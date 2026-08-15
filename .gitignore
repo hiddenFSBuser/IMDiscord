@@ -1,0 +1,12 @@
+/obj
+/bin
+/dumps
+IMDiscord.zip
+HANDOFF.md
+.claude/settings.local.json
+/ref_dumps
+/reference
+run_dump.cmd
+/tools
+pkt_blow_18186_29706.bin
+pkt_blow_18186_31030.bin

@@ -1,0 +1,454 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    IMDiscord - built without any CRT.
+
+    Every translation unit is compiled with /Zl so no default library directive
+    ends up in the object files, and the image is linked with /NODEFAULTLIB and
+    a custom entry point (im_entry in src/core/entry.cpp). The stack is fully
+    committed because the __chkstk stub in customcrt does not probe guard pages.
+
+    build.bat performs the same build from the command line.
+  -->
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <ProjectGuid>{7C4A1E20-9E4B-4A1D-9B26-2C7F1B0E5A31}</ProjectGuid>
+    <RootNamespace>IMDiscord</RootNamespace>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Release'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <WholeProgramOptimization>false</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+
+  <PropertyGroup>
+    <OutDir>$(ProjectDir)bin\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+    <TargetName>IMDiscord</TargetName>
+    <LinkIncremental>false</LinkIncremental>
+    <GenerateManifest>false</GenerateManifest>
+    <IncludePath>$(ProjectDir)src;$(ProjectDir)src\system\pch;$(ProjectDir)src\system\alghoritms;$(ProjectDir)src\system\io;$(ProjectDir)src\system\manipulators;$(ProjectDir)src\libs;$(ProjectDir)src\libs\customcrt;$(ProjectDir)src\libs\imgui;$(ProjectDir)src\libs\stb;$(ProjectDir)src\libs\opus\include;$(ProjectDir)src\libs\libwebp;$(ProjectDir)src\libs\speexdsp;$(IncludePath)</IncludePath>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <WarningLevel>Level3</WarningLevel>
+      <DisableSpecificWarnings>4005;4996;4244;4267;4018;4838;4141;4200;4245;4163;4164;4312</DisableSpecificWarnings>
+      <PreprocessorDefinitions>_HAS_EXCEPTIONS=0;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- No CRT: omit the default library name from every object file. The
+           runtime library still has to be the static flavour, because the DLL
+           one defines _DLL and turns every CRT declaration into a dllimport,
+           which would make the shims resolve under __imp_ names instead. -->
+      <OmitDefaultLibName>true</OmitDefaultLibName>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <ExceptionHandling>false</ExceptionHandling>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <!-- Precise, not Fast: /fp:fast makes the auto-vectorizer call into the
+           CRT's short vector math library. -->
+      <FloatingPointModel>Precise</FloatingPointModel>
+      <!-- Thread-safe static initialisation would call into the CRT. -->
+      <AdditionalOptions>/Zc:threadSafeInit- %(AdditionalOptions)</AdditionalOptions>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <PrecompiledHeaderOutputFile>$(IntDir)imdiscord.pch</PrecompiledHeaderOutputFile>
+      <ForcedIncludeFiles>pch.h</ForcedIncludeFiles>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EntryPointSymbol>im_entry</EntryPointSymbol>
+      <IgnoreAllDefaultLibraries>true</IgnoreAllDefaultLibraries>
+      <!-- reserve == commit, so no thread ever hits an unprobed guard page. -->
+      <StackReserveSize>2097152</StackReserveSize>
+      <StackCommitSize>2097152</StackCommitSize>
+      <GenerateMapFile>true</GenerateMapFile>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;shell32.lib;ole32.lib;oleaut32.lib;advapi32.lib;comdlg32.lib;winhttp.lib;ws2_32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;imm32.lib;bcrypt.lib;crypt32.lib;avrt.lib;winmm.lib;$(ProjectDir)src\libs\opus\lib\opus.lib;$(ProjectDir)src\libs\rnnoise\rnnoise.lib</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Debug'">
+    <ClCompile>
+      <Optimization>Disabled</Optimization>
+      <PreprocessorDefinitions>IMD_DEBUG=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <OptimizeReferences>false</OptimizeReferences>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemDefinitionGroup Condition="'$(Configuration)'=='Release'">
+    <ClCompile>
+      <Optimization>MaxSpeed</Optimization>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <DebugInformationFormat>None</DebugInformationFormat>
+    </ClCompile>
+    <Link>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <OptimizeReferences>true</OptimizeReferences>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="src\system\pch\pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="src\audio\audio.cpp" />
+    <ClCompile Include="src\audio\noise.cpp" />
+    <ClCompile Include="src\core\app.cpp" />
+    <ClCompile Include="src\core\crypto.cpp" />
+    <ClCompile Include="src\core\entry.cpp" />
+    <ClCompile Include="src\core\hwid.cpp" />
+    <ClCompile Include="src\core\log.cpp" />
+    <ClCompile Include="src\core\storage.cpp" />
+    <ClCompile Include="src\dave\dave_frames.cpp" />
+    <ClCompile Include="src\dave\dave_tests.cpp" />
+    <ClCompile Include="src\dave\hpke.cpp" />
+    <ClCompile Include="src\dave\mls_group.cpp" />
+    <ClCompile Include="src\dave\mls_message.cpp" />
+    <ClCompile Include="src\dave\mls_tree.cpp" />
+    <ClCompile Include="src\dave\mls_types.cpp" />
+    <ClCompile Include="src\dave\tls_codec.cpp" />
+    <ClCompile Include="src\discord\gateway.cpp" />
+    <ClCompile Include="src\discord\rest.cpp" />
+    <ClCompile Include="src\discord\store.cpp" />
+    <ClCompile Include="src\discord\types.cpp" />
+    <ClCompile Include="src\discord\voice.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_clock.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_crtalias.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_encoding.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_extra.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_fstream.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_math.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_memory.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_rand.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_text.cpp" />
+    <ClCompile Include="src\libs\customcrt\customcrt_windows.cpp" />
+    <ClCompile Include="src\libs\imgui\imgui.cpp" />
+    <ClCompile Include="src\libs\imgui\imgui_draw.cpp" />
+    <ClCompile Include="src\libs\imgui\imgui_impl_dx11.cpp" />
+    <ClCompile Include="src\libs\imgui\imgui_impl_win32.cpp" />
+    <ClCompile Include="src\libs\imgui\imgui_tables.cpp" />
+    <ClCompile Include="src\libs\imgui\imgui_widgets.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\alpha_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\buffer_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\frame_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\idec_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\io_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\quant_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\tree_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\vp8_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\vp8l_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dec\webp_dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\alpha_processing.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\alpha_processing_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\alpha_processing_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\alpha_processing_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\alpha_processing_sse41.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\cost.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\cost_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\cost_mips32.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\cost_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\cost_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\cpu.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\dec.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\dec_clip_tables.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\dec_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\dec_mips32.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\dec_msa.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\dec_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\dec_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\dec_sse41.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\enc.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\enc_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\enc_mips32.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\enc_msa.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\enc_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\enc_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\enc_sse41.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\filters.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\filters_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\filters_msa.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\filters_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\filters_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_avx2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_enc.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_enc_avx2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_enc_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_enc_mips32.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_enc_msa.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_enc_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_enc_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_enc_sse41.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_msa.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\lossless_sse41.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\rescaler.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\rescaler_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\rescaler_mips32.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\rescaler_msa.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\rescaler_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\rescaler_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\ssim.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\ssim_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\upsampling.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\upsampling_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\upsampling_msa.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\upsampling_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\upsampling_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\upsampling_sse41.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\yuv.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\yuv_mips_dsp_r2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\yuv_mips32.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\yuv_neon.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\yuv_sse2.cpp" />
+    <ClCompile Include="src\libs\libwebp\dsp\yuv_sse41.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\bit_reader_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\bit_writer_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\color_cache_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\filters_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\huffman_encode_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\huffman_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\palette.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\quant_levels_dec_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\quant_levels_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\random_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\rescaler_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\thread_utils.cpp" />
+    <ClCompile Include="src\libs\libwebp\utils\utils.cpp" />
+    <ClCompile Include="src\libs\speexdsp\fftwrap.cpp">
+      <PreprocessorDefinitions>HAVE_CONFIG_H;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\libs\speexdsp\filterbank.cpp">
+      <PreprocessorDefinitions>HAVE_CONFIG_H;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\libs\speexdsp\kiss_fft.cpp">
+      <PreprocessorDefinitions>HAVE_CONFIG_H;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\libs\speexdsp\kiss_fftr.cpp">
+      <PreprocessorDefinitions>HAVE_CONFIG_H;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\libs\speexdsp\mdf.cpp">
+      <PreprocessorDefinitions>HAVE_CONFIG_H;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\libs\speexdsp\preprocess.cpp">
+      <PreprocessorDefinitions>HAVE_CONFIG_H;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="src\libs\stb\stb_impl.cpp" />
+    <ClCompile Include="src\net\http.cpp" />
+    <ClCompile Include="src\net\json.cpp" />
+    <ClCompile Include="src\net\websocket.cpp" />
+    <ClCompile Include="src\system\alghoritms\uarena.cpp" />
+    <ClCompile Include="src\system\alghoritms\ubuffer.cpp" />
+    <ClCompile Include="src\system\io\ufile.cpp" />
+    <ClCompile Include="src\system\manipulators\bytereader.cpp" />
+    <ClCompile Include="src\system\manipulators\bytewriter.cpp" />
+    <ClCompile Include="src\ui\textures.cpp" />
+    <ClCompile Include="src\video\capture.cpp" />
+    <ClCompile Include="src\video\rtp_video.cpp" />
+    <ClCompile Include="src\video\encoder.cpp" />
+    <ClCompile Include="src\video\screenshare.cpp" />
+    <ClCompile Include="src\ui\theme.cpp" />
+    <ClCompile Include="src\ui\ui.cpp" />
+    <ClCompile Include="src\ui\ui_chat.cpp" />
+    <ClCompile Include="src\ui\ui_people.cpp" />
+    <ClCompile Include="src\ui\ui_sidebar.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="src\audio\audio.h" />
+    <ClInclude Include="src\audio\noise.h" />
+    <ClInclude Include="src\core\app.h" />
+    <ClInclude Include="src\core\crypto.h" />
+    <ClInclude Include="src\core\hwid.h" />
+    <ClInclude Include="src\core\log.h" />
+    <ClInclude Include="src\core\storage.h" />
+    <ClInclude Include="src\dave\dave_fixture.h" />
+    <ClInclude Include="src\dave\dave_frames.h" />
+    <ClInclude Include="src\dave\dave_tests.h" />
+    <ClInclude Include="src\dave\hpke.h" />
+    <ClInclude Include="src\dave\mls_group.h" />
+    <ClInclude Include="src\dave\mls_message.h" />
+    <ClInclude Include="src\dave\mls_tree.h" />
+    <ClInclude Include="src\dave\mls_types.h" />
+    <ClInclude Include="src\dave\tls_codec.h" />
+    <ClInclude Include="src\discord\gateway.h" />
+    <ClInclude Include="src\discord\rest.h" />
+    <ClInclude Include="src\discord\store.h" />
+    <ClInclude Include="src\discord\types.h" />
+    <ClInclude Include="src\discord\voice.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt_clock.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt_encoding.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt_fstream.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt_math.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt_memory.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt_obf.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt_rand.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt_text.h" />
+    <ClInclude Include="src\libs\customcrt\customcrt_windows.h" />
+    <ClInclude Include="src\libs\imgui\imconfig.h" />
+    <ClInclude Include="src\libs\imgui\imgui.h" />
+    <ClInclude Include="src\libs\imgui\imgui_impl_dx11.h" />
+    <ClInclude Include="src\libs\imgui\imgui_impl_win32.h" />
+    <ClInclude Include="src\libs\imgui\imgui_internal.h" />
+    <ClInclude Include="src\libs\imgui\imstb_rectpack.h" />
+    <ClInclude Include="src\libs\imgui\imstb_textedit.h" />
+    <ClInclude Include="src\libs\imgui\imstb_truetype.h" />
+    <ClInclude Include="src\libs\libwebp\dec\alphai_dec.h" />
+    <ClInclude Include="src\libs\libwebp\dec\common_dec.h" />
+    <ClInclude Include="src\libs\libwebp\dec\vp8_dec.h" />
+    <ClInclude Include="src\libs\libwebp\dec\vp8i_dec.h" />
+    <ClInclude Include="src\libs\libwebp\dec\vp8li_dec.h" />
+    <ClInclude Include="src\libs\libwebp\dec\webpi_dec.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\common_sse2.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\common_sse41.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\cpu.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\dsp.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\lossless.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\lossless_common.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\mips_macro.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\msa_macro.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\neon.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\quant.h" />
+    <ClInclude Include="src\libs\libwebp\dsp\yuv.h" />
+    <ClInclude Include="src\libs\libwebp\enc\backward_references_enc.h" />
+    <ClInclude Include="src\libs\libwebp\enc\cost_enc.h" />
+    <ClInclude Include="src\libs\libwebp\enc\histogram_enc.h" />
+    <ClInclude Include="src\libs\libwebp\enc\vp8i_enc.h" />
+    <ClInclude Include="src\libs\libwebp\enc\vp8li_enc.h" />
+    <ClInclude Include="src\libs\libwebp\mux\animi.h" />
+    <ClInclude Include="src\libs\libwebp\mux\muxi.h" />
+    <ClInclude Include="src\libs\libwebp\sharpyuv\sharpyuv.h" />
+    <ClInclude Include="src\libs\libwebp\sharpyuv\sharpyuv_cpu.h" />
+    <ClInclude Include="src\libs\libwebp\sharpyuv\sharpyuv_csp.h" />
+    <ClInclude Include="src\libs\libwebp\sharpyuv\sharpyuv_dsp.h" />
+    <ClInclude Include="src\libs\libwebp\sharpyuv\sharpyuv_gamma.h" />
+    <ClInclude Include="src\libs\libwebp\utils\bit_reader_inl_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\bit_reader_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\bit_writer_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\bounds_safety.h" />
+    <ClInclude Include="src\libs\libwebp\utils\color_cache_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\endian_inl_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\filters_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\huffman_encode_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\huffman_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\palette.h" />
+    <ClInclude Include="src\libs\libwebp\utils\quant_levels_dec_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\quant_levels_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\random_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\rescaler_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\thread_utils.h" />
+    <ClInclude Include="src\libs\libwebp\utils\utils.h" />
+    <ClInclude Include="src\libs\libwebp\webp\decode.h" />
+    <ClInclude Include="src\libs\libwebp\webp\demux.h" />
+    <ClInclude Include="src\libs\libwebp\webp\encode.h" />
+    <ClInclude Include="src\libs\libwebp\webp\format_constants.h" />
+    <ClInclude Include="src\libs\libwebp\webp\mux.h" />
+    <ClInclude Include="src\libs\libwebp\webp\mux_types.h" />
+    <ClInclude Include="src\libs\libwebp\webp\types.h" />
+    <ClInclude Include="src\libs\opus\include\opus.h" />
+    <ClInclude Include="src\libs\opus\include\opus_custom.h" />
+    <ClInclude Include="src\libs\opus\include\opus_defines.h" />
+    <ClInclude Include="src\libs\opus\include\opus_multistream.h" />
+    <ClInclude Include="src\libs\opus\include\opus_projection.h" />
+    <ClInclude Include="src\libs\opus\include\opus_types.h" />
+    <ClInclude Include="src\libs\rnnoise\rnnoise.h" />
+    <ClInclude Include="src\libs\speexdsp\_kiss_fft_guts.h" />
+    <ClInclude Include="src\libs\speexdsp\arch.h" />
+    <ClInclude Include="src\libs\speexdsp\bfin.h" />
+    <ClInclude Include="src\libs\speexdsp\config.h" />
+    <ClInclude Include="src\libs\speexdsp\fftwrap.h" />
+    <ClInclude Include="src\libs\speexdsp\filterbank.h" />
+    <ClInclude Include="src\libs\speexdsp\fixed_arm4.h" />
+    <ClInclude Include="src\libs\speexdsp\fixed_arm5e.h" />
+    <ClInclude Include="src\libs\speexdsp\fixed_bfin.h" />
+    <ClInclude Include="src\libs\speexdsp\fixed_debug.h" />
+    <ClInclude Include="src\libs\speexdsp\fixed_generic.h" />
+    <ClInclude Include="src\libs\speexdsp\kiss_fft.h" />
+    <ClInclude Include="src\libs\speexdsp\kiss_fftr.h" />
+    <ClInclude Include="src\libs\speexdsp\math_approx.h" />
+    <ClInclude Include="src\libs\speexdsp\misc_bfin.h" />
+    <ClInclude Include="src\libs\speexdsp\os_support.h" />
+    <ClInclude Include="src\libs\speexdsp\pseudofloat.h" />
+    <ClInclude Include="src\libs\speexdsp\resample_neon.h" />
+    <ClInclude Include="src\libs\speexdsp\resample_sse.h" />
+    <ClInclude Include="src\libs\speexdsp\smallft.h" />
+    <ClInclude Include="src\libs\speexdsp\speex_buffer.h" />
+    <ClInclude Include="src\libs\speexdsp\speex_echo.h" />
+    <ClInclude Include="src\libs\speexdsp\speex_jitter.h" />
+    <ClInclude Include="src\libs\speexdsp\speex_preprocess.h" />
+    <ClInclude Include="src\libs\speexdsp\speex_resampler.h" />
+    <ClInclude Include="src\libs\speexdsp\speexdsp_types.h" />
+    <ClInclude Include="src\libs\speexdsp\vorbis_psy.h" />
+    <ClInclude Include="src\libs\stb\stb_gif_stream.h" />
+    <ClInclude Include="src\libs\stb\stb_image.h" />
+    <ClInclude Include="src\libs\stb\stb_image_write.h" />
+    <ClInclude Include="src\net\http.h" />
+    <ClInclude Include="src\net\json.h" />
+    <ClInclude Include="src\net\websocket.h" />
+    <ClInclude Include="src\system\alghoritms\uarena.h" />
+    <ClInclude Include="src\system\alghoritms\ubuffer.h" />
+    <ClInclude Include="src\system\alghoritms\ulist.h" />
+    <ClInclude Include="src\system\alghoritms\umap.h" />
+    <ClInclude Include="src\system\alghoritms\uset.h" />
+    <ClInclude Include="src\system\io\ufile.h" />
+    <ClInclude Include="src\system\manipulators\bytereader.h" />
+    <ClInclude Include="src\system\manipulators\bytewriter.h" />
+    <ClInclude Include="src\system\pch\pch.h" />
+    <ClInclude Include="src\ui\textures.h" />
+    <ClInclude Include="src\ui\theme.h" />
+    <ClInclude Include="src\video\capture.h" />
+    <ClInclude Include="src\video\rtp_video.h" />
+    <ClInclude Include="src\video\encoder.h" />
+    <ClInclude Include="src\video\screenshare.h" />
+    <ClInclude Include="src\ui\ui.h" />
+    <ClInclude Include="src\ui\ui_state.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="build.bat" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>
