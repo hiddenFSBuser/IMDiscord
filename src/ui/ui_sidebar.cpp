@@ -16,6 +16,9 @@
 #include "audio/audio.h"
 #include "audio/noise.h"
 #include "audio/vad.h"
+#include "audio/sounds.h"
+#include "audio/music.h"
+#include "discord/science.h"
 #include "video/screenshare.h"
 #include "video/streamview.h"
 
@@ -91,7 +94,7 @@ namespace
         ImGui::BeginTooltip();
         ImGui::PushTextWrapPos(320.0f);
 
-        ImGui::TextUnformatted(g->name ? g->name : "Сервер");
+        ImGui::TextUnformatted(g->name ? g->name : tr("Сервер"));
 
         char line[192];
 
@@ -102,13 +105,13 @@ namespace
         int online = g->approx_online ? g->approx_online : g_card.online;
 
         if (total > 0 && online > 0)
-            cnprint(line, sizeof(line), "%d в сети  ·  %d всего", online, total);
+            cnprint(line, sizeof(line), tr("%d в сети  ·  %d всего"), online, total);
         else if (total > 0)
-            cnprint(line, sizeof(line), "%d участников", total);
+            cnprint(line, sizeof(line), tr("%d участников"), total);
         else if (g->counts_loading)
-            ccstrncpy(line, "считаем...", sizeof(line) - 1);
+            ccstrncpy(line, tr("считаем..."), sizeof(line) - 1);
         else
-            cnprint(line, sizeof(line), "%d в сети из %u загруженных",
+            cnprint(line, sizeof(line), tr("%d в сети из %u загруженных"),
                     g_card.online, g->members.count);
         ui_text_muted(line);
 
@@ -117,10 +120,10 @@ namespace
             ImGui::Separator();
 
             if (g_card.streaming)
-                cnprint(line, sizeof(line), "В голосовых: %d, из них с демонстрацией %d",
+                cnprint(line, sizeof(line), tr("В голосовых: %d, из них с демонстрацией %d"),
                         g_card.in_voice, g_card.streaming);
             else
-                cnprint(line, sizeof(line), "В голосовых: %d", g_card.in_voice);
+                cnprint(line, sizeof(line), tr("В голосовых: %d"), g_card.in_voice);
             ImGui::TextUnformatted(line);
 
             for (int i = 0; i < g_card.voice_named; i++)
@@ -131,14 +134,14 @@ namespace
                 ImGui::PushStyleColor(ImGuiCol_Text,
                                       g_card.voice_streaming[i] ? col::red : col::text_muted);
                 cnprint(line, sizeof(line), "  %s%s", u->display_name(),
-                        g_card.voice_streaming[i] ? "  (демонстрация)" : "");
+                        g_card.voice_streaming[i] ? tr("  (демонстрация)") : "");
                 ImGui::TextUnformatted(line);
                 ImGui::PopStyleColor();
             }
 
             if (g_card.in_voice > g_card.voice_named)
             {
-                cnprint(line, sizeof(line), "  и ещё %d", g_card.in_voice - g_card.voice_named);
+                cnprint(line, sizeof(line), tr("  и ещё %d"), g_card.in_voice - g_card.voice_named);
                 ui_text_muted(line);
             }
         }
@@ -214,7 +217,7 @@ void ui_view_guild_rail(float width, float height)
             g_ui.active_channel = 0;
             g_ui.show_friends = true;
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Личные сообщения и друзья");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Личные сообщения и друзья"));
     }
 
     ImGui::SetCursorPosX(indent);
@@ -268,7 +271,7 @@ void ui_view_guild_rail(float width, float height)
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoPreviewTooltip))
         {
             ImGui::SetDragDropPayload("IMD_GUILD", &g->id, sizeof(snowflake));
-            ImGui::TextUnformatted(g->name ? g->name : "Сервер");
+            ImGui::TextUnformatted(g->name ? g->name : tr("Сервер"));
             ImGui::EndDragDropSource();
         }
         if (ImGui::BeginDragDropTarget())
@@ -290,7 +293,7 @@ void ui_view_guild_rail(float width, float height)
 
         if (ImGui::BeginPopupContextItem("##guildctx"))
         {
-            if (ImGui::MenuItem("Информация о сервере"))
+            if (ImGui::MenuItem(tr("Информация о сервере")))
             {
                 g_ui.server_info_guild = g->id;
                 g_ui.open_server_info_popup = true;
@@ -300,13 +303,20 @@ void ui_view_guild_rail(float width, float height)
                 // opens it too, but a menu row is easier to find.
                 char big[320];
                 cdn::guild_icon(g, 1024, big, sizeof(big));
-                if (ImGui::MenuItem("Приблизить аватарку", 0, false, big[0] != 0))
-                    ui_open_image_viewer(big, g->name ? g->name : "Сервер");
+                if (ImGui::MenuItem(tr("Приблизить аватарку"), 0, false, big[0] != 0))
+                    ui_open_image_viewer(big, g->name ? g->name : tr("Сервер"));
             }
             ImGui::Separator();
-            ui_copy_id_item(g->id, "Скопировать ID сервера");
+            if (ImGui::MenuItem(tr("Настройки сервера"))) ui_open_guild_edit(g->id);
+            if (ImGui::MenuItem(tr("Управление ролями"))) ui_open_roles(g->id);
+            if (ImGui::MenuItem(tr("Аудит и баны"))) ui_open_audit(g->id);
+            if (ImGui::MenuItem(tr("Создать канал"))) ui_open_new_channel(g->id);
+            if (ImGui::MenuItem(tr("Приглашения"))) ui_open_invites(g->id);
+            if (ImGui::MenuItem(tr("Вебхуки"))) ui_open_webhooks(g->id);
             ImGui::Separator();
-            if (ImGui::MenuItem("Покинуть сервер"))
+            ui_copy_id_item(g->id, tr("Скопировать ID сервера"));
+            ImGui::Separator();
+            if (ImGui::MenuItem(tr("Покинуть сервер")))
             {
                 api::leave_guild(g->id);
                 if (g_ui.active_guild == g->id) { g_ui.active_guild = 0; g_ui.active_channel = 0; }
@@ -336,17 +346,27 @@ void ui_view_guild_rail(float width, float height)
     dl->AddText(ImVec2(p.x + (bubble - ts.x) * 0.5f, p.y + (bubble - ts.y) * 0.5f), col::green, "+");
 
     if (ImGui::InvisibleButton("##join", ImVec2(bubble, bubble)))
+    {
         ImGui::OpenPopup("##joinguild");
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Присоединиться к серверу");
+
+        // Discord's own box opens on a landing screen and is stepped through
+        // to the join one. This box is both at once, but the person pressing
+        // "+" and then typing a code has done what those two screens are for,
+        // and the chain is what discord checks before it decides whether the
+        // join needs a CAPTCHA.
+        science::guild_add_opened();
+        science::guild_add_join_step();
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Присоединиться к серверу"));
 
     if (ImGui::BeginPopup("##joinguild"))
     {
-        ImGui::TextUnformatted("Ссылка-приглашение или код");
+        ImGui::TextUnformatted(tr("Ссылка-приглашение или код"));
         ImGui::SetNextItemWidth(300);
         bool go = ImGui::InputText("##invite", g_ui.invite_input, sizeof(g_ui.invite_input),
                                    ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine();
-        if (ImGui::Button("Войти") || go)
+        if (ImGui::Button(tr("Войти")) || go)
         {
             if (g_ui.invite_input[0])
             {
@@ -355,6 +375,32 @@ void ui_view_guild_rail(float width, float height)
                 ImGui::CloseCurrentPopup();
             }
         }
+
+        // Making one, in the same box: both answers to "I want to be on a
+        // server I am not on", and the plus button is where somebody looks for
+        // either of them.
+        ImGui::Separator();
+        ImGui::TextUnformatted(tr("Или создать свой"));
+
+        ImGui::SetNextItemWidth(300);
+        bool make = ImGui::InputTextWithHint("##newguild", tr("название сервера"),
+                                             g_ui.new_guild_name, sizeof(g_ui.new_guild_name),
+                                             ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if ((ImGui::Button(tr("Создать")) || make) && g_ui.new_guild_name[0])
+        {
+            api::create_guild(g_ui.new_guild_name);
+            ccfset(g_ui.new_guild_name, 0, sizeof(g_ui.new_guild_name));
+            ImGui::CloseCurrentPopup();
+        }
+
+        if (api::last_error()[0])
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+            ImGui::TextWrapped("%s", api::last_error());
+            ImGui::PopStyleColor();
+        }
+
         ImGui::EndPopup();
     }
 
@@ -392,14 +438,14 @@ namespace
         ImGui::TextUnformatted(u->display_name());
         ImGui::Separator();
 
-        if (ImGui::MenuItem("Профиль")) ui_open_profile(u->id, guild_id);
+        if (ImGui::MenuItem(tr("Профиль"))) ui_open_profile(u->id, guild_id);
 
         // Turning our own playback down would silence the room, not us, and
         // muting ourselves already has its own button.
         if (!self)
         {
             bool muted = voice::user_muted(u->id);
-            if (ImGui::MenuItem(muted ? "Вернуть звук" : "Заглушить", 0, muted))
+            if (ImGui::MenuItem(muted ? tr("Вернуть звук") : tr("Заглушить"), 0, muted))
                 voice::set_user_muted(u->id, !muted);
 
             ImGui::Separator();
@@ -407,7 +453,7 @@ namespace
             float volume = voice::user_volume(u->id);
             int percent = (int)(volume * 100.0f + 0.5f);
 
-            ImGui::TextUnformatted("Громкость");
+            ImGui::TextUnformatted(tr("Громкость"));
             ImGui::SetNextItemWidth(200.0f);
 
             // Logarithmic, or the useful part of the range - everything either
@@ -420,18 +466,68 @@ namespace
             if (percent > 200)
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
-                ImGui::TextUnformatted("Ограничитель срежет часть прибавки");
+                ImGui::TextUnformatted(tr("Ограничитель срежет часть прибавки"));
                 ImGui::PopStyleColor();
             }
 
-            if (percent != 100 && ImGui::MenuItem("Сбросить на 100%"))
+            if (percent != 100 && ImGui::MenuItem(tr("Сбросить на 100%")))
                 voice::set_user_volume(u->id, 1.0f);
         }
 
+        // Everything above this line stays on this machine. Everything below
+        // it is sent, and the person on the other end is told.
+        ui_member_moderation_menu(guild_id, u->id);
+
         ImGui::Separator();
-        ui_copy_id_item(u->id, "Скопировать ID пользователя");
+        ui_copy_id_item(u->id, tr("Скопировать ID пользователя"));
 
         ImGui::EndPopup();
+    }
+
+    // Works out the whole new order after one channel is dropped on another and
+    // sends it. The whole list rather than the pair, because positions are only
+    // meaningful relative to each other: moving one and leaving the rest to be
+    // renumbered by the server gives an order nobody asked for.
+    //
+    // The mover also takes on the target's category, which is what makes
+    // dragging into and out of one work without a second gesture.
+    void dropped_on(dguild* g, snowflake moved_id, snowflake target_id)
+    {
+        dchannel* moved = store::find_channel(moved_id);
+        dchannel* target = store::find_channel(target_id);
+        if (!moved || !target) return;
+
+        // A category cannot be put inside anything, and nothing can be put
+        // inside a channel that is not a category.
+        if (moved->type == CH_CATEGORY && target->type != CH_CATEGORY) return;
+
+        snowflake parent = (moved->type == CH_CATEGORY) ? 0
+                         : (target->type == CH_CATEGORY ? target->id : target->parent_id);
+
+        // Rebuilt as a plain list: everything except the mover, with the mover
+        // put back where the target sits.
+        snowflake order[256];
+        int count = 0;
+
+        for (unsigned int i = 0; i < g->channels.count && count < 255; i++)
+        {
+            snowflake id = g->channels[i];
+            if (id == moved_id) continue;
+
+            dchannel* c = store::find_channel(id);
+            if (!c) continue;
+
+            // Only things of the mover's own kind are renumbered together:
+            // discord keeps categories in a sequence of their own.
+            bool same_kind = (moved->type == CH_CATEGORY) == (c->type == CH_CATEGORY);
+            if (!same_kind) continue;
+
+            if (id == target_id) order[count++] = moved_id;
+            order[count++] = id;
+        }
+
+        if (!count) return;
+        api::reorder_channels(g->id, order, count, moved_id, parent);
     }
 
     bool channel_row(dchannel* c, bool active, float width, bool hidden)
@@ -581,9 +677,10 @@ namespace
             const texture* t = url[0] ? tex::get(url) : 0;
             if (t && t->ready())
                 dl->AddImageRounded(t->id(), p, ImVec2(p.x + 32, p.y + 32), ImVec2(0, 0), ImVec2(1, 1),
-                                    IM_COL32_WHITE, 16.0f);
+                                    IM_COL32_WHITE, 32.0f * theme::avatar_rounding());
             else
-                dl->AddCircleFilled(ImVec2(p.x + 16, p.y + 16), 16.0f, col::bg_hover);
+                dl->AddRectFilled(p, ImVec2(p.x + 32, p.y + 32), col::bg_hover,
+                                  32.0f * theme::avatar_rounding());
             ImGui::Dummy(ImVec2(32, 32));
         }
 
@@ -605,6 +702,75 @@ namespace
 
         ImGui::SetCursorScreenPos(ImVec2(start.x, start.y + 42.0f));
 
+        // Who is in the call, underneath, the way a server's voice channel
+        // lists its occupants. A call in a direct message announces itself
+        // nowhere else in the interface: without this the only way to find
+        // out whether anybody is waiting in one is to join it and look.
+        {
+            static ulist<snowflake> in_call;
+            store::users_in_voice(c->id, &in_call);
+
+            for (unsigned int k = 0; k < in_call.count; k++)
+            {
+                duser* u = store::find_user(in_call[k]);
+                if (!u) continue;
+
+                ImGui::PushID((int)(u->id & 0x7FFFFFFF));
+                ImGui::Indent(18.0f);
+
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                ui_avatar(u, 18.0f, false);
+
+                float level = voice::speaking_level(u->id);
+                if (level > 0.02f)
+                    dl->AddCircle(ImVec2(p.x + 9, p.y + 9), 10.0f, col::green, 0, 2.0f);
+
+                const dvoice_state* vs = store::find_voice_state(u->id);
+                bool mic_off = vs && (vs->self_mute || vs->mute);
+                bool ears_off = vs && (vs->self_deaf || vs->deaf);
+
+                float reserve = 0.0f;
+                if (mic_off || ears_off) reserve = 6.0f + ((mic_off && ears_off) ? 30.0f : 14.0f);
+
+                float avail = ImGui::GetContentRegionAvail().x - reserve;
+                if (avail < 20.0f) avail = 20.0f;
+
+                char fitted[96];
+                const char* shown = fit_name(u->display_name(), avail, fitted, sizeof(fitted));
+
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
+                ImGui::TextUnformatted(shown);
+                ImGui::PopStyleColor();
+
+                if (ImGui::IsItemClicked()) ui_open_profile(u->id, 0);
+
+                if (mic_off || ears_off)
+                {
+                    ImGui::SameLine(0, 6);
+                    ImVec2 mark = ImGui::GetCursorScreenPos();
+                    ui_draw_muted_marks(dl, ImVec2(mark.x, mark.y + 2.0f), 13.0f,
+                                        mic_off, ears_off);
+                    ImGui::Dummy(ImVec2((mic_off && ears_off) ? 30.0f : 14.0f, 13.0f));
+                }
+
+                ImGui::Unindent(18.0f);
+                ImGui::PopID();
+            }
+
+            // Rung and not yet answered. An empty call that is ringing looks
+            // exactly like no call at all, and those are not the same thing
+            // to somebody deciding whether to pick up.
+            if (!in_call.count && store::call_is_ringing(c->id))
+            {
+                ImGui::Indent(18.0f);
+                ImGui::PushStyleColor(ImGuiCol_Text, col::green);
+                ImGui::TextUnformatted(tr("идёт вызов..."));
+                ImGui::PopStyleColor();
+                ImGui::Unindent(18.0f);
+            }
+        }
+
         if (clicked)
         {
             g_ui.active_channel = c->id;
@@ -625,11 +791,11 @@ namespace
         // has no one person behind it, but it still has an id worth copying.
         if (ImGui::BeginPopupContextItem("##dmctx"))
         {
-            if (peer && ImGui::MenuItem("Открыть профиль")) ui_open_profile(peer->id, 0);
+            if (peer && ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(peer->id, 0);
 
             ImGui::Separator();
-            ui_copy_id_item(c->id, "Скопировать ID чата");
-            if (peer) ui_copy_id_item(peer->id, "Скопировать ID пользователя");
+            ui_copy_id_item(c->id, tr("Скопировать ID чата"));
+            if (peer) ui_copy_id_item(peer->id, tr("Скопировать ID пользователя"));
             ImGui::EndPopup();
         }
 
@@ -650,12 +816,12 @@ void ui_view_channel_list(float width, float height)
     if (g_ui.active_guild == 0)
     {
         ImGui::PushStyleColor(ImGuiCol_Header, ImGui::ColorConvertU32ToFloat4(col::bg_active));
-        if (ImGui::Selectable("Друзья", g_ui.show_friends, 0, ImVec2(width - 16.0f, 30.0f)))
+        if (ImGui::Selectable(tr("Друзья"), g_ui.show_friends, 0, ImVec2(width - 16.0f, 30.0f)))
             g_ui.show_friends = true;
         ImGui::PopStyleColor();
 
         ImGui::Dummy(ImVec2(0, 6));
-        ui_text_muted("ЛИЧНЫЕ СООБЩЕНИЯ");
+        ui_text_muted(tr("ЛИЧНЫЕ СООБЩЕНИЯ"));
         ImGui::Dummy(ImVec2(0, 2));
 
         const ulist<snowflake>& dms = store::dm_order();
@@ -666,7 +832,7 @@ void ui_view_channel_list(float width, float height)
             dm_row(c, !g_ui.show_friends && g_ui.active_channel == c->id, width);
         }
 
-        if (dms.count == 0) ui_text_muted("Пока пусто");
+        if (dms.count == 0) ui_text_muted(tr("Пока пусто"));
     }
     else
     {
@@ -674,13 +840,13 @@ void ui_view_channel_list(float width, float height)
         if (g)
         {
             ImGui::PushFont(g_app.font_bold);
-            ImGui::TextWrapped("%s", g->name ? g->name : "Сервер");
+            ImGui::TextWrapped("%s", g->name ? g->name : tr("Сервер"));
             ImGui::PopFont();
             ImGui::Dummy(ImVec2(0, 6));
 
             if (!g->loaded)
             {
-                ui_text_muted("Загрузка каналов...");
+                ui_text_muted(tr("Загрузка каналов..."));
             }
 
             // Categories first, then their children; loose channels go on top.
@@ -711,7 +877,7 @@ void ui_view_channel_list(float width, float height)
                         {
                             dchannel* cat = store::find_channel(c->parent_id);
                             ImGui::Dummy(ImVec2(0, 6));
-                            ui_text_muted(cat && cat->name ? cat->name : "КАНАЛЫ");
+                            ui_text_muted(cat && cat->name ? cat->name : tr("КАНАЛЫ"));
                         }
                     }
 
@@ -722,6 +888,45 @@ void ui_view_channel_list(float width, float height)
                     if (hidden && !g_ui.show_hidden_channels) { ImGui::PopID(); continue; }
 
                     bool clicked = channel_row(c, active, width, hidden);
+
+                    // Dragging one channel onto another puts it where that one
+                    // is. The payload is the id rather than the index, because
+                    // the list is walked in two passes and an index means
+                    // nothing outside the pass that produced it.
+                    if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover))
+                    {
+                        ImGui::SetDragDropPayload("IMD_CHANNEL", &c->id, sizeof(snowflake));
+
+                        char label[160];
+                        ui_channel_display_name(c, label, sizeof(label));
+                        ImGui::TextUnformatted(label);
+
+                        ImGui::EndDragDropSource();
+                    }
+
+                    if (ImGui::BeginDragDropTarget())
+                    {
+                        const ImGuiPayload* p = ImGui::AcceptDragDropPayload("IMD_CHANNEL");
+                        if (p && p->DataSize == (int)sizeof(snowflake))
+                        {
+                            snowflake moved = *(const snowflake*)p->Data;
+                            if (moved != c->id) dropped_on(g, moved, c->id);
+                        }
+
+                        // A person dropped here rather than a channel. The
+                        // same row answers both because that is where the eye
+                        // goes: the destination is the channel, whatever is
+                        // being carried.
+                        const ImGuiPayload* who = ImGui::AcceptDragDropPayload("IMD_VOICE_MEMBER");
+                        if (who && who->DataSize == (int)sizeof(snowflake))
+                        {
+                            snowflake moved = *(const snowflake*)who->Data;
+                            if (ui_can_move_member(g->id, moved, c->id))
+                                api::voice_move(g->id, moved, c->id);
+                        }
+
+                        ImGui::EndDragDropTarget();
+                    }
 
                     // A channel that cannot be read opens its properties
                     // instead of itself. Trying to load messages would only
@@ -739,33 +944,38 @@ void ui_view_channel_list(float width, float height)
                     // other client does; right click opens just the chat.
                     if (ImGui::BeginPopupContextItem("##chctx"))
                     {
-                        if (ImGui::MenuItem("Свойства канала"))
+                        if (ImGui::MenuItem(tr("Свойства канала")))
                         {
                             g_ui.channel_info_id = c->id;
                             g_ui.open_channel_info_popup = true;
                         }
+                        if (ImGui::MenuItem(tr("Права канала"))) ui_open_channel_perms(c->id);
+                        if (ImGui::MenuItem(tr("Удалить канал"))) api::delete_channel(c->id);
                         ImGui::Separator();
-                        ui_copy_id_item(c->id, "Скопировать ID канала");
-                        ui_copy_id_item(g->id, "Скопировать ID сервера");
+                        ui_copy_id_item(c->id, tr("Скопировать ID канала"));
+                        ui_copy_id_item(g->id, tr("Скопировать ID сервера"));
                         ImGui::EndPopup();
                     }
 
                     if (c->is_voice() && !hidden && ImGui::BeginPopupContextItem("##vcctx"))
                     {
-                        if (ImGui::MenuItem("Открыть чат канала")) open_chat = true;
+                        if (ImGui::MenuItem(tr("Открыть чат канала"))) open_chat = true;
 
                         if (voice::current_channel() == c->id)
                         {
-                            if (ImGui::MenuItem("Выйти из канала")) voice::leave();
+                            if (ImGui::MenuItem(tr("Выйти из канала"))) voice::leave();
                         }
-                        else if (ImGui::MenuItem("Зайти в канал"))
+                        else if (ImGui::MenuItem(tr("Зайти в канал")))
                         {
                             voice::join(g->id, c->id);
                             open_chat = true;
                         }
                         ImGui::Separator();
-                        ui_copy_id_item(c->id, "Скопировать ID канала");
-                        ui_copy_id_item(g->id, "Скопировать ID сервера");
+                        if (ImGui::MenuItem(tr("Права канала"))) ui_open_channel_perms(c->id);
+                        if (ImGui::MenuItem(tr("Удалить канал"))) api::delete_channel(c->id);
+                        ImGui::Separator();
+                        ui_copy_id_item(c->id, tr("Скопировать ID канала"));
+                        ui_copy_id_item(g->id, tr("Скопировать ID сервера"));
                         ImGui::EndPopup();
                     }
 
@@ -780,6 +990,7 @@ void ui_view_channel_list(float width, float height)
                     {
                         g_ui.active_channel = c->id;
                         g_ui.show_friends = false;
+                        science::channel_opened(c->id, g->id);
                         g_ui.scroll_to_bottom = true;
                         g_ui.reply_to = 0;
                         if (!c->history_loaded) api::fetch_messages(c->id, 0);
@@ -824,6 +1035,8 @@ void ui_view_channel_list(float width, float height)
                                 reserve += 6.0f + ((mic_off && ears_off) ? 30.0f : 14.0f);
                             if (shows_live)
                                 reserve += 6.0f + ImGui::CalcTextSize("LIVE").x + 10.0f;
+                            if (voice::camera_on(u->id))
+                                reserve += 6.0f + ImGui::CalcTextSize("CAM").x + 10.0f;
 
                             float avail = ImGui::GetContentRegionAvail().x - reserve;
                             if (avail < 20.0f) avail = 20.0f;
@@ -832,23 +1045,64 @@ void ui_view_channel_list(float width, float height)
                             const char* shown = fit_name(u->display_name(), avail,
                                                          fitted, sizeof(fitted));
 
-                            ImGui::SameLine();
-                            ImGui::PushStyleColor(ImGuiCol_Text, quieted ? col::red : col::text_muted);
-                            ImGui::TextUnformatted(shown);
-                            ImGui::PopStyleColor();
+                            // A button carrying the name rather than plain
+                            // text. Text has no id of its own, and everything
+                            // hung off this row - the profile, the menu, and
+                            // now dragging somebody into another channel -
+                            // wants one: drag and drop on an id-less item is
+                            // keyed on where the item sits, which stops being
+                            // true the moment the list underneath it moves.
+                            //
+                            // The button takes exactly the space the text
+                            // would have, so the badges after it land where
+                            // they always did.
+                            ImVec2 name_size = ImGui::CalcTextSize(shown);
+                            if (name_size.x < 1.0f) name_size.x = 1.0f;
 
-                            // The name opens the profile, and does so whether
-                            // or not this client is in the channel - looking
-                            // somebody up should not mean walking into a call
-                            // to do it.
-                            if (ImGui::IsItemClicked()) ui_open_profile(u->id, g->id);
+                            ImGui::SameLine();
+                            ImVec2 name_at = ImGui::GetCursorScreenPos();
+                            ImGui::InvisibleButton("##name",
+                                                   ImVec2(name_size.x, ImGui::GetTextLineHeight()));
+
+                            ImGui::GetWindowDrawList()->AddText(
+                                name_at, quieted ? col::red : col::text_muted, shown);
+
+                            bool can_drag = ui_can_move_member(g->id, u->id, 0);
+
+                            // Dragged onto another voice channel, they are
+                            // moved into it. Offered only when it would work:
+                            // a drag that can only ever be refused is worse
+                            // than no drag at all.
+                            if (can_drag && ImGui::BeginDragDropSource())
+                            {
+                                ImGui::SetDragDropPayload("IMD_VOICE_MEMBER", &u->id, sizeof(snowflake));
+                                ImGui::TextUnformatted(u->display_name());
+                                ImGui::EndDragDropSource();
+                            }
+
+                            // On release, and only if the pointer stayed put.
+                            // Opening the profile on the press - which is what
+                            // IsItemClicked does - put a modal window up the
+                            // instant the button went down, and a drag can
+                            // never begin underneath one.
+                            ImGuiIO& io = ImGui::GetIO();
+                            float travel = io.MouseDragMaxDistanceSqr[ImGuiMouseButton_Left];
+                            bool dragged = travel >= io.MouseDragThreshold * io.MouseDragThreshold;
+
+                            if (ImGui::IsItemHovered() &&
+                                ImGui::IsMouseReleased(ImGuiMouseButton_Left) && !dragged)
+                                ui_open_profile(u->id, g->id);
+
                             if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen("##vmemctx"))
                             {
+                                const char* hint = can_drag
+                                    ? tr("ЛКМ - профиль, ПКМ - звук, тянуть - перенести")
+                                    : tr("ЛКМ - профиль, ПКМ - звук");
+
                                 if (shown != u->display_name())
-                                    ImGui::SetTooltip("%s\nЛКМ - профиль, ПКМ - звук",
-                                                      u->display_name());
+                                    ImGui::SetTooltip("%s\n%s", u->display_name(), hint);
                                 else
-                                    ImGui::SetTooltip("ЛКМ - профиль, ПКМ - звук");
+                                    ImGui::SetTooltip("%s", hint);
                             }
 
                             ui_voice_member_menu(u, g->id, self);
@@ -867,8 +1121,43 @@ void ui_view_channel_list(float width, float height)
                                 ImGui::Dummy(ImVec2((mic_off && ears_off) ? 30.0f : 14.0f, 13.0f));
 
                                 if (ImGui::IsItemHovered())
-                                    ImGui::SetTooltip(ears_off ? "Звук выключен полностью"
-                                                               : "Микрофон выключен");
+                                    ImGui::SetTooltip(ears_off ? tr("Звук выключен полностью")
+                                                               : tr("Микрофон выключен"));
+                            }
+
+                            // A camera, when they have one on. Same idea as the
+                            // LIVE badge and deliberately next to it: both are
+                            // "this person has a picture", and both need the
+                            // person picked before anything can be shown.
+                            if (voice::camera_on(u->id))
+                            {
+                                bool watching = voice::watched_camera() == u->id;
+
+                                ImGui::SameLine(0, 6);
+                                ImGui::PushStyleColor(ImGuiCol_Button, watching ? col::accent : col::bg_panel);
+                                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, watching ? col::accent : col::bg_hover);
+                                ImGui::PushStyleColor(ImGuiCol_ButtonActive, col::bg_active);
+                                ImGui::PushStyleColor(ImGuiCol_Text, col::text_normal);
+                                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5, 1));
+
+                                if (ImGui::SmallButton("CAM"))
+                                {
+                                    // The decoder is one instance, so opening a
+                                    // camera closes whatever else was using it.
+                                    if (watching) voice::watch_camera(0);
+                                    else
+                                    {
+                                        if (streamview::watching_user()) streamview::stop();
+                                        voice::watch_camera(u->id);
+                                    }
+                                }
+
+                                ImGui::PopStyleVar();
+                                ImGui::PopStyleColor(4);
+
+                                if (ImGui::IsItemHovered())
+                                    ImGui::SetTooltip(watching ? tr("Закрыть камеру")
+                                                               : tr("Смотреть камеру"));
                             }
 
                             // Anybody sharing their screen gets a badge that
@@ -896,8 +1185,8 @@ void ui_view_channel_list(float width, float height)
                                 ImGui::PopStyleColor(4);
 
                                 if (ImGui::IsItemHovered())
-                                    ImGui::SetTooltip(watching ? "Закрыть демонстрацию"
-                                                               : "Смотреть демонстрацию");
+                                    ImGui::SetTooltip(watching ? tr("Закрыть демонстрацию")
+                                                               : tr("Смотреть демонстрацию"));
                             }
 
                             ImGui::Unindent(18.0f);
@@ -957,16 +1246,16 @@ void ui_view_voice_panel(float width)
         }
         else
         {
-            ccstrncpy(title, "Голосовой канал", sizeof(title) - 1);
+            ccstrncpy(title, tr("Голосовой канал"), sizeof(title) - 1);
         }
 
         screenshare_state share = screenshare::state();
         bool sharing = share != SHARE_IDLE && share != SHARE_FAILED;
 
-        // Two buttons now sit on the right of this row, so the labels are cut
-        // off before they can run underneath them.
+        // Three buttons now sit on the right of this row, so the labels are
+        // cut off before they can run underneath them.
         dl->PushClipRect(ImVec2(p.x + 12.0f, p.y),
-                         ImVec2(p.x + width - 90.0f, p.y + VOICE_ROW_HEIGHT), true);
+                         ImVec2(p.x + width - 128.0f, p.y + VOICE_ROW_HEIGHT), true);
 
         // While a share is running its own state is the more interesting of the
         // two, so it takes the top line and the channel name stays below.
@@ -978,10 +1267,28 @@ void ui_view_voice_panel(float width)
             dl->AddText(ImVec2(p.x + 12.0f, p.y + 7.0f), col::red, screenshare::status_text());
         else
             dl->AddText(ImVec2(p.x + 12.0f, p.y + 7.0f), connected ? col::green : col::yellow,
-                        connected ? "Голос подключён" : "Подключение...");
+                        connected ? tr("Голос подключён") : tr("Подключение..."));
 
         dl->AddText(ImVec2(p.x + 12.0f, p.y + 25.0f), col::text_muted, title);
         dl->PopClipRect();
+
+        // Music. First of the three because it is the one that is opened and
+        // left alone, where the other two are reached for in a hurry.
+        ImGui::SetCursorScreenPos(ImVec2(p.x + width - 122.0f, p.y + 10.0f));
+        {
+            bool on = music::playing();
+
+            if (ui_glyph_button("##music", ICON_MUSIC, false, ImVec2(34, 26),
+                                on ? col::green : col::bg_panel,
+                                on ? col::green : col::bg_hover, col::text_normal))
+                ui_open_music();
+
+            if (ImGui::IsItemHovered())
+            {
+                if (on) ImGui::SetTooltip(tr("Играет: %s"), music::title());
+                else    ImGui::SetTooltip(tr("Музыка в голосовой канал"));
+            }
+        }
 
         // Go Live. Only offered once the voice side is up, because the stream is
         // requested for the channel that connection is already sitting in.
@@ -1011,12 +1318,12 @@ void ui_view_voice_panel(float width)
 
             if (ImGui::IsItemHovered())
             {
-                if (!connected)            ImGui::SetTooltip("Сначала дождись голоса");
-                else if (sharing)          ImGui::SetTooltip("%s - нажми, чтобы настроить или закончить",
+                if (!connected)            ImGui::SetTooltip(tr("Сначала дождись голоса"));
+                else if (sharing)          ImGui::SetTooltip(tr("%s - нажми, чтобы настроить или закончить"),
                                                              screenshare::status_text());
-                else if (share == SHARE_FAILED) ImGui::SetTooltip("%s - нажми, чтобы попробовать снова",
+                else if (share == SHARE_FAILED) ImGui::SetTooltip(tr("%s - нажми, чтобы попробовать снова"),
                                                                   screenshare::status_text());
-                else                       ImGui::SetTooltip("Демонстрация экрана");
+                else                       ImGui::SetTooltip(tr("Демонстрация экрана"));
             }
         }
 
@@ -1027,7 +1334,7 @@ void ui_view_voice_panel(float width)
             if (sharing) screenshare::stop();
             voice::leave();
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Отключиться");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Отключиться"));
 
         p.y += VOICE_ROW_HEIGHT;
         ImGui::SetCursorScreenPos(p);
@@ -1045,8 +1352,11 @@ void ui_view_voice_panel(float width)
 
         char first[96];
         char second[96];
-        cnprint(first, sizeof(first), "голос закрыт, код %u", voice::last_close_code());
-        cnprint(second, sizeof(second), "%s", voice::last_stop_reason());
+        cnprint(first, sizeof(first), tr("голос закрыт, код %u"), voice::last_close_code());
+        // Translated here rather than where it is set: the reason is kept as a
+        // pointer to a literal, and one set before the language changed would
+        // otherwise stay in the language it was set in.
+        cnprint(second, sizeof(second), "%s", tr(voice::last_stop_reason()));
 
         dl->PushClipRect(p, ImVec2(p.x + width - 8.0f, p.y + STOPPED_ROW_HEIGHT), true);
         dl->AddText(ImVec2(p.x + 10.0f, p.y + 3.0f), col::red, first);
@@ -1069,7 +1379,7 @@ void ui_view_voice_panel(float width)
     // profile now lives too. There is no room on this row for another button
     // and every other client puts it behind the avatar as well.
     if (ImGui::IsItemClicked()) g_ui.show_accounts = true;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Аккаунты");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Аккаунты"));
 
     dl->AddText(ImVec2(p.x + 48.0f, p.y + 10.0f), col::text_normal, me ? me->display_name() : "...");
 
@@ -1082,19 +1392,19 @@ void ui_view_voice_panel(float width)
     if (ui_glyph_button("##mute", ICON_MIC, muted, ImVec2(28, 28), col::bg_panel, col::bg_hover,
                         muted ? col::text_muted : col::text_normal))
         voice::set_muted(!muted);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(muted ? "Включить микрофон" : "Выключить микрофон");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(muted ? tr("Включить микрофон") : tr("Выключить микрофон"));
 
     ImGui::SameLine(0, 4);
     bool deaf = voice::deafened();
     if (ui_glyph_button("##deaf", ICON_HEADPHONES, deaf, ImVec2(28, 28), col::bg_panel, col::bg_hover,
                         deaf ? col::text_muted : col::text_normal))
         voice::set_deafened(!deaf);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip(deaf ? "Включить звук" : "Отключить звук");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(deaf ? tr("Включить звук") : tr("Отключить звук"));
 
     ImGui::SameLine(0, 4);
     if (ui_glyph_button("##settings", ICON_GEAR, false, ImVec2(28, 28), col::bg_panel, col::bg_hover, col::text_normal))
         g_ui.show_settings = true;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Настройки");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Настройки"));
 
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
 }
@@ -1107,7 +1417,7 @@ void ui_view_settings_popup()
 {
     if (g_ui.show_settings)
     {
-        ImGui::OpenPopup("Настройки");
+        ImGui::OpenPopup(tr("Настройки###settings"));
         g_ui.show_settings = false;
 
         // Asked once per opening, not on a timer: the list changes rarely
@@ -1119,40 +1429,129 @@ void ui_view_settings_popup()
     // you read - account, sessions, call health, diagnostics. A fixed modest
     // size instead of growing to fit: both columns scroll on their own.
     ImGui::SetNextWindowSize(ImVec2(720, 520), ImGuiCond_Appearing);
-    if (!ImGui::BeginPopupModal("Настройки", 0, 0)) return;
+    if (!ImGui::BeginPopupModal(tr("Настройки###settings"), 0, 0)) return;
+
+    // ---- language ----
+    //
+    // Above the two columns rather than inside them, because somebody who
+    // opened this window looking for it cannot read the headings that would
+    // tell them where it is.
+    {
+        ui_lang chosen = lang::current();
+
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::BeginCombo(tr("Язык"), lang::name(chosen)))
+        {
+            for (int i = 0; i < LANG_COUNT; i++)
+                if (ImGui::Selectable(lang::name((ui_lang)i), i == (int)chosen))
+                    lang::set((ui_lang)i);
+            ImGui::EndCombo();
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 6));
 
     float cols_h = ImGui::GetContentRegionAvail().y - 42.0f;   // "Закрыть" row
     ImGui::BeginChild("##settings_left", ImVec2(336.0f, cols_h), false,
                       ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
+    // ---- appearance ----
+    ImGui::TextUnformatted(tr("Внешний вид"));
+    ImGui::Separator();
+
+    {
+        // Whole looks first: most people want a different one, not fifteen
+        // different ones, and the list underneath is there for whoever does.
+        ImGui::TextUnformatted(tr("Готовые темы"));
+
+        for (int i = 0; i < theme::preset_count(); i++)
+        {
+            if (i && (i % 3)) ImGui::SameLine(0, 6);
+            if (ui_icon_button(tr(theme::preset_name(i)), ImVec2(100, 26),
+                               col::bg_panel, col::bg_hover))
+                theme::apply_preset(i);
+        }
+
+        ImGui::Dummy(ImVec2(0, 8));
+
+        // Shape. Both are fractions of the thing being drawn, so one number
+        // holds at every size on the screen.
+        float avatar = theme::avatar_rounding() * 200.0f;   // 0..100 reads better
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::SliderFloat(tr("Форма аватарок"), &avatar, 0.0f, 100.0f, "%.0f%%"))
+            theme::set_avatar_rounding(avatar / 200.0f);
+
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(tr("0% - квадрат, 100% - круг"));
+
+        float corner = theme::corner_rounding();
+        ImGui::SetNextItemWidth(200);
+        if (ImGui::SliderFloat(tr("Закругление углов"), &corner, 0.0f, 16.0f, "%.0f"))
+            theme::set_corner_rounding(corner);
+
+        ImGui::Dummy(ImVec2(0, 6));
+
+        // Every colour, one per row. Folded away by default: fifteen pickers
+        // open is a wall, and most people never touch them.
+        if (ImGui::TreeNode(tr("Цвета по отдельности")))
+        {
+            for (int i = 0; i < theme::color_count(); i++)
+            {
+                theme::entry* e = theme::color_at(i);
+                if (!e) continue;
+
+                ImVec4 v = ImGui::ColorConvertU32ToFloat4(*e->value);
+
+                ImGui::PushID(i);
+                if (ImGui::ColorEdit3(tr(e->label), &v.x,
+                                      ImGuiColorEditFlags_NoInputs |
+                                      ImGuiColorEditFlags_AlphaPreview))
+                {
+                    *e->value = ImGui::ColorConvertFloat4ToU32(v);
+                    storage::settings_set_int(e->key, (int)(unsigned int)*e->value);
+                    storage::settings_save();
+                    theme::apply();
+                }
+                ImGui::PopID();
+            }
+
+            ImGui::TreePop();
+        }
+
+        ImGui::Dummy(ImVec2(0, 6));
+        if (ImGui::Button(tr("Сбросить оформление"), ImVec2(220, 28))) theme::reset();
+    }
+
+    ImGui::Dummy(ImVec2(0, 10));
+
     // ---- archive and export ----
-    ImGui::TextUnformatted("Архив переписки");
+    ImGui::TextUnformatted(tr("Архив переписки"));
     ImGui::Separator();
 
     {
         char line[192];
-        cnprint(line, sizeof(line), "Сохранено сообщений за сеанс: %u, каналов: %u",
+        cnprint(line, sizeof(line), tr("Сохранено сообщений за сеанс: %u, каналов: %u"),
                 archive::total_messages(), archive::total_channels());
         ui_text_muted(line);
 
         unsigned long long age = archive::snapshot_age_seconds();
         if (age)
         {
-            cnprint(line, sizeof(line), "Снимок серверов и друзей обновлён %llu мин назад",
+            cnprint(line, sizeof(line), tr("Снимок серверов и друзей обновлён %llu мин назад"),
                     age / 60);
             ui_text_muted(line);
         }
     }
 
     static bool save_files = false;
-    ImGui::Checkbox("Сохранять вложения рядом с файлом", &save_files);
+    ImGui::Checkbox(tr("Сохранять вложения рядом с файлом"), &save_files);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Иначе в экспорт попадут только ссылки. Ссылки discord со временем "
-                          "перестают открываться, копии остаются навсегда.");
+        ImGui::SetTooltip(tr("Иначе в экспорт попадут только ссылки. Ссылки discord со временем "
+                          "перестают открываться, копии остаются навсегда."));
 
     export_attachments attach_mode = save_files ? EXPORT_SAVE_FILES : EXPORT_LINKS_ONLY;
 
-    if (ImGui::Button("Экспортировать этот канал", ImVec2(-1, 0)) && g_ui.active_channel)
+    if (ImGui::Button(tr("Экспортировать этот канал"), ImVec2(-1, 0)) && g_ui.active_channel)
     {
         wchar_t suggested[64];
         chartowcs("chat.html", suggested, 64);
@@ -1161,13 +1560,13 @@ void ui_view_settings_popup()
         if (ufile::save_dialog(suggested, chosen, MAX_PATH))
         {
             if (exporter::channel_to_html(g_ui.active_channel, chosen, attach_mode))
-                api::set_last_error("Экспорт готов");
+                api::set_last_error(tr("Экспорт готов"));
             else
-                api::set_last_error("Экспортировать не удалось");
+                api::set_last_error(tr("Экспортировать не удалось"));
         }
     }
 
-    if (ImGui::Button("Экспортировать весь архив", ImVec2(-1, 0)))
+    if (ImGui::Button(tr("Экспортировать весь архив"), ImVec2(-1, 0)))
     {
         wchar_t suggested[64];
         chartowcs("export.html", suggested, 64);
@@ -1185,7 +1584,7 @@ void ui_view_settings_popup()
             int n = exporter::everything_to_html(chosen, attach_mode);
 
             char done[128];
-            cnprint(done, sizeof(done), "Записано каналов: %d", n);
+            cnprint(done, sizeof(done), tr("Записано каналов: %d"), n);
             api::set_last_error(done);
         }
     }
@@ -1195,27 +1594,27 @@ void ui_view_settings_popup()
     if (exporter::warming())
     {
         char line[224];
-        cnprint(line, sizeof(line), "Прогрев: %u из %u каналов, сообщений %u — %s",
+        cnprint(line, sizeof(line), tr("Прогрев: %u из %u каналов, сообщений %u — %s"),
                 exporter::warm_channels_done(), exporter::warm_channels_total(),
                 exporter::warm_messages(), exporter::warm_status());
         ui_text_muted(line);
 
-        if (ImGui::Button("Остановить прогрев", ImVec2(-1, 0))) exporter::warm_stop();
+        if (ImGui::Button(tr("Остановить прогрев"), ImVec2(-1, 0))) exporter::warm_stop();
     }
     else
     {
-        ImGui::TextUnformatted("Что прогревать");
+        ImGui::TextUnformatted(tr("Что прогревать"));
 
         int scope = (int)exporter::warm_current_scope();
         bool changed = false;
 
-        changed |= ImGui::RadioButton("Только личные чаты", &scope, exporter::WARM_DIRECT_ONLY);
+        changed |= ImGui::RadioButton(tr("Только личные чаты"), &scope, exporter::WARM_DIRECT_ONLY);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("По умолчанию. Один людный сервер бывает больше всей личной "
-                              "переписки вместе взятой, а нужна обычно именно она.");
+            ImGui::SetTooltip(tr("По умолчанию. Один людный сервер бывает больше всей личной "
+                              "переписки вместе взятой, а нужна обычно именно она."));
 
-        changed |= ImGui::RadioButton("Всё подряд", &scope, exporter::WARM_EVERYTHING);
-        changed |= ImGui::RadioButton("Выбранное вручную", &scope, exporter::WARM_SELECTED);
+        changed |= ImGui::RadioButton(tr("Всё подряд"), &scope, exporter::WARM_EVERYTHING);
+        changed |= ImGui::RadioButton(tr("Выбранное вручную"), &scope, exporter::WARM_SELECTED);
 
         if (changed) exporter::warm_set_scope((exporter::warm_scope)scope);
 
@@ -1235,7 +1634,7 @@ void ui_view_settings_popup()
                 ImGui::PushID((int)(g->id & 0x7FFFFFFF));
 
                 bool whole = exporter::warm_guild_fully_selected(g->id);
-                if (ImGui::Checkbox(g->name ? g->name : "сервер", &whole))
+                if (ImGui::Checkbox(g->name ? g->name : tr("сервер"), &whole))
                     exporter::warm_select_guild(g->id, whole);
 
                 ImGui::Indent(18.0f);
@@ -1263,7 +1662,7 @@ void ui_view_settings_popup()
             if (dms.count)
             {
                 ImGui::Separator();
-                ui_text_muted("Личные чаты");
+                ui_text_muted(tr("Личные чаты"));
             }
 
             for (unsigned int i = 0; i < dms.count; i++)
@@ -1285,26 +1684,26 @@ void ui_view_settings_popup()
             ImGui::EndChild();
 
             char picked[96];
-            cnprint(picked, sizeof(picked), "Отмечено каналов: %u",
+            cnprint(picked, sizeof(picked), tr("Отмечено каналов: %u"),
                     exporter::warm_selection_count());
             ui_text_muted(picked);
 
             ImGui::SameLine();
-            if (ImGui::SmallButton("Снять всё")) exporter::warm_clear_selection();
+            if (ImGui::SmallButton(tr("Снять всё"))) exporter::warm_clear_selection();
         }
 
         char go[128];
-        cnprint(go, sizeof(go), "Прогреть (%u каналов)", exporter::warm_planned_count());
+        cnprint(go, sizeof(go), tr("Прогреть (%u каналов)"), exporter::warm_planned_count());
 
         if (ImGui::Button(go, ImVec2(-1, 0))) exporter::warm_start();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Прочитать историю и сложить её в архив. Долго и много "
+            ImGui::SetTooltip(tr("Прочитать историю и сложить её в архив. Долго и много "
                               "запросов, зато потом всё открывается мгновенно и читается "
-                              "без сети.");
+                              "без сети."));
     }
 
     ImGui::Dummy(ImVec2(0, 10));
-    ImGui::TextUnformatted("Устройства");
+    ImGui::TextUnformatted(tr("Устройства"));
     ImGui::Separator();
 
     // The device lists are refreshed while the popup is open, so hot-plugging a
@@ -1340,7 +1739,7 @@ void ui_view_settings_popup()
         }
         ImGui::EndCombo();
     }
-    ui_text_muted("Микрофон");
+    ui_text_muted(tr("Микрофон"));
 
     ImGui::Dummy(ImVec2(0, 4));
     ImGui::SetNextItemWidth(-1);
@@ -1359,13 +1758,13 @@ void ui_view_settings_popup()
         }
         ImGui::EndCombo();
     }
-    ui_text_muted("Вывод звука");
+    ui_text_muted(tr("Вывод звука"));
 
     ImGui::Dummy(ImVec2(0, 10));
-    ImGui::TextUnformatted("Шумоподавление");
+    ImGui::TextUnformatted(tr("Шумоподавление"));
     ImGui::Separator();
 
-    const char* modes[] = { "Выключено", "Noise gate", "SpeexDSP", "RNNoise" };
+    const char* modes[] = { tr("Выключено"), "Noise gate", "SpeexDSP", "RNNoise" };
     int mode = noise::mode();
 
     ImGui::SetNextItemWidth(-1);
@@ -1385,7 +1784,7 @@ void ui_view_settings_popup()
     if (noise::mode() == NOISE_GATE)
     {
         float threshold = noise::gate_threshold();
-        if (ImGui::SliderFloat("Порог", &threshold, 0.0f, 0.2f, "%.3f"))
+        if (ImGui::SliderFloat(tr("Порог"), &threshold, 0.0f, 0.2f, "%.3f"))
         {
             noise::set_gate_threshold(threshold);
             storage::settings_set_int("gate_threshold", (int)(threshold * 1000.0f));
@@ -1393,28 +1792,28 @@ void ui_view_settings_popup()
     }
 
     ImGui::Dummy(ImVec2(0, 10));
-    ImGui::TextUnformatted("Чувствительность");
+    ImGui::TextUnformatted(tr("Чувствительность"));
     ImGui::Separator();
 
     bool vad_on = vad::enabled();
-    if (ImGui::Checkbox("Определять голос", &vad_on))
+    if (ImGui::Checkbox(tr("Определять голос"), &vad_on))
     {
         vad::set_enabled(vad_on);
         storage::settings_set_int("vad_enabled", vad_on ? 1 : 0);
     }
-    ui_text_muted(vad_on ? "Передача только когда ты говоришь"
-                         : "Микрофон открыт постоянно");
+    ui_text_muted(vad_on ? tr("Передача только когда ты говоришь")
+                         : tr("Микрофон открыт постоянно"));
 
     if (vad_on)
     {
         bool automatic = vad::automatic();
-        if (ImGui::RadioButton("Автоматически", automatic))
+        if (ImGui::RadioButton(tr("Автоматически"), automatic))
         {
             vad::set_automatic(true);
             storage::settings_set_int("vad_auto", 1);
         }
         ImGui::SameLine();
-        if (ImGui::RadioButton("Вручную", !automatic))
+        if (ImGui::RadioButton(tr("Вручную"), !automatic))
         {
             vad::set_automatic(false);
             storage::settings_set_int("vad_auto", 0);
@@ -1423,7 +1822,7 @@ void ui_view_settings_popup()
         if (!vad::automatic())
         {
             float thr = vad::threshold();
-            if (ImGui::SliderFloat("##vadthr", &thr, 0.0f, 0.15f, "порог %.3f"))
+            if (ImGui::SliderFloat("##vadthr", &thr, 0.0f, 0.15f, tr("порог %.3f")))
             {
                 vad::set_threshold(thr);
                 storage::settings_set_int("vad_threshold", (int)(thr * 1000.0f));
@@ -1431,7 +1830,7 @@ void ui_view_settings_popup()
         }
         else
         {
-            ui_text_muted("Порог сам подстраивается под тишину в комнате");
+            ui_text_muted(tr("Порог сам подстраивается под тишину в комнате"));
         }
 
         // The meter is the only way to set a threshold without guessing:
@@ -1469,38 +1868,99 @@ void ui_view_settings_popup()
     }
 
     ImGui::Dummy(ImVec2(0, 10));
-    ImGui::TextUnformatted("Громкость");
+    ImGui::TextUnformatted(tr("Громкость"));
     ImGui::Separator();
 
     float in_gain = audio::input_gain();
-    if (ImGui::SliderFloat("Микрофон", &in_gain, 0.0f, 2.0f, "%.2f"))
+    if (ImGui::SliderFloat(tr("Микрофон"), &in_gain, 0.0f, 2.0f, "%.2f"))
         audio::set_input_gain(in_gain);
 
     float out_gain = audio::output_gain();
-    if (ImGui::SliderFloat("Динамики", &out_gain, 0.0f, 2.0f, "%.2f"))
+    if (ImGui::SliderFloat(tr("Динамики"), &out_gain, 0.0f, 2.0f, "%.2f"))
         audio::set_output_gain(out_gain);
 
     ImGui::Dummy(ImVec2(0, 10));
-    ImGui::TextUnformatted("Каналы");
+    ImGui::TextUnformatted(tr("Приватность"));
+    ImGui::Separator();
+
+    {
+        // Discord's own analytics. Four settings rather than a switch,
+        // because the events are not alike: reporting that the audit log was
+        // opened is the same kind of fact as opening it, while reporting that
+        // the pointer moved over a picture, or that speech began, is watching
+        // the person. The middle setting is that line.
+        int mode = (int)science::mode();
+
+        ImGui::SetNextItemWidth(240);
+        if (ImGui::BeginCombo(tr("Телеметрия Discord"), science::mode_name((science_mode)mode)))
+        {
+            for (int i = 0; i <= SCIENCE_ALL; i++)
+                if (ImGui::Selectable(science::mode_name((science_mode)i), i == mode))
+                    science::set_mode((science_mode)i);
+            ImGui::EndCombo();
+        }
+
+        ImGui::PushTextWrapPos(0.0f);
+        ui_text_muted(science::mode_note((science_mode)mode));
+        ImGui::PopTextWrapPos();
+    }
+
+    if (ImGui::Button(tr("Настроить приватность"), ImVec2(220, 28))) ui_open_privacy();
+    ui_text_muted(tr("Кто может писать вам в личные сообщения"));
+
+    ImGui::Dummy(ImVec2(0, 10));
+    ImGui::TextUnformatted(tr("Звуки"));
+    ImGui::Separator();
+
+    {
+        // Its own volume, not the call's: a chime at the level of somebody's
+        // voice is startling, and the two are turned up and down for quite
+        // different reasons.
+        float snd = sounds::volume();
+        if (ImGui::SliderFloat(tr("Громкость звуков"), &snd, 0.0f, 1.0f, "%.2f"))
+            sounds::set_volume(snd);
+
+        struct { ui_sound id; const char* label; } rows[] = {
+            { SOUND_VOICE_JOIN,   tr("Заход в голосовой") },
+            { SOUND_VOICE_LEAVE,  tr("Выход из голосового") },
+            { SOUND_STREAM_START, tr("Начало демонстрации") },
+            { SOUND_STREAM_STOP,  tr("Конец демонстрации") },
+            { SOUND_NOTIFY,       tr("Личное сообщение") },
+        };
+
+        for (int i = 0; i < 5; i++)
+        {
+            bool on = sounds::enabled(rows[i].id);
+
+            ImGui::PushID(i);
+            if (ImGui::Checkbox(rows[i].label, &on)) sounds::set_enabled(rows[i].id, on);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(tr("Проверить"))) sounds::play(rows[i].id);
+            ImGui::PopID();
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 10));
+    ImGui::TextUnformatted(tr("Каналы"));
     ImGui::Separator();
 
     {
         bool show = g_ui.show_hidden_channels;
-        if (ImGui::Checkbox("Показывать закрытые каналы", &show))
+        if (ImGui::Checkbox(tr("Показывать закрытые каналы"), &show))
         {
             g_ui.show_hidden_channels = show;
             storage::settings_set_int("show_hidden_channels", show ? 1 : 0);
         }
         ui_text_muted(g_ui.show_hidden_channels
-                          ? "С замком - те, куда нет доступа. Клик открывает свойства"
-                          : "Видно только то, что можно читать");
+                          ? tr("С замком - те, куда нет доступа. Клик открывает свойства")
+                          : tr("Видно только то, что можно читать"));
     }
 
     ImGui::Dummy(ImVec2(0, 10));
-    ImGui::TextUnformatted("Картинки");
+    ImGui::TextUnformatted(tr("Картинки"));
     ImGui::Separator();
 
-    const char* formats[] = { "PNG по возможности", "Всегда WebP" };
+    const char* formats[] = { tr("PNG по возможности"), tr("Всегда WebP") };
     int format = ui_image_format();
 
     ImGui::SetNextItemWidth(-1);
@@ -1513,29 +1973,29 @@ void ui_view_settings_popup()
         ImGui::EndCombo();
     }
     ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
-    ImGui::TextWrapped("PNG запрашивается у прокси discord и приходит без потерь, "
+    ImGui::TextWrapped(tr("PNG запрашивается у прокси discord и приходит без потерь, "
                        "но стоит им лишней перекодировки. WebP отдаётся как есть. "
                        "Гифки и анимированный WebP настройка не трогает: у прокси "
-                       "от них остался бы один кадр.");
+                       "от них остался бы один кадр."));
     ImGui::PopStyleColor();
 
     ImGui::Dummy(ImVec2(0, 6));
 
     bool direct_gifs = ui_embed_direct_gifs();
-    if (ImGui::Checkbox("Подгружать гифки с ссылок", &direct_gifs))
+    if (ImGui::Checkbox(tr("Подгружать гифки с ссылок"), &direct_gifs))
         ui_set_embed_direct_gifs(direct_gifs);
 
     bool video = ui_video_player();
-    if (ImGui::Checkbox("Проигрывать mp4 прямо в чате", &video))
+    if (ImGui::Checkbox(tr("Проигрывать mp4 прямо в чате"), &video))
         ui_set_video_player(video);
-    ui_text_muted(video ? "Сырое: звук уходит вперёд, перемотка грубая"
-                        : "Выключено - видео показывается кадром со ссылкой на скачивание");
+    ui_text_muted(video ? tr("Сырое: звук уходит вперёд, перемотка грубая")
+                        : tr("Выключено - видео показывается кадром со ссылкой на скачивание"));
 
     ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
-    ImGui::TextWrapped("Гифку с чужого сайта discord пропускает через свой прокси, а тот "
+    ImGui::TextWrapped(tr("Гифку с чужого сайта discord пропускает через свой прокси, а тот "
                        "оставляет от неё первый кадр. С галочкой такая картинка берётся "
                        "прямо с сайта и играет целиком; сайт при этом видит запрос от тебя, "
-                       "а не от discord. Картинок и вложений самого discord это не касается.");
+                       "а не от discord. Картинок и вложений самого discord это не касается."));
     ImGui::PopStyleColor();
 
     ImGui::Dummy(ImVec2(0, 6));
@@ -1543,25 +2003,25 @@ void ui_view_settings_popup()
     int cache_hours = tex::cache_ttl_hours();
     ImGui::SetNextItemWidth(-1);
     if (ImGui::SliderInt("##cachehours", &cache_hours, 0, 720,
-                         cache_hours > 0 ? "Хранить на диске: %d ч" : "Не хранить на диске",
+                         cache_hours > 0 ? tr("Хранить на диске: %d ч") : tr("Не хранить на диске"),
                          ImGuiSliderFlags_AlwaysClamp))
         tex::set_cache_ttl_hours(cache_hours);
 
     ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
     if (tex::cache_ttl_hours() > 0)
-        ImGui::TextWrapped("Скачанные картинки и гифки лежат файлами и переживают перезапуск. "
+        ImGui::TextWrapped(tr("Скачанные картинки и гифки лежат файлами и переживают перезапуск. "
                            "Сейчас занято %u МБ в %d файлах; всё, что старше срока, удаляется "
-                           "при запуске и при смене этой настройки.",
+                           "при запуске и при смене этой настройки."),
                            tex::cache_disk_kb() / 1024, tex::cache_file_count());
     else
-        ImGui::TextWrapped("Кэш на диске выключен и очищен: каждая картинка качается заново "
-                           "после того, как её выгрузили из памяти.");
+        ImGui::TextWrapped(tr("Кэш на диске выключен и очищен: каждая картинка качается заново "
+                           "после того, как её выгрузили из памяти."));
     ImGui::PopStyleColor();
 
     ImGui::Dummy(ImVec2(0, 4));
-    ImGui::TextUnformatted("Уровень входа");
+    ImGui::TextUnformatted(tr("Уровень входа"));
     ImGui::ProgressBar(audio::input_level(), ImVec2(-1, 10), "");
-    ImGui::TextUnformatted("Уровень выхода");
+    ImGui::TextUnformatted(tr("Уровень выхода"));
     ImGui::ProgressBar(audio::output_level(), ImVec2(-1, 10), "");
 
     if (audio::last_error()[0])
@@ -1578,7 +2038,7 @@ void ui_view_settings_popup()
     ImGui::BeginChild("##settings_right", ImVec2(0, cols_h), false,
                       ImGuiWindowFlags_AlwaysVerticalScrollbar);
 
-    ImGui::TextUnformatted("Аккаунт");
+    ImGui::TextUnformatted(tr("Аккаунт"));
     ImGui::Separator();
 
     {
@@ -1588,36 +2048,36 @@ void ui_view_settings_popup()
         duser* me = store::self();
         char line[256];
 
-        cnprint(line, sizeof(line), "Почта: %s",
-                (me && me->email && me->email[0]) ? me->email : "не указана");
+        cnprint(line, sizeof(line), tr("Почта: %s"),
+                (me && me->email && me->email[0]) ? me->email : tr("не указана"));
         ImGui::TextUnformatted(line);
-        cnprint(line, sizeof(line), "Телефон: %s",
-                (me && me->phone && me->phone[0]) ? me->phone : "не привязан");
+        cnprint(line, sizeof(line), tr("Телефон: %s"),
+                (me && me->phone && me->phone[0]) ? me->phone : tr("не привязан"));
         ImGui::TextUnformatted(line);
 
-        cnprint(line, sizeof(line), "Почта подтверждена: %s, двухфакторка: %s",
-                (me && me->verified) ? "да" : "нет",
-                (me && me->mfa_enabled) ? "включена" : "выключена");
+        cnprint(line, sizeof(line), tr("Почта подтверждена: %s, двухфакторка: %s"),
+                (me && me->verified) ? tr("да") : tr("нет"),
+                (me && me->mfa_enabled) ? tr("включена") : tr("выключена"));
         ui_text_muted(line);
     }
 
     ImGui::Dummy(ImVec2(0, 10));
-    ImGui::TextUnformatted("Сеансы");
+    ImGui::TextUnformatted(tr("Сеансы"));
     ImGui::Separator();
 
-    if (ImGui::Button("Обновить список", ImVec2(-1, 0))) api::fetch_sessions();
+    if (ImGui::Button(tr("Обновить список"), ImVec2(-1, 0))) api::fetch_sessions();
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Где ещё открыт этот аккаунт");
+        ImGui::SetTooltip(tr("Где ещё открыт этот аккаунт"));
 
     {
         store::guard g;
         int st = store::sessions_state();
         const ulist<dsession>& list = store::sessions();
 
-        if (st == 1) ui_text_muted("Загружаю...");
-        else if (st == 3) ui_text_muted("Не удалось загрузить");
-        else if (st == 2 && list.count == 0) ui_text_muted("Сеансов нет");
-        else if (st == 0) ui_text_muted("Ещё не запрашивалось");
+        if (st == 1) ui_text_muted(tr("Загружаю..."));
+        else if (st == 3) ui_text_muted(tr("Не удалось загрузить"));
+        else if (st == 2 && list.count == 0) ui_text_muted(tr("Сеансов нет"));
+        else if (st == 0) ui_text_muted(tr("Ещё не запрашивалось"));
 
         for (unsigned int i = 0; i < list.count; i++)
         {
@@ -1643,14 +2103,14 @@ void ui_view_settings_popup()
 
             char sub[256];
             cnprint(sub, sizeof(sub), "%s%s%s",
-                    s->location[0] ? s->location : "место неизвестно",
+                    s->location[0] ? s->location : tr("место неизвестно"),
                     when[0] ? " — " : "", when);
             ui_text_muted(sub);
         }
     }
 
     ImGui::Dummy(ImVec2(0, 10));
-    ImGui::TextUnformatted("Качество звонка");
+    ImGui::TextUnformatted(tr("Качество звонка"));
     ImGui::Separator();
 
     {
@@ -1661,19 +2121,19 @@ void ui_view_settings_popup()
         voice::rx_report r;
         if (!voice::last_rx_report(&r))
         {
-            ui_text_muted("Появится через несколько секунд в звонке");
+            ui_text_muted(tr("Появится через несколько секунд в звонке"));
         }
         else
         {
             char line[192];
 
-            cnprint(line, sizeof(line), "Сыграно %u кадров, опоздало %u, срезано кольцом %u",
+            cnprint(line, sizeof(line), tr("Сыграно %u кадров, опоздало %u, срезано кольцом %u"),
                     r.played, r.late, r.overflow);
             ImGui::TextUnformatted(line);
 
             // Сколько потерянных пакетов пришлось достроить маскировкой opus:
             // растёт - значит сеть рвётся, а не декодер или микшер.
-            cnprint(line, sizeof(line), "Скрыто потерь %u", r.concealed);
+            cnprint(line, sizeof(line), tr("Скрыто потерь %u"), r.concealed);
             if (r.concealed)
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
@@ -1687,7 +2147,7 @@ void ui_view_settings_popup()
 
             // E2EE-дропы: растут - значит обрывы это не сеть, а согласование
             // ключей DAVE (кто-то зашёл/вышел, эпоха сменилась).
-            cnprint(line, sizeof(line), "E2EE: без ключей %u, не развернуто %u",
+            cnprint(line, sizeof(line), tr("E2EE: без ключей %u, не развернуто %u"),
                     r.nokey, r.unwrap);
             if (r.nokey || r.unwrap)
             {
@@ -1702,7 +2162,7 @@ void ui_view_settings_popup()
 
             // Поднимается только когда сам декодер отдаёт полношкальный
             // мусор: это показание отличает больной opus от больной сети.
-            cnprint(line, sizeof(line), "Срывов декодера %u", r.railed);
+            cnprint(line, sizeof(line), tr("Срывов декодера %u"), r.railed);
             if (r.railed)
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
@@ -1714,26 +2174,26 @@ void ui_view_settings_popup()
                 ui_text_muted(line);
             }
 
-            cnprint(line, sizeof(line), "Медиа и стримы: недобор %u, срез %u",
+            cnprint(line, sizeof(line), tr("Медиа и стримы: недобор %u, срез %u"),
                     r.underruns, r.overruns);
             ui_text_muted(line);
 
-            cnprint(line, sizeof(line), "Буфер вывода %u мс", audio::render_backlog_ms());
+            cnprint(line, sizeof(line), tr("Буфер вывода %u мс"), audio::render_backlog_ms());
             ui_text_muted(line);
         }
     }
 
     ImGui::Dummy(ImVec2(0, 10));
-    ImGui::TextUnformatted("Диагностика");
+    ImGui::TextUnformatted(tr("Диагностика"));
     ImGui::Separator();
-    ImGui::Text("Шлюз: %s", gateway::status_text());
-    ImGui::Text("Текстур в памяти: %u КБ", tex::memory_used() / 1024);
-    ImGui::Text("Загрузок в очереди: %d", tex::pending_downloads());
+    ImGui::Text(tr("Шлюз: %s"), gateway::status_text());
+    ImGui::Text(tr("Текстур в памяти: %u КБ"), tex::memory_used() / 1024);
+    ImGui::Text(tr("Загрузок в очереди: %d"), tex::pending_downloads());
 
     ImGui::EndChild();
 
     ImGui::Dummy(ImVec2(0, 4));
-    if (ImGui::Button("Закрыть", ImVec2(120, 30))) ImGui::CloseCurrentPopup();
+    if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30))) ImGui::CloseCurrentPopup();
 
     ImGui::EndPopup();
 }

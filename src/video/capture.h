@@ -8,6 +8,18 @@
 // overlays. DXGI desktop duplication and Windows.Graphics.Capture are the
 // obvious additions, and both fit this shape.
 
+// The most frames a second a share will send.
+//
+// Not a round number chosen for looking sensible: above this the H.264
+// encoder refuses the output type outright with E_FAIL - "encoder:
+// SetOutputType (0x80004005)" - and the share never starts at all. Better to
+// stop at the last rate that works than to offer one that fails.
+//
+// Applied where the setting is read and again where the screen is grabbed,
+// because the two used to disagree and a typed number was quietly undone in a
+// place nobody could see.
+const int SHARE_FPS_MAX = 172;
+
 enum capture_method
 {
     // The compositor hands over the frame it has already composed, on the
@@ -47,6 +59,15 @@ struct capture_frame
     // frame period cannot be measured with a 15.6 ms clock, and the encoder and
     // the RTP timestamps both want better than that anyway.
     unsigned long long time_us;
+
+    // Whether anything on screen actually moved since the last grab. Desktop
+    // duplication says so for free - a still screen produces no frame at all,
+    // and the pixels handed back are the previous ones. Encoding those again
+    // costs a full scale and a full encode per layer for a picture nobody
+    // changed, which on a quiet desktop is most of what a share spends.
+    //
+    // Always true on the blit path, which has no way to know.
+    bool fresh;
 };
 
 // Where the picture ended up inside the frame, and what part of the desktop

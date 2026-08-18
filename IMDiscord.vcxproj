@@ -135,6 +135,8 @@
     <ClCompile Include="src\core\crypto.cpp" />
     <ClCompile Include="src\core\entry.cpp" />
     <ClCompile Include="src\core\hwid.cpp" />
+    <ClCompile Include="src\core\lang.cpp" />
+    <ClCompile Include="src\core\lang_table.cpp" />
     <ClCompile Include="src\core\log.cpp" />
     <ClCompile Include="src\core\storage.cpp" />
     <ClCompile Include="src\dave\dave_frames.cpp" />
@@ -290,6 +292,11 @@
     <ClCompile Include="src\ui\theme.cpp" />
     <ClCompile Include="src\ui\ui.cpp" />
     <ClCompile Include="src\ui\ui_chat.cpp" />
+    <ClCompile Include="src\audio\mp3.cpp" />
+    <ClCompile Include="src\audio\music.cpp" />
+    <ClCompile Include="src\libs\minimp3\minimp3_impl.cpp" />
+    <ClCompile Include="src\ui\ui_music.cpp" />
+    <ClCompile Include="src\ui\ui_moderate.cpp" />
     <ClCompile Include="src\ui\ui_people.cpp" />
     <ClCompile Include="src\ui\ui_sidebar.cpp" />
   </ItemGroup>
@@ -300,6 +307,7 @@
     <ClInclude Include="src\core\app.h" />
     <ClInclude Include="src\core\crypto.h" />
     <ClInclude Include="src\core\hwid.h" />
+    <ClInclude Include="src\core\lang.h" />
     <ClInclude Include="src\core\log.h" />
     <ClInclude Include="src\core\storage.h" />
     <ClInclude Include="src\dave\dave_fixture.h" />

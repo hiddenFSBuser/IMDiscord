@@ -18,6 +18,53 @@ struct ui_state
     snowflake profile_guild;
     snowflake server_info_guild;
 
+    // The role editor: which server it is open on, which role is selected,
+    // and the fields being edited before they are sent.
+    snowflake roles_guild;
+    snowflake roles_selected;
+    bool open_roles_popup;
+    char role_name[128];
+    char role_new_name[128];
+    unsigned long long role_perms;
+    unsigned int role_color;
+    bool role_hoist;
+    bool role_mentionable;
+
+    // The invite and webhook window: which server it was opened on and which
+    // channel the link will point into.
+    snowflake invite_guild;
+    snowflake invite_channel;
+    bool open_invites_popup;
+
+    // The webhook box, split from invites: the two share only a channel.
+    snowflake hooks_guild;
+    snowflake hooks_channel;
+    bool open_hooks_popup;
+
+    // The new-channel box.
+    snowflake newchan_guild;
+    bool open_newchan_popup;
+
+    // The channel permission box: which channel, and whose overwrite is
+    // being edited inside it.
+    snowflake chanperm_channel;
+    snowflake chanperm_target;
+    bool open_chanperm_popup;
+
+    // The privacy box.
+    bool open_privacy_popup;
+
+    // Renaming a server and changing its icon.
+    snowflake guildedit_guild;
+    bool open_guildedit_popup;
+
+    // The audit log and ban list.
+    snowflake audit_guild;
+    bool open_audit_popup;
+
+    // The music player.
+    bool open_music_popup;
+
     // imgui refuses to cut or copy from a password field, so the token input
     // can be switched to plain text on demand.
     bool token_visible;
@@ -81,7 +128,13 @@ struct ui_state
     char login_error[256];
     char message_input[3800];
     char friend_input[128];
+
+    // Held while a friend request is waiting on a captcha: who it was for,
+    // and the token the person brings back. Tokens are long.
+    char captcha_for[128];
+    char captcha_token[2048];
     char invite_input[192];
+    char new_guild_name[128];
     char member_filter[64];
 
     ulist<upload_file> pending_files;
@@ -147,6 +200,7 @@ enum ui_icon
     ICON_PHONE,      // start a call
     ICON_HANGUP,     // leave a call
     ICON_SCREEN,     // share the screen
+    ICON_MUSIC,      // play a track into the call
 };
 
 bool ui_glyph_button(const char* id, ui_icon icon, bool crossed, const ImVec2& size,
@@ -195,6 +249,39 @@ void ui_apply_saved_guild_order();
 
 void ui_view_profile_popup();
 void ui_view_server_info_popup();
+void ui_view_roles_popup();
+void ui_view_invites_popup();
+void ui_open_invites(snowflake guild_id);
+void ui_view_webhooks_popup();
+void ui_open_webhooks(snowflake guild_id);
+void ui_view_new_channel_popup();
+void ui_open_new_channel(snowflake guild_id);
+void ui_view_channel_perms_popup();
+void ui_open_channel_perms(snowflake channel_id);
+void ui_view_privacy_popup();
+void ui_open_privacy();
+void ui_view_audit_popup();
+void ui_view_music_popup();
+void ui_open_music();
+void ui_open_audit(snowflake guild_id);
+void ui_view_guild_edit_popup();
+void ui_open_guild_edit(snowflake guild_id);
+void ui_open_roles(snowflake guild_id);
+
+// The give-and-take-away submenu, for any place a member is right-clickable.
+void ui_member_roles_menu(snowflake guild_id, snowflake user_id);
+
+// Whether this account may pull somebody out of the voice channel they are
+// sitting in, and into to_channel_id. Passing 0 for the destination asks only
+// whether they can be moved at all, which is what a drag has to know before
+// it is allowed to start.
+bool ui_can_move_member(snowflake guild_id, snowflake user_id, snowflake to_channel_id);
+
+// Disconnecting, silencing, timing out and banning, for the same places. Each
+// item only appears when the account holds the permission for it and the
+// person on the other end is somebody it may be used on, so the menu is often
+// empty - in which case it draws nothing at all, not an empty heading.
+void ui_member_moderation_menu(snowflake guild_id, snowflake user_id);
 void ui_view_channel_info_popup();
 void ui_view_share_popup();
 
@@ -242,3 +329,7 @@ void ui_view_image_viewer();
 void ui_open_image_viewer(const char* url, const char* name);
 // Somebody else's screen. Draws nothing while no stream is being watched.
 void ui_view_stream_window();
+void ui_view_camera_window();
+
+// True when something on screen moves by itself and the frame cannot wait.
+bool ui_wants_redraw();

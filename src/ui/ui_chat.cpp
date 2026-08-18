@@ -6,6 +6,7 @@
 #include "textures.h"
 
 #include "core/app.h"
+#include "stb/stb_image.h"
 #include "core/log.h"
 #include "discord/store.h"
 #include "core/offline.h"
@@ -42,21 +43,132 @@ namespace
                 char name[MAX_PATH];
                 wcstochar(j->path, name, sizeof(name));
                 char msg[512];
-                cnprint(msg, sizeof(msg), "Сохранено: %s", name);
+                cnprint(msg, sizeof(msg), tr("Сохранено: %s"), name);
                 api::set_last_error(msg);
             }
             else
             {
-                api::set_last_error("Не удалось записать файл на диск");
+                api::set_last_error(tr("Не удалось записать файл на диск"));
             }
         }
         else
         {
-            api::set_last_error("Скачивание не удалось");
+            api::set_last_error(tr("Скачивание не удалось"));
         }
 
         res.free_response();
         memfree(j);
+    }
+
+    // A picture onto the clipboard, in the form the rest of Windows expects.
+    //
+    // CF_DIB and twenty four bits, not thirty two: the alpha channel in a DIB
+    // is not part of the old format and half the programs that paste one read
+    // it as garbage or ignore it. Anything transparent is laid over white here
+    // instead, which is what a viewer would have shown anyway.
+    bool copy_image_to_clipboard(const char* url)
+    {
+        ubuffer blob;
+        blob.init();
+
+        // Already on disk in the ordinary case - it is being looked at.
+        if (!tex::fetch_blob(url, &blob) || !blob.size)
+        {
+            blob.free_buffer();
+            api::set_last_error(tr("Картинка не загрузилась"));
+            return false;
+        }
+
+        int w = 0, h = 0, comp = 0;
+        unsigned char* rgba = stbi_load_from_memory(blob.data, (int)blob.size, &w, &h, &comp, 4);
+        blob.free_buffer();
+
+        if (!rgba || w <= 0 || h <= 0)
+        {
+            if (rgba) stbi_image_free(rgba);
+            api::set_last_error(tr("Формат картинки не поддерживается"));
+            return false;
+        }
+
+        // Rows are padded to a multiple of four bytes and stored bottom up.
+        int stride = (w * 3 + 3) & ~3;
+        unsigned int bytes = (unsigned int)(sizeof(BITMAPINFOHEADER) + (size_t)stride * h);
+
+        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (!mem)
+        {
+            stbi_image_free(rgba);
+            return false;
+        }
+
+        unsigned char* dst = (unsigned char*)GlobalLock(mem);
+        if (!dst)
+        {
+            GlobalFree(mem);
+            stbi_image_free(rgba);
+            return false;
+        }
+
+        BITMAPINFOHEADER* head = (BITMAPINFOHEADER*)dst;
+        ccfset(head, 0, sizeof(*head));
+        head->biSize = sizeof(BITMAPINFOHEADER);
+        head->biWidth = w;
+        head->biHeight = h;
+        head->biPlanes = 1;
+        head->biBitCount = 24;
+        head->biCompression = BI_RGB;
+        head->biSizeImage = (DWORD)((size_t)stride * h);
+
+        unsigned char* pixels = dst + sizeof(BITMAPINFOHEADER);
+
+        for (int y = 0; y < h; y++)
+        {
+            const unsigned char* src = rgba + (size_t)y * w * 4;
+            unsigned char* row = pixels + (size_t)(h - 1 - y) * stride;
+
+            for (int x = 0; x < w; x++)
+            {
+                int a = src[x * 4 + 3];
+                int r = src[x * 4 + 0];
+                int g = src[x * 4 + 1];
+                int b = src[x * 4 + 2];
+
+                // Over white, so a transparent corner does not arrive black.
+                if (a < 255)
+                {
+                    r = (r * a + 255 * (255 - a)) / 255;
+                    g = (g * a + 255 * (255 - a)) / 255;
+                    b = (b * a + 255 * (255 - a)) / 255;
+                }
+
+                row[x * 3 + 0] = (unsigned char)b;
+                row[x * 3 + 1] = (unsigned char)g;
+                row[x * 3 + 2] = (unsigned char)r;
+            }
+        }
+
+        GlobalUnlock(mem);
+        stbi_image_free(rgba);
+
+        if (!OpenClipboard(g_app.hwnd))
+        {
+            GlobalFree(mem);
+            return false;
+        }
+
+        EmptyClipboard();
+
+        // The clipboard owns the block from here whether or not it succeeded,
+        // so it must not be freed on the way out.
+        if (!SetClipboardData(CF_DIB, mem))
+        {
+            CloseClipboard();
+            GlobalFree(mem);
+            return false;
+        }
+
+        CloseClipboard();
+        return true;
     }
 
     void start_download(const char* url, const char* filename)
@@ -81,9 +193,9 @@ namespace
 
     void human_size(unsigned int bytes, char* out, int cap)
     {
-        if (bytes < 1024) cnprint(out, cap, "%u Б", bytes);
-        else if (bytes < 1024 * 1024) cnprint(out, cap, "%u КБ", bytes / 1024);
-        else cnprint(out, cap, "%u.%u МБ", bytes / (1024 * 1024), (bytes % (1024 * 1024)) * 10 / (1024 * 1024));
+        if (bytes < 1024) cnprint(out, cap, tr("%u Б"), bytes);
+        else if (bytes < 1024 * 1024) cnprint(out, cap, tr("%u КБ"), bytes / 1024);
+        else cnprint(out, cap, tr("%u.%u МБ"), bytes / (1024 * 1024), (bytes % (1024 * 1024)) * 10 / (1024 * 1024));
     }
 
     // Matches one extension against a url, starting at its dot. The extension
@@ -172,7 +284,7 @@ namespace
             ImVec2 size(w * scale, h * scale);
             ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), col::bg_hover, 6.0f);
 
-            const char* label = (t->state == TEX_FAILED) ? "не удалось загрузить" : "загрузка...";
+            const char* label = (t->state == TEX_FAILED) ? tr("не удалось загрузить") : tr("загрузка...");
             ImVec2 ts = ImGui::CalcTextSize(label);
             ImGui::GetWindowDrawList()->AddText(
                 ImVec2(p.x + (size.x - ts.x) * 0.5f, p.y + (size.y - ts.y) * 0.5f), col::text_muted, label);
@@ -380,7 +492,7 @@ namespace
         if (!showing)
         {
             const char* text = "";
-            if (mine && st == PLAYER_LOADING) text = "Загружается...";
+            if (mine && st == PLAYER_LOADING) text = tr("Загружается...");
             else if (mine && st == PLAYER_FAILED) text = player::last_error();
 
             if (text[0])
@@ -433,16 +545,16 @@ namespace
             format_clock(pos, elapsed, sizeof(elapsed));
             format_clock(dur, total, sizeof(total));
 
-            if (ImGui::SmallButton(st == PLAYER_PLAYING ? "Пауза" : "Играть"))
+            if (ImGui::SmallButton(st == PLAYER_PLAYING ? tr("Пауза") : tr("Играть")))
             {
                 if (st == PLAYER_ENDED) player::open(a->url);
                 else                    player::toggle_pause();
             }
             ImGui::SameLine();
-            if (ImGui::SmallButton(player::muted() ? "Звук выкл" : "Звук вкл"))
+            if (ImGui::SmallButton(player::muted() ? tr("Звук выкл") : tr("Звук вкл")))
                 player::set_muted(!player::muted());
             ImGui::SameLine();
-            if (ImGui::SmallButton("Стоп")) player::stop();
+            if (ImGui::SmallButton(tr("Стоп"))) player::stop();
 
             ImGui::SameLine();
             char clock[40];
@@ -462,11 +574,11 @@ namespace
             char size_text[32];
             human_size(a->size, size_text, sizeof(size_text));
 
-            ui_text_muted(a->filename ? a->filename : "видео");
+            ui_text_muted(a->filename ? a->filename : tr("видео"));
             ImGui::SameLine();
             ui_text_muted(size_text);
             ImGui::SameLine();
-            if (ImGui::SmallButton("Скачать")) start_download(a->url, a->filename);
+            if (ImGui::SmallButton(tr("Скачать"))) start_download(a->url, a->filename);
         }
     }
 
@@ -647,7 +759,9 @@ namespace
 
             if (ImGui::BeginPopupContextItem("##imgctx"))
             {
-                if (ImGui::MenuItem("Скачать")) start_download(a->url, a->filename);
+                if (ImGui::MenuItem(tr("Копировать картинку"))) copy_image_to_clipboard(image_url);
+                if (ImGui::MenuItem(tr("Копировать ссылку"))) ImGui::SetClipboardText(a->url);
+                if (ImGui::MenuItem(tr("Скачать"))) start_download(a->url, a->filename);
                 ImGui::EndPopup();
             }
         }
@@ -663,7 +777,7 @@ namespace
             ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 12, p.y + 28), col::text_muted, size_text);
 
             ImGui::SetCursorScreenPos(ImVec2(p.x + w - 104, p.y + 12));
-            if (ui_icon_button("Скачать##att", ImVec2(92, 28), col::accent, col::accent_hover))
+            if (ui_icon_button(tr("Скачать##att"), ImVec2(92, 28), col::accent, col::accent_hover))
                 start_download(a->url, a->filename);
 
             ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h + 4));
@@ -754,18 +868,18 @@ namespace
     {
         switch (type)
         {
-        case 1:  return "добавил участника в беседу";
-        case 2:  return "убрал участника из беседы";
-        case 3:  return "начал звонок";
-        case 4:  return "сменил название беседы";
-        case 5:  return "сменил значок беседы";
-        case 6:  return "закрепил сообщение";
-        case 7:  return "зашёл на сервер";
-        case 8:  case 9: case 10: case 11: return "забустил сервер";
-        case 12: return "подписался на канал";
-        case 18: return "создал ветку";
-        case 21: return "ответил в ветке";
-        case 46: return "опросу пришёл конец";
+        case 1:  return tr("добавил участника в беседу");
+        case 2:  return tr("убрал участника из беседы");
+        case 3:  return tr("начал звонок");
+        case 4:  return tr("сменил название беседы");
+        case 5:  return tr("сменил значок беседы");
+        case 6:  return tr("закрепил сообщение");
+        case 7:  return tr("зашёл на сервер");
+        case 8:  case 9: case 10: case 11: return tr("забустил сервер");
+        case 12: return tr("подписался на канал");
+        case 18: return tr("создал ветку");
+        case 21: return tr("ответил в ветке");
+        case 46: return tr("опросу пришёл конец");
         default: return 0;
         }
     }
@@ -791,7 +905,7 @@ namespace
 
         char line[256];
         cnprint(line, sizeof(line), "%s %s",
-                author ? author->display_name() : "кто-то", text);
+                author ? author->display_name() : tr("кто-то"), text);
         ImGui::TextUnformatted(line);
 
         char stamp[48];
@@ -844,7 +958,7 @@ namespace
 
             ImGui::PushFont(g_app.font_bold);
             ImGui::PushStyleColor(ImGuiCol_Text, col::text_normal);
-            ImGui::TextUnformatted(author ? author->display_name() : "неизвестный");
+            ImGui::TextUnformatted(author ? author->display_name() : tr("неизвестный"));
             ImGui::PopStyleColor();
             ImGui::PopFont();
 
@@ -860,7 +974,7 @@ namespace
             if (m->pending)
             {
                 ImGui::SameLine();
-                ui_text_muted("отправляется...");
+                ui_text_muted(tr("отправляется..."));
             }
             if (m->deleted)
             {
@@ -868,7 +982,7 @@ namespace
                 // was taken back, which is exactly why it is worth showing.
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Text, col::red);
-                ImGui::TextUnformatted("удалено");
+                ImGui::TextUnformatted(tr("удалено"));
                 ImGui::PopStyleColor();
             }
         }
@@ -889,7 +1003,7 @@ namespace
             }
             else
             {
-                ui_text_muted("> ответ на сообщение");
+                ui_text_muted(tr("> ответ на сообщение"));
             }
         }
 
@@ -937,21 +1051,40 @@ namespace
 
         if (ImGui::BeginPopup("##msgctx"))
         {
-            if (ImGui::MenuItem("Ответить")) g_ui.reply_to = m->id;
-            if (author && ImGui::MenuItem("Профиль автора")) ui_open_profile(author->id, m->guild_id);
-            if (m->content && ImGui::MenuItem("Копировать текст")) ImGui::SetClipboardText(m->content);
+            if (ImGui::MenuItem(tr("Ответить"))) g_ui.reply_to = m->id;
+            if (author && ImGui::MenuItem(tr("Профиль автора"))) ui_open_profile(author->id, m->guild_id);
+            if (m->content && ImGui::MenuItem(tr("Копировать текст"))) ImGui::SetClipboardText(m->content);
 
             ImGui::Separator();
-            if (author) ui_copy_id_item(author->id, "Скопировать ID автора");
-            ui_copy_id_item(m->id, "Скопировать ID сообщения");
-            ui_copy_id_item(m->channel_id, "Скопировать ID канала");
-            if (m->guild_id) ui_copy_id_item(m->guild_id, "Скопировать ID сервера");
+            if (author) ui_copy_id_item(author->id, tr("Скопировать ID автора"));
+            ui_copy_id_item(m->id, tr("Скопировать ID сообщения"));
+            ui_copy_id_item(m->channel_id, tr("Скопировать ID канала"));
+            if (m->guild_id) ui_copy_id_item(m->guild_id, tr("Скопировать ID сервера"));
 
-            if (author && author->id == store::self_id())
+            // Your own message always, somebody else's only with the
+            // permission for it. Working it out per message rather than per
+            // channel costs nothing here - the menu is open on one row - and
+            // it is the message's own channel that decides, not the one being
+            // looked at.
+            bool mine = author && author->id == store::self_id();
+            bool may_delete = mine;
+
+            if (!mine && m->guild_id)
+            {
+                dguild* g = store::find_guild(m->guild_id);
+                dchannel* c = store::find_channel(m->channel_id);
+                if (g)
+                    may_delete = (store::member_permissions(g, store::self_id(), c)
+                                  & PERM_MANAGE_MESSAGES) != 0;
+            }
+
+            if (may_delete)
             {
                 ImGui::Separator();
-                if (ImGui::MenuItem("Удалить")) api::delete_message(m->channel_id, m->id);
+                if (ImGui::MenuItem(tr("Удалить"))) api::delete_message(m->channel_id, m->id);
             }
+
+            if (author && m->guild_id) ui_member_moderation_menu(m->guild_id, author->id);
             ImGui::EndPopup();
         }
 
@@ -1124,7 +1257,7 @@ namespace
             }
         }
 
-        if (!shown) ui_text_muted("никого не нашлось");
+        if (!shown) ui_text_muted(tr("никого не нашлось"));
         ImGui::EndChild();
     }
 }
@@ -1139,7 +1272,7 @@ void ui_view_chat(float width, float height)
     if (!ch)
     {
         ImGui::SetCursorPos(ImVec2(width * 0.5f - 90.0f, height * 0.5f));
-        ui_text_muted("Выберите канал слева");
+        ui_text_muted(tr("Выберите канал слева"));
         return;
     }
 
@@ -1192,7 +1325,7 @@ void ui_view_chat(float width, float height)
             }
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip(in_this_call ? "Завершить звонок" : "Позвонить");
+            ImGui::SetTooltip(in_this_call ? tr("Завершить звонок") : tr("Позвонить"));
     }
 
     // ---- input block height ----
@@ -1236,7 +1369,7 @@ void ui_view_chat(float width, float height)
     if (ch->archive_messages > 0 && (offline::active() || !ch->history_loaded))
     {
         char note[96];
-        cnprint(note, sizeof(note), "Из архива: %d сообщений", ch->archive_messages);
+        cnprint(note, sizeof(note), tr("Из архива: %d сообщений"), ch->archive_messages);
 
         ImGui::Dummy(ImVec2(0, 4));
         ImGui::Indent(16.0f);
@@ -1247,7 +1380,7 @@ void ui_view_chat(float width, float height)
     {
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Indent(16.0f);
-        ui_text_muted("Этот канал в архив не попал. Прогрей его, когда будет связь.");
+        ui_text_muted(tr("Этот канал в архив не попал. Прогрей его, когда будет связь."));
         ImGui::Unindent(16.0f);
     }
 
@@ -1255,7 +1388,7 @@ void ui_view_chat(float width, float height)
     {
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Indent(16.0f);
-        ui_text_muted("Загрузка сообщений...");
+        ui_text_muted(tr("Загрузка сообщений..."));
         ImGui::Unindent(16.0f);
     }
     else if (ch->history_failed && !ch->history_loaded)
@@ -1263,10 +1396,10 @@ void ui_view_chat(float width, float height)
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Indent(16.0f);
         ui_text_muted(archive::channel_count(ch->id)
-                      ? "Дальше только сохранённое."
-                      : "История недоступна.");
+                      ? tr("Дальше только сохранённое.")
+                      : tr("История недоступна."));
         ImGui::SameLine();
-        if (ImGui::SmallButton("Повторить"))
+        if (ImGui::SmallButton(tr("Повторить")))
         {
             ch->history_failed = false;
             api::fetch_messages(ch->id, 0);
@@ -1277,7 +1410,7 @@ void ui_view_chat(float width, float height)
     {
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Indent(16.0f);
-        if (ImGui::SmallButton("Загрузить более старые сообщения"))
+        if (ImGui::SmallButton(tr("Загрузить более старые сообщения")))
             api::fetch_messages(ch->id, ch->messages[0].id);
         ImGui::Unindent(16.0f);
     }
@@ -1297,7 +1430,33 @@ void ui_view_chat(float width, float height)
 
         // Consecutive messages from one author within 7 minutes share a header.
         bool grouped = (m->author_id == prev_author) && (t - prev_time < 7 * 60 * 1000) && !m->referenced_id;
-        draw_message(m, grouped);
+
+        // A warmed channel holds hundreds of messages and the window shows
+        // twenty. Building the rest anyway - every avatar, every attachment
+        // card, every word measured for wrapping - is what the client was
+        // spending its idle time on.
+        //
+        // Skipping them has to leave the list exactly as long, or the scrollbar
+        // would jump about, so a message that has been drawn once is replaced
+        // by empty space of the height it had. One that has not been drawn yet
+        // has no height to stand in for and is drawn properly, which is also
+        // how it gets one.
+        float top = ImGui::GetCursorPosY();
+        bool measured = m->draw_height > 0.0f;
+        bool visible = !measured ||
+                       ImGui::IsRectVisible(ImVec2(0.0f, m->draw_height));
+
+        if (visible)
+        {
+            draw_message(m, grouped);
+
+            float height = ImGui::GetCursorPosY() - top;
+            if (height > 0.0f) m->draw_height = height;
+        }
+        else
+        {
+            ImGui::Dummy(ImVec2(1.0f, m->draw_height));
+        }
 
         prev_author = m->author_id;
         prev_time = t;
@@ -1326,10 +1485,10 @@ void ui_view_chat(float width, float height)
         dmessage* ref = store::find_message(ch, g_ui.reply_to);
         duser* ref_author = ref ? store::find_user(ref->author_id) : 0;
         char label[160];
-        cnprint(label, sizeof(label), "Ответ %s", ref_author ? ref_author->display_name() : "");
+        cnprint(label, sizeof(label), tr("Ответ %s"), ref_author ? ref_author->display_name() : "");
         ui_text_muted(label);
         ImGui::SameLine();
-        if (ImGui::SmallButton("отменить")) g_ui.reply_to = 0;
+        if (ImGui::SmallButton(tr("отменить"))) g_ui.reply_to = 0;
     }
 
     draw_attachment_tray(width);
@@ -1339,7 +1498,7 @@ void ui_view_chat(float width, float height)
         wchar_t path[1024];
         if (ufile::open_dialog(path, 1024)) ui_attach_path(path);
     }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Прикрепить файл (можно перетащить или вставить Ctrl+V)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Прикрепить файл (можно перетащить или вставить Ctrl+V)"));
 
     ImGui::SameLine();
     ImGui::SetNextItemWidth(width - 60.0f);
@@ -1350,7 +1509,15 @@ void ui_view_chat(float width, float height)
 
     bool input_active = ImGui::IsItemActive() || ImGui::IsItemFocused();
 
-    if (send) submit_message(ch);
+    if (send)
+    {
+        submit_message(ch);
+
+        // EnterReturnsTrue deactivates the box on the way out, so without this
+        // the next thing typed goes nowhere and the box has to be clicked
+        // again between every two messages. -1 is the item just submitted.
+        ImGui::SetKeyboardFocusHere(-1);
+    }
 
     ImGui::EndGroup();
 
@@ -1377,21 +1544,21 @@ void ui_view_chat(float width, float height)
         {
             char line[256];
             duser* first = store::find_user(writers[0]);
-            const char* a_name = first ? first->display_name() : "кто-то";
+            const char* a_name = first ? first->display_name() : tr("кто-то");
 
             if (count == 1)
             {
-                cnprint(line, sizeof(line), "%s печатает...", a_name);
+                cnprint(line, sizeof(line), tr("%s печатает..."), a_name);
             }
             else if (count == 2)
             {
                 duser* second = store::find_user(writers[1]);
-                cnprint(line, sizeof(line), "%s и %s печатают...", a_name,
-                        second ? second->display_name() : "кто-то");
+                cnprint(line, sizeof(line), tr("%s и %s печатают..."), a_name,
+                        second ? second->display_name() : tr("кто-то"));
             }
             else
             {
-                cnprint(line, sizeof(line), "%s и ещё %d печатают...", a_name, count - 1);
+                cnprint(line, sizeof(line), tr("%s и ещё %d печатают..."), a_name, count - 1);
             }
 
             ui_text_muted(line);
@@ -1562,28 +1729,32 @@ void ui_view_image_viewer()
         }
         else
         {
-            ui_text_muted("Загрузка изображения...");
+            ui_text_muted(tr("Загрузка изображения..."));
         }
 
-        if (ImGui::Button("Закрыть", ImVec2(110, 30)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+        if (ImGui::Button(tr("Закрыть"), ImVec2(110, 30)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
         {
             g_ui.viewer_open = false;
             ImGui::CloseCurrentPopup();
         }
 
         ImGui::SameLine();
-        if (ImGui::Button("Крупнее", ImVec2(90, 30))) g_ui.viewer_zoom *= 1.25f;
+        if (ImGui::Button(tr("Копировать"), ImVec2(130, 30)))
+            copy_image_to_clipboard(g_ui.viewer_url);
+
         ImGui::SameLine();
-        if (ImGui::Button("Мельче", ImVec2(90, 30))) g_ui.viewer_zoom *= 0.8f;
+        if (ImGui::Button(tr("Крупнее"), ImVec2(90, 30))) g_ui.viewer_zoom *= 1.25f;
         ImGui::SameLine();
-        if (ImGui::Button("Сбросить", ImVec2(100, 30)))
+        if (ImGui::Button(tr("Мельче"), ImVec2(90, 30))) g_ui.viewer_zoom *= 0.8f;
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Сбросить"), ImVec2(100, 30)))
         {
             g_ui.viewer_zoom = 1.0f;
             g_ui.viewer_pan = ImVec2(0, 0);
         }
 
         ImGui::SameLine();
-        if (ImGui::Button("Скачать", ImVec2(110, 30)))
+        if (ImGui::Button(tr("Скачать"), ImVec2(110, 30)))
         {
             char clean[260];
 
@@ -1606,7 +1777,7 @@ void ui_view_image_viewer()
         }
 
         ImGui::SameLine();
-        ui_text_muted("колесо - масштаб, перетаскивание - сдвиг");
+        ui_text_muted(tr("колесо - масштаб, перетаскивание - сдвиг"));
 
         ImGui::EndPopup();
     }

@@ -53,6 +53,7 @@ namespace
 
         int width, height;
         bool have_frame;      // something has been copied at least once
+        bool stale;           // the last grab returned the previous picture
     };
 
     dxgi_state g_dxgi;
@@ -518,6 +519,8 @@ namespace
     {
         if (!g_dxgi.dupl) return false;
 
+        g_dxgi.stale = false;
+
         DXGI_OUTDUPL_FRAME_INFO info;
         IDXGIResource* resource = 0;
 
@@ -528,6 +531,7 @@ namespace
             // Nothing on screen changed. The previous image is still correct,
             // and saying so costs nothing - this is most of why duplication is
             // cheaper than blitting the desktop thirty times a second.
+            g_dxgi.stale = true;
             return g_dxgi.have_frame;
         }
 
@@ -682,8 +686,8 @@ bool capture::start(const capture_target* target, int max_width, int max_height,
 
     if (max_width <= 0) max_width = target->width;
     if (max_height <= 0) max_height = target->height;
-    if (fps <= 0) fps = 30;
-    if (fps > 60) fps = 60;
+    if (fps < 1) fps = 1;
+    if (fps > SHARE_FPS_MAX) fps = SHARE_FPS_MAX;
 
     // Fit inside the limit without changing the shape of the picture, and never
     // upscale: sending more pixels than were captured buys nothing.
@@ -851,6 +855,9 @@ bool capture::grab(capture_frame* out)
 
     if (!ok) return false;
 
+    // Blitting has no way to tell one picture from the same picture, so it
+    // always claims a new one.
+    out->fresh = (g_method != CAPTURE_DXGI) || !g_dxgi.stale;
     out->time_us = now;
     g_captured++;
     return true;

@@ -44,6 +44,19 @@ namespace http
     // proxy on its own socket instead.
     void set_proxy(const proxy_config* cfg);
 
+    // Cookies discord has set on this client, kept across requests.
+    //
+    // A client that ignores Set-Cookie sends every request as though it had
+    // never spoken to the server before, and discord reads that the way it
+    // reads any other script: the browser carries about a kilobyte of these
+    // and is never asked for a CAPTCHA on an invite, this client carried none
+    // and always was.
+    //
+    // Only names and values are kept. Expiry, domain and path would matter to
+    // a general purpose client; everything here goes to one host.
+    void cookies_header(ubuffer* out);
+    void clear_cookies();
+
     // headers_utf8 is a "Name: Value\r\n"-joined block, or null.
     bool request(const char* method,
                  const char* url,

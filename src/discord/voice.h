@@ -40,6 +40,29 @@ namespace voice
     const char* last_stop_reason();
     unsigned short last_close_code();
 
+    // ---- cameras ---------------------------------------------------------
+    //
+    // Somebody else's webcam. It rides the voice connection already open, on
+    // its own source, so there is nothing to connect to and nothing to request
+    // - a camera simply starts arriving.
+    //
+    // One is decoded at a time, and it is the one being watched. The Media
+    // Foundation decoder is a single instance shared with the stream viewer,
+    // so several at once would need it split into instances first; watching a
+    // camera and a screen share together does not work for the same reason.
+    bool camera_on(snowflake user_id);
+    int cameras_on(snowflake* out, int cap);
+
+    snowflake watched_camera();
+    void watch_camera(snowflake user_id);   // zero stops watching
+
+    // The newest decoded picture as RGBA, false when nothing new has arrived.
+    // The bytes belong to the decoder and last until the next call.
+    bool take_camera_frame(const unsigned char** rgba, int* width, int* height);
+    int camera_width();
+    int camera_height();
+    unsigned int camera_frames();
+
     bool is_speaking(snowflake user_id);
     float speaking_level(snowflake user_id);
 

@@ -78,9 +78,24 @@ namespace mls
     // One MLSMessage wrapping a PublicMessage that carries a proposal.
     bool read_proposal_message(tls_reader* r, proposal_message* out);
 
-    // op 27 payload: uint8 is_revoke, then a vector of MLSMessages.
+    // op 27 payload: uint8 is_revoke, then either a vector of MLSMessages or,
+    // when it is a revoke, a vector of the 32 byte references of the
+    // proposals being taken back.
+    //
+    // out_revoked is where those references land. Without them the only
+    // possible response to a revoke is to forget every proposal held, and a
+    // commit that arrives afterwards naming one that was never revoked then
+    // cannot be resolved at all.
+    struct proposal_ref
+    {
+        unsigned char ref[32];
+    };
+
     bool parse_proposals_payload(const void* data, unsigned int len,
                                  bool* out_is_revoke,
                                  proposal_message* out, unsigned int cap,
-                                 unsigned int* out_count);
+                                 unsigned int* out_count,
+                                 proposal_ref* out_revoked = 0,
+                                 unsigned int revoked_cap = 0,
+                                 unsigned int* out_revoked_count = 0);
 }

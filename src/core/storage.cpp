@@ -363,7 +363,7 @@ void storage::accounts_load()
             saved_account entry;
             ccfset(&entry, 0, sizeof(entry));
             ccstrncpy(entry.token, legacy, sizeof(entry.token) - 1);
-            ccstrncpy(entry.name, "Аккаунт", sizeof(entry.name) - 1);
+            ccstrncpy(entry.name, tr("Аккаунт"), sizeof(entry.name) - 1);
             g_accounts.push(entry);
             g_active_account = 0;
             accounts_save();

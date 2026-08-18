@@ -63,7 +63,33 @@ namespace
         return true;
     }
 
-    bool pick_decoder()
+    // Whether the transform in hand asks for work instead of being asked, and
+    // the queue it asks through.
+    bool g_async = false;
+    IMFMediaEventGenerator* g_events = 0;
+
+    // Outstanding requests. An asynchronous transform says when it wants a
+    // frame and when it has one; doing either unasked is a protocol error.
+    int g_need_input = 0;
+    int g_have_output = 0;
+
+    // Frames waiting for a request to arrive. Small, because the transform asks
+    // freely: this only covers the moment between handing over a picture and
+    // being asked for the next.
+    const int PENDING_MAX = 16;
+    IMFSample* g_pending[PENDING_MAX];
+    int g_pending_count = 0;
+
+    void drop_pending()
+    {
+        for (int i = 0; i < g_pending_count; i++)
+            if (g_pending[i]) g_pending[i]->Release();
+        g_pending_count = 0;
+    }
+
+    // Tries one enumeration and takes the first transform it returns. Returns
+    // false without complaint - the caller has another kind to try.
+    bool try_decoder(UINT32 flags, const char* what)
     {
         MFT_REGISTER_TYPE_INFO want;
         want.guidMajorType = MFMediaType_Video;
@@ -72,19 +98,14 @@ namespace
         IMFActivate** found = 0;
         UINT32 count = 0;
 
-        // Synchronous only, for the same reason the encoder is: the event driven
-        // interface an asynchronous transform wants is not implemented here.
-        HRESULT hr = MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
-                               MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
-                               &want, 0, &found, &count);
-        if (FAILED(hr) || count == 0)
+        if (FAILED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flags, &want, 0, &found, &count)) ||
+            count == 0)
         {
-            set_error("нет ни одного декодера H.264", hr);
             if (found) CoTaskMemFree(found);
             return false;
         }
 
-        hr = found[0]->ActivateObject(IID_IMFTransform, (void**)&g_mft);
+        HRESULT hr = found[0]->ActivateObject(IID_IMFTransform, (void**)&g_mft);
 
         wchar_t* name = 0;
         UINT32 name_len = 0;
@@ -97,12 +118,98 @@ namespace
         for (UINT32 i = 0; i < count; i++) found[i]->Release();
         CoTaskMemFree(found);
 
-        if (FAILED(hr) || !g_mft)
+        if (FAILED(hr) || !g_mft) { release(&g_mft); return false; }
+
+        // A hardware transform arrives locked, and every call on it fails until
+        // the caller says it understands the asynchronous contract.
+        IMFAttributes* attrs = 0;
+        g_async = false;
+
+        if (SUCCEEDED(g_mft->GetAttributes(&attrs)) && attrs)
         {
-            set_error("декодер не запустился", hr);
+            UINT32 is_async = 0;
+            attrs->GetUINT32(MF_TRANSFORM_ASYNC, &is_async);
+            g_async = is_async != 0;
+
+            if (g_async && FAILED(attrs->SetUINT32(MF_TRANSFORM_ASYNC_UNLOCK, TRUE)))
+            {
+                attrs->Release();
+                release(&g_mft);
+                return false;
+            }
+            attrs->Release();
+        }
+
+        if (g_async &&
+            (FAILED(g_mft->QueryInterface(IID_IMFMediaEventGenerator, (void**)&g_events)) ||
+             !g_events))
+        {
+            release(&g_mft);
+            g_async = false;
             return false;
         }
+
+        log_line("decoder: %s - %s%s", what, g_name, g_async ? " (асинхронный)" : "");
         return true;
+    }
+
+    bool pick_decoder()
+    {
+        // Hardware first, and hardware means asynchronous: the event driven
+        // interface is the only one a graphics driver offers, which is why
+        // enumerating synchronous transforms alone - as this did - could only
+        // ever find Microsoft's software decoder. Decoding 1080p thirty times a
+        // second on the processor is most of what watching a share used to cost.
+        if (try_decoder(MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT |
+                        MFT_ENUM_FLAG_SORTANDFILTER, "аппаратный"))
+            return true;
+
+        // Nothing on the card, or it refused to unlock. The software transform
+        // still works and is what has been used all along.
+        if (try_decoder(MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                        "программный"))
+            return true;
+
+        set_error("нет ни одного декодера H.264", 0);
+        return false;
+    }
+
+    // Drains the request queue. Nothing here blocks: the events are polled, so
+    // the caller keeps its submit-and-poll shape and no extra thread appears.
+    void pump_events()
+    {
+        if (!g_events) return;
+
+        for (;;)
+        {
+            IMFMediaEvent* ev = 0;
+            if (FAILED(g_events->GetEvent(MF_EVENT_FLAG_NO_WAIT, &ev)) || !ev) break;
+
+            MediaEventType type = MEUnknown;
+            ev->GetType(&type);
+            ev->Release();
+
+            if (type == METransformNeedInput) g_need_input++;
+            else if (type == METransformHaveOutput) g_have_output++;
+        }
+    }
+
+    // Hands over as many waiting frames as the transform has asked for.
+    void feed_pending()
+    {
+        while (g_pending_count > 0 && g_need_input > 0)
+        {
+            IMFSample* sample = g_pending[0];
+            for (int i = 1; i < g_pending_count; i++) g_pending[i - 1] = g_pending[i];
+            g_pending_count--;
+
+            HRESULT hr = g_mft->ProcessInput(0, sample, 0);
+            sample->Release();
+
+            if (SUCCEEDED(hr)) { g_need_input--; g_in++; }
+            else if (hr != MF_E_NOTACCEPTING) { set_error("ProcessInput", hr); break; }
+            else break;      // asked too soon; the request stands
+        }
     }
 
     // A decoder holds several pictures back by default so it can reorder them.
@@ -247,30 +354,68 @@ void vdec::nv12_to_rgba(const unsigned char* nv12, int src_pitch, int plane_heig
     const unsigned char* y_plane = nv12;
     const unsigned char* uv_plane = nv12 + (size_t)src_pitch * plane_height;
 
+    // Two pixels at a time, because chroma is stored at half resolution and a
+    // pair shares one. Done per pixel, as this was, every chroma sample is
+    // fetched twice, masked into place twice and multiplied out twice for a
+    // result that cannot differ - and at two million pixels thirty times a
+    // second that duplication is most of the cost of watching somebody's
+    // screen.
+    //
+    // The three chroma terms are lifted out of the pair as well, so what is
+    // left inside is one multiply and an add per pixel.
     for (int y = 0; y < height; y++)
     {
         const unsigned char* y_row = y_plane + (size_t)(src_y + y) * src_pitch + src_x;
         const unsigned char* uv_row = uv_plane + (size_t)((src_y + y) / 2) * src_pitch + src_x;
-        unsigned char* out = dst + (size_t)y * width * 4;
+        unsigned int* out = (unsigned int*)(dst + (size_t)y * width * 4);
 
-        for (int x = 0; x < width; x++)
+        int x = 0;
+        for (; x + 1 < width; x += 2)
         {
-            int c = (int)y_row[x] - 16;
-            int u = (int)uv_row[(x & ~1) + 0] - 128;
-            int v = (int)uv_row[(x & ~1) + 1] - 128;
+            int u = (int)uv_row[x + 0] - 128;
+            int v = (int)uv_row[x + 1] - 128;
 
-            int r = (298 * c + 409 * v + 128) >> 8;
-            int g = (298 * c - 100 * u - 208 * v + 128) >> 8;
-            int b = (298 * c + 516 * u + 128) >> 8;
+            int rc = 409 * v + 128;
+            int gc = -100 * u - 208 * v + 128;
+            int bc = 516 * u + 128;
+
+            for (int k = 0; k < 2; k++)
+            {
+                int c = 298 * ((int)y_row[x + k] - 16);
+
+                int r = (c + rc) >> 8;
+                int g = (c + gc) >> 8;
+                int b = (c + bc) >> 8;
+
+                if (r < 0) r = 0; else if (r > 255) r = 255;
+                if (g < 0) g = 0; else if (g > 255) g = 255;
+                if (b < 0) b = 0; else if (b > 255) b = 255;
+
+                // One store instead of four. The layout is RGBA in memory,
+                // which on a little endian machine is this word.
+                out[x + k] = (unsigned int)r | ((unsigned int)g << 8) |
+                             ((unsigned int)b << 16) | 0xFF000000u;
+            }
+        }
+
+        // An odd width leaves one pixel, which takes the chroma of the pair it
+        // half belongs to.
+        if (x < width)
+        {
+            int u = (int)uv_row[x & ~1] - 128;
+            int v = (int)uv_row[(x & ~1) + 1] - 128;
+            int c = 298 * ((int)y_row[x] - 16);
+
+            int r = (c + 409 * v + 128) >> 8;
+            int g = (c - 100 * u - 208 * v + 128) >> 8;
+            int b = (c + 516 * u + 128) >> 8;
 
             if (r < 0) r = 0; else if (r > 255) r = 255;
             if (g < 0) g = 0; else if (g > 255) g = 255;
             if (b < 0) b = 0; else if (b > 255) b = 255;
 
-            out[x * 4 + 0] = (unsigned char)r;
-            out[x * 4 + 1] = (unsigned char)g;
-            out[x * 4 + 2] = (unsigned char)b;
-            out[x * 4 + 3] = 255;
+            out[x] = (unsigned int)r | ((unsigned int)g << 8) |
+                     ((unsigned int)b << 16) | 0xFF000000u;
         }
     }
 }
@@ -351,14 +496,28 @@ void vdec::stop()
         g_mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
     }
 
+    drop_pending();
+    g_need_input = 0;
+    g_have_output = 0;
+
+    release(&g_events);
     release(&g_out_buffer);
     release(&g_mft);
+    g_async = false;
     g_running = false;
 }
 
 void vdec::flush()
 {
     if (g_mft) g_mft->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+
+    // Requests outstanding across a flush describe frames that no longer
+    // exist. Acting on them afterwards asks the transform for output it has
+    // already thrown away, which it answers with an error that reads exactly
+    // like a broken stream.
+    drop_pending();
+    g_need_input = 0;
+    g_have_output = 0;
 }
 
 bool vdec::running() { return g_running; }
@@ -402,10 +561,31 @@ bool vdec::submit(const unsigned char* annexb, int len, unsigned long long time_
     sample->AddBuffer(buf);
     // Media Foundation counts in units of a hundred nanoseconds.
     sample->SetSampleTime((LONGLONG)(time_us * 10));
+    buf->Release();
+
+    if (g_async)
+    {
+        // Handed over only when asked for. Pushing at an asynchronous transform
+        // unbidden is not merely rude, it is refused.
+        pump_events();
+
+        if (g_pending_count >= PENDING_MAX)
+        {
+            // The transform has stopped asking. Give up the oldest rather than
+            // grow without limit - it is one picture, and the alternative is a
+            // queue that never drains.
+            g_pending[0]->Release();
+            for (int i = 1; i < g_pending_count; i++) g_pending[i - 1] = g_pending[i];
+            g_pending_count--;
+        }
+
+        g_pending[g_pending_count++] = sample;
+        feed_pending();
+        return true;
+    }
 
     hr = g_mft->ProcessInput(0, sample, 0);
     sample->Release();
-    buf->Release();
 
     // Being told to stop pushing is not a failure: it means output is waiting.
     if (hr == MF_E_NOTACCEPTING) return true;
@@ -415,9 +595,52 @@ bool vdec::submit(const unsigned char* annexb, int len, unsigned long long time_
     return true;
 }
 
+namespace
+{
+    // next() and next_nv12() are the same walk over the transform's output and
+    // differ only in what is written into the shared buffer at the end of it,
+    // so they share one body rather than two copies that drift apart.
+    bool g_want_planar = false;
+
+    // The visible region packed as it came out of the decoder: luma rows, then
+    // the interleaved chroma rows. Copying only - no arithmetic per pixel.
+    void pack_nv12(const unsigned char* src, int pitch, int plane_h,
+                   int vis_x, int vis_y, unsigned char* dst, int w, int h)
+    {
+        vis_x &= ~1;
+        vis_y &= ~1;
+
+        for (int y = 0; y < h; y++)
+            ccpy(dst + (size_t)y * w, src + (size_t)(vis_y + y) * pitch + vis_x, (size_t)w);
+
+        const unsigned char* uv = src + (size_t)pitch * plane_h;
+        unsigned char* out = dst + (size_t)w * h;
+
+        for (int y = 0; y < h / 2; y++)
+            ccpy(out + (size_t)y * w, uv + (size_t)(vis_y / 2 + y) * pitch + vis_x, (size_t)w);
+    }
+}
+
+bool vdec::next_nv12(const unsigned char** nv12, int* width, int* height)
+{
+    g_want_planar = true;
+    bool ok = vdec::next(nv12, width, height);
+    g_want_planar = false;
+    return ok;
+}
+
 bool vdec::next(const unsigned char** rgba, int* width, int* height)
 {
     if (!g_running) return false;
+
+    if (g_async)
+    {
+        // Nothing is ready until the transform says so, and asking anyway
+        // returns an error that looks exactly like a broken stream.
+        pump_events();
+        feed_pending();
+        if (g_have_output <= 0) return false;
+    }
 
     // The renegotiation below consumes the attempt, so the caller gets an
     // answer on the second pass rather than having to come back for it.
@@ -465,6 +688,8 @@ bool vdec::next(const unsigned char** rgba, int* width, int* height)
             release(&holder);
             return false;
         }
+
+        if (g_async && g_have_output > 0) g_have_output--;
 
         IMFSample* got = odb.pSample;
         bool ok = false;
@@ -515,10 +740,17 @@ bool vdec::next(const unsigned char** rgba, int* width, int* height)
                 pitch = -pitch;
             }
 
-            if (src && g_vis_w > 0 && g_vis_h > 0 && ensure_rgba(g_vis_w * g_vis_h * 4))
+            int need = g_want_planar ? (g_vis_w * g_vis_h * 3 / 2)
+                                     : (g_vis_w * g_vis_h * 4);
+
+            if (src && g_vis_w > 0 && g_vis_h > 0 && ensure_rgba(need))
             {
-                nv12_to_rgba(src, (int)pitch, g_buf_h, g_vis_x, g_vis_y,
-                             g_rgba, g_vis_w, g_vis_h);
+                if (g_want_planar)
+                    pack_nv12(src, (int)pitch, g_buf_h, g_vis_x, g_vis_y,
+                              g_rgba, g_vis_w, g_vis_h);
+                else
+                    nv12_to_rgba(src, (int)pitch, g_buf_h, g_vis_x, g_vis_y,
+                                 g_rgba, g_vis_w, g_vis_h);
 
                 // The one measurement that tells a decode that produced nothing
                 // apart from one that produced a picture nobody can see.

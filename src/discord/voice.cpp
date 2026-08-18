@@ -5,10 +5,16 @@
 #include "audio/audio.h"
 #include "audio/noise.h"
 #include "audio/vad.h"
+#include "audio/sounds.h"
+#include "audio/music.h"
+#include "science.h"
+#include "rest.h"           // only for the token a call's analytics is signed with
 #include "core/storage.h"
 #include "net/proxy.h"
 #include "core/log.h"
 #include "core/wavdump.h"
+#include "video/decoder.h"
+#include "video/rtp_video.h"
 #include "core/crypto.h"
 #include "net/websocket.h"
 #include "net/json.h"
@@ -43,6 +49,11 @@ enum
     VOP_RESUME = 7,
     VOP_HELLO = 8,
     VOP_RESUMED = 9,
+
+    // Who has a camera on, and which source it is coming from. Sent for every
+    // participant whose video state changes, including a change to off - which
+    // arrives as the same opcode with video_ssrc zero.
+    VOP_VIDEO = 12,
     VOP_CLIENT_DISCONNECT = 13,
 
     // DAVE. Ops 21-24 arrive as JSON, 25-31 as binary frames shaped
@@ -234,6 +245,9 @@ namespace
     unsigned int g_timestamp = 0;
     unsigned int g_nonce_counter = 0;
     bool g_speaking_sent = false;
+
+    // Whether the encoder is currently set up for music rather than speech.
+    bool g_music_encoding = false;
 
     // Frames of encoded silence to send after the last word before the
     // speaking flag is lowered.
@@ -497,6 +511,30 @@ namespace
         w.free_writer();
     }
 
+    // Discord's own numbering, taken from the stream viewer where it is already
+    // proven on the wire. Getting these wrong is silent: the server relays a
+    // codec nothing here can read.
+    const int PAYLOAD_OPUS = 120;
+    const int PAYLOAD_H264 = 105;
+    const int PAYLOAD_H264_RTX = 106;
+
+    // encode says what this client can send, decode what it can be sent. Audio
+    // goes both ways; video only comes in, because there is no camera capture
+    // on this side. Saying otherwise for opus would silence the microphone.
+    void add_codec(jwriter* w, const char* name, const char* type,
+                   int payload, int rtx, int priority, bool encode)
+    {
+        w->begin_obj();
+        w->kv_str("name", name);
+        w->kv_str("type", type);
+        w->kv_i64("priority", priority);
+        w->kv_i64("payload_type", payload);
+        w->kv_bool("encode", encode);
+        w->kv_bool("decode", true);
+        if (rtx >= 0) w->kv_i64("rtx_payload_type", rtx);
+        w->end_obj();
+    }
+
     void send_select_protocol(const char* address, unsigned short port, const char* mode)
     {
         jwriter w;
@@ -506,6 +544,21 @@ namespace
         w.key("d");
         w.begin_obj();
         w.kv_str("protocol", "udp");
+
+        // Without this list the server has no reason to relay anybody's camera
+        // here: the table is what maps an incoming payload type back to a
+        // codec, so declaring it is what turns video on for the receiving side.
+        //
+        // Only what there is a decoder for. Claiming the other four invites the
+        // server to send a camera in one of them, and then a picture arrives
+        // that nothing here can turn into pixels - which looks exactly like a
+        // camera that does not work.
+        w.key("codecs");
+        w.begin_arr();
+        add_codec(&w, "opus", "audio", PAYLOAD_OPUS, -1, 1000, true);
+        add_codec(&w, "H264", "video", PAYLOAD_H264, PAYLOAD_H264_RTX, 1000, false);
+        w.end_arr();
+
         w.key("data");
         w.begin_obj();
         w.kv_str("address", address);
@@ -720,7 +773,7 @@ namespace
                 // good standing and quietly ignores it, which is why the
                 // rebuild alone never recovered the call.
                 send_invalid_commit(transition_id);
-                dave_reinit("переход без коммита");
+                dave_reinit(tr("переход без коммита"));
             }
             return;
         }
@@ -758,7 +811,7 @@ namespace
         // notices.
         g_media_ready = false;
         send_invalid_commit(transition_id);
-        dave_reinit("коммит не применился");
+        dave_reinit(tr("коммит не применился"));
     }
 
     // The whole of a transition: the protocol version first, then the epoch.
@@ -783,7 +836,7 @@ namespace
                 g_own_commit_won = false;
 
                 log_line("dave: канал понижен с v%d до v0 - шифрование выключено", was);
-                set_status(VOICE_CONNECTED, "В голосовом канале (без E2EE)");
+                set_status(VOICE_CONNECTED, tr("В голосовом канале (без E2EE)"));
                 return;
             }
 
@@ -792,7 +845,7 @@ namespace
             g_dave_active = true;
             g_dave_downgraded = false;
             log_line("dave: канал переходит с v%d на v%d", was, g_dave_version);
-            dave_reinit("смена версии протокола");
+            dave_reinit(tr("смена версии протокола"));
             return;
         }
 
@@ -988,7 +1041,7 @@ namespace
             {
                 log_line("dave: welcome не открылся, представляюсь заново");
                 send_transition_response(transition_id, false);
-                dave_reinit("welcome не открылся");
+                dave_reinit(tr("welcome не открылся"));
                 break;
             }
 
@@ -1009,7 +1062,7 @@ namespace
             log_line("dave: welcome %s (transition %u)",
                      g_group_ready ? "accepted" : "REJECTED", transition_id);
 
-            if (g_media_ready) set_status(VOICE_CONNECTED, "В голосовом канале (E2EE)");
+            if (g_media_ready) set_status(VOICE_CONNECTED, tr("В голосовом канале (E2EE)"));
             send_transition_response(transition_id, g_group_ready);
             break;
         }
@@ -1295,9 +1348,13 @@ namespace
     {
         if (len < 12 + 16 + 4) return 0;
         if ((packet[0] & 0xC0) != 0x80) return 0;
-        // RTCP shares the port; only opus (payload type 120) is media. The top
-        // bit of byte 1 is the marker flag and has to be masked off first.
-        if ((packet[1] & 0x7F) != 0x78) return 0;
+        // RTCP shares the port, so the payload type is what separates media
+        // from control. The top bit of byte 1 is the marker flag and has to be
+        // masked off first - on video that bit is meaningful, it closes a
+        // frame, so reading it as part of the type would reject every last
+        // packet of every picture.
+        unsigned int pt = packet[1] & 0x7F;
+        if (pt != PAYLOAD_OPUS && pt != PAYLOAD_H264 && pt != PAYLOAD_H264_RTX) return 0;
 
         *out_ssrc = ((unsigned int)packet[8] << 24) | ((unsigned int)packet[9] << 16) |
                     ((unsigned int)packet[10] << 8) | packet[11];
@@ -1364,6 +1421,112 @@ namespace
     bool g_logged_decrypt_fail = false;
     bool g_logged_no_capture = false;
     bool g_logged_dave_frame = false;
+
+    // ---- cameras ---------------------------------------------------------
+    //
+    // A camera is not a second connection the way Go Live is: it rides the
+    // voice socket already open, on its own ssrc, and op 12 says whose it is.
+    //
+    // Only one is decoded at a time. The Media Foundation decoder in vdec is a
+    // single instance shared with the stream viewer, so showing four people at
+    // once would need it broken into instances first - a wider change than
+    // this, and one worth doing separately rather than half.
+    struct camera
+    {
+        snowflake user_id;
+        unsigned int video_ssrc;
+        unsigned int rtx_ssrc;
+        rtp_h264_rx rx;
+        bool rx_ready;
+        unsigned long long last_packet_tick;
+    };
+
+    ulist<camera> g_cameras;
+    snowflake g_watched_camera = 0;
+    volatile long g_camera_frames = 0;
+    volatile long g_camera_packets = 0;
+    bool g_camera_decoding = false;
+
+    camera* find_camera(snowflake user_id)
+    {
+        for (unsigned int i = 0; i < g_cameras.count; i++)
+            if (g_cameras[i].user_id == user_id) return &g_cameras[i];
+        return 0;
+    }
+
+    camera* find_camera_by_ssrc(unsigned int ssrc)
+    {
+        for (unsigned int i = 0; i < g_cameras.count; i++)
+            if (g_cameras[i].video_ssrc && g_cameras[i].video_ssrc == ssrc)
+                return &g_cameras[i];
+        return 0;
+    }
+
+    void drop_camera(snowflake user_id)
+    {
+        for (unsigned int i = 0; i < g_cameras.count; i++)
+        {
+            if (g_cameras[i].user_id != user_id) continue;
+
+            if (g_cameras[i].rx_ready) rtpvid::rx_free(&g_cameras[i].rx);
+            g_cameras.delete_at((int)i);
+            break;
+        }
+
+        if (g_watched_camera == user_id)
+        {
+            g_watched_camera = 0;
+            if (g_camera_decoding) { vdec::stop(); g_camera_decoding = false; }
+        }
+    }
+
+    // One packet of somebody's camera. Reassembled per person, but only the
+    // one being watched is decoded: the rest are tracked so the badge stays
+    // honest without paying for pictures nobody is looking at.
+    void feed_camera(unsigned int ssrc, const unsigned char* media, int len,
+                     bool marker, unsigned short seq, unsigned int timestamp)
+    {
+        camera* cam = find_camera_by_ssrc(ssrc);
+        if (!cam) return;
+
+        cam->last_packet_tick = g_tick;
+        InterlockedIncrement(&g_camera_packets);
+
+        if (cam->user_id != g_watched_camera) return;
+
+        if (!cam->rx_ready)
+        {
+            rtpvid::rx_init(&cam->rx);
+            cam->rx_ready = true;
+        }
+
+        const unsigned char* frame = 0;
+        unsigned int frame_len = 0;
+        if (!rtpvid::rx_push(&cam->rx, media, len, marker, seq, timestamp,
+                             &frame, &frame_len))
+            return;
+
+        if (!g_camera_decoding)
+        {
+            if (!vdec::start()) return;
+            g_camera_decoding = true;
+        }
+
+        // The video clock runs at 90 kHz, and the decoder wants microseconds.
+        vdec::submit(frame, (int)frame_len,
+                     (unsigned long long)timestamp * 1000ull / 90ull);
+        InterlockedIncrement(&g_camera_frames);
+    }
+
+    void clear_cameras()
+    {
+        for (unsigned int i = 0; i < g_cameras.count; i++)
+            if (g_cameras[i].rx_ready) rtpvid::rx_free(&g_cameras[i].rx);
+
+        g_cameras = ulist<camera>();
+        g_watched_camera = 0;
+        if (g_camera_decoding) { vdec::stop(); g_camera_decoding = false; }
+    }
 
     // ---- per-speaker pcm rings ------------------------------------------
 
@@ -1786,6 +1949,11 @@ namespace
             int got = proxy::udp_recv(&g_udp_route, packet, (int)sizeof(packet));
             if (got <= 0) break;
 
+            // Read before decryption: a retransmission carries a payload type
+            // of its own and belongs to no picture directly, and a camera the
+            // list does not know about must not be mistaken for a voice.
+            unsigned int packet_pt = packet[1] & 0x7F;
+
             unsigned int ssrc = 0;
             unsigned short seq = 0;
             int len = decrypt_packet(packet, got, payload, sizeof(payload), &ssrc, &seq);
@@ -1816,6 +1984,15 @@ namespace
                     EnterCriticalSection(&g_speakers_lock);
                     speaker* s = find_speaker(ssrc);
                     if (s) sender = s->user_id;
+
+                    // A camera has no speaker behind its ssrc, and its frames
+                    // are wrapped to the same person as their voice. Without
+                    // this every picture is thrown away for want of a name.
+                    if (!sender)
+                    {
+                        camera* cam = find_camera_by_ssrc(ssrc);
+                        if (cam) sender = cam->user_id;
+                    }
                     LeaveCriticalSection(&g_speakers_lock);
                 }
 
@@ -1849,6 +2026,22 @@ namespace
 
                 media = plain;
                 len = (int)plain_len;
+            }
+
+            // Video, if this ssrc belongs to somebody's camera. Checked before
+            // the audio path, because handing a picture to the opus decoder is
+            // exactly how a stream of noise gets made.
+            if (packet_pt != PAYLOAD_OPUS)
+            {
+                bool marker = (packet[1] & 0x80) != 0;
+                unsigned int timestamp =
+                    ((unsigned int)packet[4] << 24) | ((unsigned int)packet[5] << 16) |
+                    ((unsigned int)packet[6] << 8) | packet[7];
+
+                EnterCriticalSection(&g_speakers_lock);
+                feed_camera(ssrc, media, len, marker, seq, timestamp);
+                LeaveCriticalSection(&g_speakers_lock);
+                continue;
             }
 
             if (!g_logged_first_rx)
@@ -1905,8 +2098,19 @@ namespace
         // queue is plenty of cushion - anything older is dropped unsent.
         audio::trim_capture(4 * AUDIO_FRAME_SAMPLES * AUDIO_CHANNELS);
 
+        // The track, if one is playing. Pulled first and unconditionally: this
+        // tick is its clock, and skipping a pull on a tick where the
+        // microphone had nothing would leave the music running slow.
+        short track[AUDIO_FRAME_SAMPLES * AUDIO_CHANNELS];
+        bool have_music = music::next_frame(track);
+
+        if (have_music && music::monitoring())
+            audio::write_media(track, AUDIO_FRAME_SAMPLES * AUDIO_CHANNELS);
+
         short pcm[AUDIO_FRAME_SAMPLES * AUDIO_CHANNELS];
-        if (!audio::read_capture_frame(pcm))
+        bool have_mic = audio::read_capture_frame(pcm);
+
+        if (!have_mic)
         {
             if (!g_logged_no_capture && g_tick > 100)
             {
@@ -1914,12 +2118,28 @@ namespace
                 log_line("voice: no microphone frames after 2 s (capture active: %d)",
                          audio::capture_active() ? 1 : 0);
             }
-            return;
+
+            // A track still has to go out. Silence stands in for the
+            // microphone and the mix below carries the music alone.
+            if (!have_music) return;
+            ccfset(pcm, 0, sizeof(pcm));
         }
 
         // Without a group there is nothing to encrypt to, and plain opus on a
         // DAVE channel gets the session dropped.
-        if (g_muted || (g_dave_active && !g_media_ready))
+        if (g_dave_active && !g_media_ready)
+        {
+            if (g_speaking_sent) { send_speaking(false); g_speaking_sent = false; }
+            vad::reset();
+            return;
+        }
+
+        // Muting silences the microphone, not the track: the mute button is
+        // about this room, and a person muting themselves to cough should not
+        // cut the music off with it.
+        bool mic_open = !g_muted && have_mic;
+
+        if (!mic_open && !have_music)
         {
             if (g_speaking_sent) { send_speaking(false); g_speaking_sent = false; }
             vad::reset();
@@ -1929,13 +2149,32 @@ namespace
         // Downmix before denoising: every suppressor expects mono.
         short mono[AUDIO_FRAME_SAMPLES];
         for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++)
-            mono[i] = (short)((pcm[i * 2] + pcm[i * 2 + 1]) / 2);
+            mono[i] = mic_open ? (short)((pcm[i * 2] + pcm[i * 2 + 1]) / 2) : (short)0;
 
-        noise::process(mono, AUDIO_FRAME_SAMPLES);
+        if (mic_open) noise::process(mono, AUDIO_FRAME_SAMPLES);
 
         // Judged after the suppressor, so the threshold is set against what
         // would actually have been sent rather than against the raw room.
-        bool talk = vad::speaking(mono, AUDIO_FRAME_SAMPLES);
+        bool talk = mic_open && vad::speaking(mono, AUDIO_FRAME_SAMPLES);
+
+        // The music is added after the gate rather than before it. Judging a
+        // frame that already has a track in it would leave the gate open for
+        // as long as the track ran, and every silence between words would go
+        // out as room noise.
+        if (have_music)
+        {
+            for (int i = 0; i < AUDIO_FRAME_SAMPLES; i++)
+            {
+                int v = mono[i] + ((track[i * 2] + track[i * 2 + 1]) / 2);
+                if (v > 32767) v = 32767;
+                if (v < -32768) v = -32768;
+                mono[i] = (short)v;
+            }
+
+            // Whatever the gate thought of the microphone, there is something
+            // to send.
+            talk = true;
+        }
 
         if (!talk)
         {
@@ -1973,13 +2212,30 @@ namespace
             // first frame of a new one makes it code that frame as a
             // continuation of something the far side stopped hearing long ago,
             // and their decoder rings on it. Start the burst clean.
+            science::start_speaking(g_channel_id, g_guild_id);
+
             opus_encoder_ctl(g_encoder, OPUS_RESET_STATE);
-            opus_encoder_ctl(g_encoder, OPUS_SET_BITRATE(64000));
-            opus_encoder_ctl(g_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
             opus_encoder_ctl(g_encoder, OPUS_SET_COMPLEXITY(0));
 
             send_speaking(true);
             g_speaking_sent = true;
+
+            // Forces the settings below to be applied to the fresh state.
+            g_music_encoding = !have_music;
+        }
+
+        // Speech and music want different encoders. Voice mode spends its
+        // bits on a band a voice lives in and folds the rest away, which is
+        // exactly wrong for a track; sixty four kilobits is also thin for one.
+        // Changed only when it changes, because each of these walks into the
+        // encoder's state.
+        if (have_music != g_music_encoding)
+        {
+            g_music_encoding = have_music;
+
+            opus_encoder_ctl(g_encoder, OPUS_SET_BITRATE(have_music ? 128000 : 64000));
+            opus_encoder_ctl(g_encoder, OPUS_SET_SIGNAL(have_music ? OPUS_SIGNAL_MUSIC
+                                                                   : OPUS_SIGNAL_VOICE));
         }
 
         unsigned char encoded[1400];
@@ -2045,8 +2301,8 @@ namespace
                 else if (g_tick - g_silent_since > 750)      // 15 s
                 {
                     g_silent_since = g_tick;
-                    set_status(VOICE_CONNECTED, "E2EE не согласовано, пробую заново");
-                    dave_reinit("пятнадцать секунд без ключей");
+                    set_status(VOICE_CONNECTED, tr("E2EE не согласовано, пробую заново"));
+                    dave_reinit(tr("пятнадцать секунд без ключей"));
                 }
             }
             else
@@ -2106,16 +2362,16 @@ namespace
         else
         {
             log_line("voice: no supported encryption mode offered");
-            set_status(VOICE_FAILED, "Сервер не предлагает поддерживаемое шифрование");
+            set_status(VOICE_FAILED, tr("Сервер не предлагает поддерживаемое шифрование"));
             return;
         }
 
         log_line("voice: ready ssrc=%u %s:%u mode=%s", g_ssrc, g_udp_host, g_udp_port, chosen);
-        set_status(VOICE_CONNECTING, "Согласование UDP...");
+        set_status(VOICE_CONNECTING, tr("Согласование UDP..."));
 
         if (!udp_connect())
         {
-            set_status(VOICE_FAILED, "UDP-соединение не установлено");
+            set_status(VOICE_FAILED, tr("UDP-соединение не установлено"));
             return;
         }
 
@@ -2123,7 +2379,7 @@ namespace
         unsigned short external_port = 0;
         if (!udp_discover(external_ip, sizeof(external_ip), &external_port))
         {
-            set_status(VOICE_FAILED, "IP discovery не ответил");
+            set_status(VOICE_FAILED, tr("IP discovery не ответил"));
             return;
         }
 
@@ -2142,7 +2398,7 @@ namespace
         const jval* key = d->arr("secret_key");
         if (key->count < 32)
         {
-            set_status(VOICE_FAILED, "Некорректный ключ сессии");
+            set_status(VOICE_FAILED, tr("Некорректный ключ сессии"));
             return;
         }
         for (int i = 0; i < 32; i++)
@@ -2174,7 +2430,7 @@ namespace
             if (err != OPUS_OK || !g_encoder)
             {
                 log_line("voice: opus encoder failed (%d)", err);
-                set_status(VOICE_FAILED, "Не удалось создать кодек");
+                set_status(VOICE_FAILED, tr("Не удалось создать кодек"));
                 return;
             }
             opus_encoder_ctl(g_encoder, OPUS_SET_BITRATE(64000));
@@ -2205,7 +2461,7 @@ namespace
         g_logged_dave_frame = false;
 
         InterlockedExchange(&g_session_ready, 1);
-        set_status(VOICE_CONNECTED, g_dave_active ? "В канале, согласование E2EE..." : "В голосовом канале");
+        set_status(VOICE_CONNECTED, g_dave_active ? tr("В канале, согласование E2EE...") : tr("В голосовом канале"));
         log_line("voice: session established");
     }
 
@@ -2299,8 +2555,60 @@ namespace
                 g_dave_version_next = version;
                 g_dave_active = version > 0;
                 g_dave_downgraded = false;
-                dave_reinit("эпоха 1");
+                dave_reinit(tr("эпоха 1"));
             }
+            break;
+        }
+
+        case VOP_VIDEO:
+        {
+            // Somebody's camera changed state. The same opcode carries both
+            // "on" and "off": off is a video_ssrc of zero, and dropping the
+            // entry then is what stops a tile lingering after they turn it off.
+            snowflake uid = d->sf("user_id");
+            unsigned int video_ssrc = (unsigned int)d->i64("video_ssrc", 0);
+            unsigned int rtx_ssrc = (unsigned int)d->i64("rtx_ssrc", 0);
+            unsigned int audio_ssrc = (unsigned int)d->i64("audio_ssrc", 0);
+
+            if (!uid) break;
+
+            EnterCriticalSection(&g_speakers_lock);
+
+            // The audio ssrc comes with it, and it is often the first place a
+            // name gets attached to a stream.
+            if (audio_ssrc) ensure_speaker(audio_ssrc, uid);
+
+            if (!video_ssrc)
+            {
+                if (find_camera(uid))
+                {
+                    log_line("voice: камера выключена у %llu", uid);
+                    drop_camera(uid);
+                }
+            }
+            else
+            {
+                camera* cam = find_camera(uid);
+                if (!cam)
+                {
+                    camera fresh;
+                    ccfset(&fresh, 0, sizeof(fresh));
+                    fresh.user_id = uid;
+                    g_cameras.push(fresh);
+                    cam = &g_cameras[g_cameras.count - 1];
+                }
+
+                if (cam->video_ssrc != video_ssrc)
+                {
+                    if (cam->rx_ready) rtpvid::rx_reset(&cam->rx);
+                    cam->video_ssrc = video_ssrc;
+                }
+                cam->rtx_ssrc = rtx_ssrc;
+
+                log_line("voice: камера включена у %llu (video ssrc %u)", uid, video_ssrc);
+            }
+
+            LeaveCriticalSection(&g_speakers_lock);
             break;
         }
 
@@ -2308,6 +2616,7 @@ namespace
         {
             snowflake uid = d->sf("user_id");
             EnterCriticalSection(&g_speakers_lock);
+            drop_camera(uid);
             for (unsigned int i = 0; i < g_speakers.count; i++)
             {
                 if (g_speakers[i].user_id == uid)
@@ -2342,7 +2651,7 @@ namespace
         ubuffer message;
         message.init(1 << 14);
 
-        set_status(VOICE_CONNECTING, "Подключение к голосовому серверу...");
+        set_status(VOICE_CONNECTING, tr("Подключение к голосовому серверу..."));
 
         g_ws.init();
         if (g_ws.connect(url, "Origin: https://discord.com\r\n", via))
@@ -2360,7 +2669,7 @@ namespace
         }
         else
         {
-            set_status(VOICE_FAILED, "Голосовой сервер недоступен");
+            set_status(VOICE_FAILED, tr("Голосовой сервер недоступен"));
         }
 
         // The close code is the whole answer when a connection dies during an
@@ -2402,7 +2711,7 @@ namespace
         g_ws.destroy();
 
         if (g_running && g_state != VOICE_FAILED)
-            set_status(VOICE_IDLE, "Голосовой канал закрыт");
+            set_status(VOICE_IDLE, tr("Голосовой канал закрыт"));
 
         CoUninitialize();
         return 0;
@@ -2466,6 +2775,7 @@ namespace
         audio::stop_render();
 
         clear_speakers();
+        clear_cameras();
         if (g_encoder) { opus_encoder_destroy(g_encoder); g_encoder = 0; }
 
         if (!keep_server)
@@ -2556,12 +2866,22 @@ void voice::join(snowflake guild_id, snowflake channel_id)
     g_guild_id = guild_id;
     g_channel_id = channel_id;
 
-    set_status(VOICE_CONNECTING, "Запрос голосового сервера...");
+    // Whose call this is, taken now. The gateway that opened it is deliberately
+    // kept alive across an account switch, so analytics about it has to keep
+    // naming the account that is actually in the channel.
+    science::set_voice_identity(api::token(), science::analytics_token());
+    science::join_voice_channel(channel_id, guild_id);
+    set_status(VOICE_CONNECTING, tr("Запрос голосового сервера..."));
     gateway::update_voice_state(guild_id, channel_id, g_muted, g_deafened);
 }
 
 void voice::leave()
 {
+    // Played here rather than left to the gateway: by the time the dispatch
+    // announcing our own departure arrives the channel has been forgotten,
+    // and the handler there has nothing left to compare against.
+    sounds::play(SOUND_VOICE_LEAVE);
+
     snowflake guild = g_guild_id;
     g_stop_reason = "нажата трубка";
     stop_voice_connection();
@@ -2573,6 +2893,9 @@ void voice::leave()
     g_channel_id = 0;
     g_pending_guild = 0;
     g_pending_channel = 0;
+
+    // Sends what is still queued under the call's account before forgetting it.
+    science::clear_voice_identity();
 
     gateway::update_voice_state(guild, 0, false, false);
     set_status(VOICE_IDLE, "");
@@ -2633,6 +2956,72 @@ bool voice::last_rx_report(voice::rx_report* out)
 }
 
 bool voice::e2ee_active() { return g_dave_active && g_media_ready; }
+
+// ---- cameras --------------------------------------------------------------
+
+bool voice::camera_on(snowflake user_id)
+{
+    if (!g_locks_ready || !user_id) return false;
+
+    EnterCriticalSection(&g_speakers_lock);
+    bool on = find_camera(user_id) != 0;
+    LeaveCriticalSection(&g_speakers_lock);
+    return on;
+}
+
+int voice::cameras_on(snowflake* out, int cap)
+{
+    if (!g_locks_ready || !out || cap <= 0) return 0;
+
+    int count = 0;
+    EnterCriticalSection(&g_speakers_lock);
+    for (unsigned int i = 0; i < g_cameras.count && count < cap; i++)
+        out[count++] = g_cameras[i].user_id;
+    LeaveCriticalSection(&g_speakers_lock);
+    return count;
+}
+
+snowflake voice::watched_camera() { return g_watched_camera; }
+
+void voice::watch_camera(snowflake user_id)
+{
+    if (!g_locks_ready) return;
+
+    EnterCriticalSection(&g_speakers_lock);
+
+    if (g_watched_camera != user_id)
+    {
+        // Whatever was half assembled belonged to the last person; keeping it
+        // would splice two pictures together.
+        camera* was = find_camera(g_watched_camera);
+        if (was && was->rx_ready) rtpvid::rx_reset(&was->rx);
+
+        g_watched_camera = user_id;
+
+        if (g_camera_decoding)
+        {
+            vdec::stop();
+            g_camera_decoding = false;
+        }
+
+        camera* now = find_camera(user_id);
+        if (now && now->rx_ready) rtpvid::rx_reset(&now->rx);
+
+        log_line(user_id ? "voice: смотрю камеру %llu" : "voice: камера закрыта", user_id);
+    }
+
+    LeaveCriticalSection(&g_speakers_lock);
+}
+
+bool voice::take_camera_frame(const unsigned char** rgba, int* width, int* height)
+{
+    if (!g_camera_decoding) return false;
+    return vdec::next(rgba, width, height);
+}
+
+int voice::camera_width() { return g_camera_decoding ? vdec::width() : 0; }
+int voice::camera_height() { return g_camera_decoding ? vdec::height() : 0; }
+unsigned int voice::camera_frames() { return (unsigned int)g_camera_frames; }
 
 float voice::user_volume(snowflake user_id)
 {
@@ -2812,6 +3201,6 @@ void voice::on_gateway_disconnected()
 {
     g_stop_reason = "гейтвей отключился";
     stop_voice_connection();
-    if (g_channel_id) set_status(VOICE_IDLE, "Соединение потеряно");
+    if (g_channel_id) set_status(VOICE_IDLE, tr("Соединение потеряно"));
 }
 

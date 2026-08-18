@@ -10,6 +10,7 @@
 #include "imgui_impl_dx11.h"
 #include "system/io/ufile.h"
 #include "ui/ui.h"
+#include "discord/science.h"
 #include "ui/theme.h"
 #include "log.h"
 
@@ -385,26 +386,68 @@ int app_main()
 
     build_fonts();
     log_line("app: fonts built");
+    // What the person chose, before the first frame is drawn - otherwise the
+    // client flashes discord's colours and then changes to theirs.
+    theme::load();
     theme_apply();
 
     ImGui_ImplWin32_Init(g_app.hwnd);
     ImGui_ImplDX11_Init(g_app.device, g_app.context);
     log_line("app: imgui backends ready");
 
+    // Before anything draws, so the first frame is already in the right
+    // language rather than switching under the person a moment later.
+    lang::init();
+
+    science::init();
     ui_init();
     log_line("app: entering main loop");
 
     g_app.running = true;
+
+    // When input was last seen. A window is only "at rest" once the cursor has
+    // stopped for a moment - hover highlights and a blinking caret are still
+    // animation, and cutting the rate the instant the mouse stops would show
+    // as the interface going sticky under the hand.
+    unsigned long long last_input = GetTickCount64();
+
     while (g_app.running)
     {
         MSG msg;
+        bool had_input = false;
+
         while (PeekMessageW(&msg, 0, 0, 0, PM_REMOVE))
         {
+            if (msg.message != WM_TIMER && msg.message != WM_PAINT) had_input = true;
+
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
             if (msg.message == WM_QUIT) g_app.running = false;
         }
         if (!g_app.running) break;
+
+        if (had_input) last_input = GetTickCount64();
+
+        // Three speeds, and which one applies is decided here.
+        //
+        // Under the hand: whatever the monitor does, because that is the only
+        // case where the refresh rate is the thing being judged.
+        //
+        // Watching a picture with nobody touching anything: sixty. A screen
+        // share arrives at thirty frames a second and a camera at less, so a
+        // hundred and forty four rebuilds of the whole interface produce the
+        // same picture four times over. That is the bulk of what watching a
+        // share costs on this side, and none of it is the video.
+        //
+        // Nothing at all: wait for an event. Any message ends the wait, so the
+        // first thing the mouse does wakes it and nothing feels sticky.
+        bool idle = GetTickCount64() - last_input > 400;
+
+        if (idle)
+        {
+            DWORD wait = ui_wants_redraw() ? 16 : 60;
+            MsgWaitForMultipleObjects(0, 0, FALSE, wait, QS_ALLINPUT);
+        }
 
         if (g_app.occluded && g_app.swapchain->Present(0, DXGI_PRESENT_TEST) == DXGI_STATUS_OCCLUDED)
         {
@@ -440,6 +483,9 @@ int app_main()
     }
 
     ui_shutdown();
+
+    // Before the network goes, so the last batch is not simply dropped.
+    science::shutdown();
 
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

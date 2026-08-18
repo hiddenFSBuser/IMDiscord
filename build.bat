@@ -117,11 +117,15 @@ for /r "%SRC%" %%F in (*.cpp) do (
     if /i "%%~nxF"=="imgui_demo.cpp"      set "SKIP=1"
     rem Built on its own line with /Oi-; see the section above.
     if /i "%%~nxF"=="customcrt_mathalias.cpp" set "SKIP=1"
-    rem Only the speexdsp preprocessor is used; the rest of the library would
-    rem drag in an echo canceller, a resampler and a jitter buffer for nothing.
+    rem The speexdsp preprocessor and its resampler. The rest of the library
+    rem would drag in an echo canceller and a jitter buffer for nothing.
+    rem
+    rem The resampler earns its place: an mp3 is almost always 44.1 kHz and
+    rem opus encodes at 48, so every track played into a call goes through it.
+    rem Linear interpolation is what the chat video player uses, and for music
+    rem it is audibly not good enough.
     if /i "%%~nxF"=="buffer.cpp"          set "SKIP=1"
     if /i "%%~nxF"=="jitter.cpp"          set "SKIP=1"
-    if /i "%%~nxF"=="resample.cpp"        set "SKIP=1"
     if /i "%%~nxF"=="scal.cpp"            set "SKIP=1"
     if /i "%%~nxF"=="smallft.cpp"         set "SKIP=1"
 

@@ -20,7 +20,7 @@ namespace
         w->u64(g->epoch);
         w->opaque(g->tree_hash, 32);
         w->opaque(g->confirmed_transcript_hash, g->confirmed_transcript_hash_len);
-        w->opaque(0, 0);   // extensions<V>
+        w->opaque(g->context_extensions, g->context_extensions_len);
     }
 
     // ParentNode { HPKEPublicKey encryption_key; opaque parent_hash<V>;
@@ -164,6 +164,51 @@ namespace
         ccfset(member_prk, 0, sizeof(member_prk));
     }
 
+    // A leaf added without an UpdatePath cannot read anything encrypted to the
+    // parents above it, so RFC 9420 has every node on its direct path record
+    // it in unmerged_leaves - both so a resolution lists it and, which is what
+    // bit here, because those nodes are hashed into the tree hash.
+    //
+    // Leaving this out is invisible while every parent is blank, which is the
+    // whole of any group this client builds by itself and the whole of its own
+    // tests. Against a real group it is not invisible at all: the tree arrives
+    // from a Welcome with real parents in it, the first Add afterwards hashes
+    // to something nobody else computed, and the confirmation tag of the very
+    // next commit fails. Which is exactly what the logs showed, twice.
+    void add_unmerged_leaf(group_state* g, unsigned int leaf)
+    {
+        unsigned int path[MAX_NODES];
+        unsigned int count = mls_tree::direct_path(mls_tree::leaf_to_node(leaf),
+                                                   g->leaf_count, path, MAX_NODES);
+
+        for (unsigned int i = 0; i < count; i++)
+        {
+            unsigned int node = path[i];
+            if (node >= MAX_NODES) continue;
+
+            parent_node* p = &g->parents[node];
+
+            // A blank parent stays blank; it has no list to record anything in.
+            if (!p->used) continue;
+            if (p->unmerged_count >= MAX_UNMERGED) continue;
+
+            // In increasing order, and never twice.
+            bool seen = false;
+            for (unsigned int k = 0; k < p->unmerged_count && !seen; k++)
+                seen = p->unmerged[k] == leaf;
+            if (seen) continue;
+
+            unsigned int at = p->unmerged_count;
+            while (at > 0 && p->unmerged[at - 1] > leaf)
+            {
+                p->unmerged[at] = p->unmerged[at - 1];
+                at--;
+            }
+            p->unmerged[at] = leaf;
+            p->unmerged_count++;
+        }
+    }
+
     unsigned int allocate_leaf(group_state* g)
     {
         for (unsigned int i = 0; i < g->leaf_count; i++)
@@ -265,8 +310,14 @@ namespace
         unsigned char ref[32];
     };
 
+    // One reference per proposal being committed, in the order they arrived.
+    struct committed_ref
+    {
+        unsigned char ref[32];
+    };
+
     void write_framed_content_commit(const group_state* g,
-                                     const pending_add* adds, unsigned int add_count,
+                                     const committed_ref* refs, unsigned int ref_count,
                                      tls_writer* w)
     {
         w->opaque(g->group_id, g->group_id_len);
@@ -279,15 +330,17 @@ namespace
         // Commit { ProposalOrRef proposals<V>; optional<UpdatePath> path; }
         tls_writer proposals;
         proposals.init(1024);
-        for (unsigned int i = 0; i < add_count; i++)
+        for (unsigned int i = 0; i < ref_count; i++)
         {
             proposals.u8(2);                    // ProposalOrRefType: reference
-            proposals.opaque(adds[i].ref, 32);
+            proposals.opaque(refs[i].ref, 32);
         }
         w->opaque(proposals);
         proposals.free_writer();
 
-        // Adds alone do not require an UpdatePath.
+        // Adds and removes alone do not require an UpdatePath, and libdave
+        // does not send one for them either - it commits with force_path
+        // false, which leaves the path out whenever the proposals allow it.
         write_optional_absent(w);
     }
 
@@ -310,29 +363,70 @@ bool build_commit(group_state* g,
 {
     if (!g->established) return false;
 
-    // ---- collect the adds ----
+    // ---- collect what is being committed ----
+    //
+    // Removes as well as adds. A commit that carries only the adds leaves this
+    // client sitting on an epoch the rest of the group has left the moment
+    // somebody stops watching - and from there nothing it sends can be opened
+    // by anyone.
     pending_add adds[MAX_MEMBERS];
     unsigned int add_count = 0;
+
+    unsigned int removes[MAX_MEMBERS];
+    unsigned int remove_count = 0;
+
+    committed_ref refs[MAX_MEMBERS * 2];
+    unsigned int ref_count = 0;
 
     for (unsigned int i = 0; i < proposal_count; i++)
     {
         const proposal* p = &proposals[i].prop;
-        if (p->type != PROPOSAL_ADD) continue;
-        if (add_count >= MAX_MEMBERS) break;
+        if (ref_count >= MAX_MEMBERS * 2) break;
 
-        if (!p->add.verify())
+        if (p->type == PROPOSAL_ADD)
         {
-            log_line("mls: rejecting an add whose key package does not verify");
+            if (add_count >= MAX_MEMBERS) continue;
+
+            if (!p->add.verify())
+            {
+                log_line("mls: rejecting an add whose key package does not verify");
+                continue;
+            }
+
+            adds[add_count].kp = p->add;
+            add_count++;
+        }
+        else if (p->type == PROPOSAL_REMOVE)
+        {
+            if (remove_count >= MAX_MEMBERS) continue;
+            if (p->remove_index >= MAX_MEMBERS || !g->leaf_used[p->remove_index])
+            {
+                log_line("mls: rejecting a remove of a leaf that is not there");
+                continue;
+            }
+
+            // Committing our own removal would be committing to leave, and
+            // whoever is streaming is not the one who should be doing that.
+            if (p->remove_index == g->my_leaf)
+            {
+                log_line("mls: refusing to commit our own removal");
+                continue;
+            }
+
+            removes[remove_count++] = p->remove_index;
+        }
+        else
+        {
             continue;
         }
 
-        adds[add_count].kp = p->add;
-        // The reference covers the whole AuthenticatedContent, not the proposal.
-        proposals[i].compute_ref(adds[add_count].ref);
-        add_count++;
+        // The reference covers the whole AuthenticatedContent, not the
+        // proposal, and the commit names them in the order they arrived.
+        proposals[i].compute_ref(refs[ref_count].ref);
+        ref_count++;
     }
 
-    if (add_count == 0)
+    if (ref_count == 0)
     {
         log_line("mls: nothing to commit");
         return false;
@@ -349,7 +443,15 @@ bool build_commit(group_state* g,
     tls_writer content;
     content.init(1024);
 
-    // ---- apply the adds to the tree ----
+    // ---- apply the proposals to the tree ----
+    //
+    // Removes before adds, which is the order RFC 9420 lays down and not an
+    // arbitrary one: a leaf freed by a remove is available to an add in the
+    // same commit, so the two orders build different trees, and a tree that
+    // differs from everybody else's is a group that can no longer read itself.
+    for (unsigned int i = 0; i < remove_count; i++)
+        g->leaf_used[removes[i]] = false;
+
     for (unsigned int i = 0; i < add_count; i++)
     {
         unsigned int leaf = allocate_leaf(g);
@@ -358,12 +460,13 @@ bool build_commit(group_state* g,
         g->leaves[leaf] = adds[i].kp.leaf;
         g->leaf_used[leaf] = true;
         adds[i].leaf_index = leaf;
+        add_unmerged_leaf(g, leaf);
     }
 
     // The FramedContent is built against the epoch being left behind.
     unsigned long long saved_epoch = g->epoch;
     g->epoch = sending_epoch;
-    write_framed_content_commit(g, adds, add_count, &content);
+    write_framed_content_commit(g, refs, ref_count, &content);
     g->epoch = saved_epoch;
 
     // ---- sign the commit against the old group context ----
@@ -463,8 +566,13 @@ bool build_commit(group_state* g,
     }
 
     // ---- welcome ----
+    //
+    // Only when somebody is being let in. A commit that just removes a member
+    // has nobody to welcome, and libdave leaves the message out entirely in
+    // that case rather than sending an empty one.
     ok = true;
     out_welcome->clear();
+    if (add_count > 0)
     {
         // GroupInfo, signed by us and encrypted under the welcome secret.
         tls_writer group_info_tbs;
@@ -591,8 +699,9 @@ bool build_commit(group_state* g,
         ccfset(welcome_key, 0, sizeof(welcome_key));
     }
 
-    log_line("mls: commit for epoch %llu with %u add(s), commit %u bytes, welcome %u bytes",
-             g->epoch, add_count, out_commit->size, out_welcome->size);
+    log_line("mls: commit for epoch %llu with %u add(s) and %u remove(s), "
+             "commit %u bytes, welcome %u bytes",
+             g->epoch, add_count, remove_count, out_commit->size, out_welcome->size);
 
     content.free_writer();
     tbs.free_writer();
@@ -880,8 +989,12 @@ bool process_welcome(group_state* g,
 
     // Sanity markers: if the group info decrypted correctly these describe the
     // real group, and if it did not they will be obvious nonsense.
-    log_line("mls: group info epoch %llu, group id %u bytes, %u bytes of extensions",
-             epoch, gid_len, gi_ext_len);
+    // Two different extension fields, and only one of them was ever the
+    // interesting one: the GroupInfo's carry the ratchet tree, the
+    // GroupContext's go into the key schedule and have to be written back.
+    log_line("mls: group info epoch %llu, group id %u bytes, "
+             "расширения GroupInfo %u байт, GroupContext %u байт",
+             epoch, gid_len, gi_ext_len, ctx_ext_len);
 
     // ---- rebuild the state ----
     ccfset(g->leaf_used, 0, sizeof(g->leaf_used));
@@ -921,7 +1034,45 @@ bool process_welcome(group_state* g,
     ccpy(g->group_id, gid, gid_len);
     g->group_id_len = gid_len;
     g->epoch = epoch;
+
+    // Carried forward untouched; see the note on the field.
+    g->context_extensions_len = 0;
+    if (ctx_ext_len <= sizeof(g->context_extensions))
+    {
+        if (ctx_ext_len) ccpy(g->context_extensions, ctx_ext, ctx_ext_len);
+        g->context_extensions_len = ctx_ext_len;
+    }
+    else
+    {
+        log_line("mls: расширения GroupContext не влезли (%u байт) - "
+                 "коммиты после входа не примутся", ctx_ext_len);
+    }
     ccpy(g->tree_hash, tree_hash, 32);
+
+    // The GroupInfo carries both the tree and the hash the group agreed on for
+    // it, so the two can be held against each other here and nowhere else.
+    //
+    // Joining works either way - the key schedule for a welcome runs over the
+    // GroupContext bytes exactly as they arrived - which is why a disagreement
+    // stays invisible until the next commit, where the context is written out
+    // of our own state and the confirmation tag then fails. That is the shape
+    // of the failure this has been showing for several rounds.
+    {
+        unsigned char ours[32];
+        compute_tree_hash(g, ours);
+
+        bool same = true;
+        for (int i = 0; i < 32 && same; i++) same = ours[i] == tree_hash[i];
+
+        if (!same)
+        {
+            log_line("mls: НАШ tree_hash не совпал с групповым при входе "
+                     "(листьев %u) - следующий коммит не примется",
+                     g->leaf_count);
+            log_bytes("mls:   групповой", tree_hash, 32);
+            log_bytes("mls:   наш", ours, 32);
+        }
+    }
     ccpy(g->confirmed_transcript_hash, confirmed, confirmed_len);
     g->confirmed_transcript_hash_len = confirmed_len;
 
@@ -1239,7 +1390,7 @@ bool apply_update_path(group_state* g, unsigned int sender_leaf,
     provisional.u64(sending_epoch + 1);
     provisional.opaque(merged_tree_hash, 32);
     provisional.opaque(g->confirmed_transcript_hash, g->confirmed_transcript_hash_len);
-    provisional.opaque(0, 0);   // extensions<V>
+    provisional.opaque(g->context_extensions, g->context_extensions_len);
 
     tls_writer info;
     info.init(768);
@@ -1368,7 +1519,31 @@ namespace
     }
 }
 
-bool mls::process_commit(group_state* g,
+bool mls::commit_sender(const void* message, unsigned int len, unsigned int* out_leaf)
+{
+    if (!message || !out_leaf) return false;
+    *out_leaf = 0xFFFFFFFF;
+
+    tls_reader r;
+    r.init((const unsigned char*)message, len);
+
+    unsigned short version = 0, wire = 0;
+    if (!r.u16(&version) || !r.u16(&wire)) return false;
+    if (version != PROTOCOL_VERSION_MLS10 || wire != WIRE_PUBLIC_MESSAGE) return false;
+
+    const unsigned char* gid = 0;
+    unsigned int gid_len = 0;
+    unsigned long long epoch = 0;
+    if (!r.opaque(&gid, &gid_len) || !r.u64(&epoch)) return false;
+
+    unsigned char sender_type = 0;
+    if (!r.u8(&sender_type)) return false;
+    if (sender_type != SENDER_MEMBER) return false;
+
+    return r.u32(out_leaf);
+}
+
+bool mls::process_commit(group_state* g_live,
                          const void* message, unsigned int len,
                          const cached_proposal* known, unsigned int known_count,
                          const char** out_error)
@@ -1376,6 +1551,21 @@ bool mls::process_commit(group_state* g,
     const char* ignored = 0;
     if (!out_error) out_error = &ignored;
     *out_error = "";
+
+    if (!g_live) { *out_error = "нет группы"; return false; }
+
+    // Everything below works on a copy, and the copy replaces the live group
+    // only once the confirmation tag has proved it.
+    //
+    // This used to change the group as it went and give up partway when
+    // something did not check out, which left the tree half rewritten, the
+    // epoch advanced and the group marked broken. A commit that fails is a
+    // commit somebody else applied and we did not - unpleasant, and survivable
+    // by staying where we were. Being left with no group at all is not: the
+    // stream then falls back to sending in the clear, and nobody watching can
+    // decode a single frame of it.
+    group_state work = *g_live;
+    group_state* g = &work;
 
     if (!g || !g->established || !message) { *out_error = "нет группы"; return false; }
 
@@ -1499,9 +1689,18 @@ bool mls::process_commit(group_state* g,
     unsigned char init_prev[32];
     ccpy(init_prev, g->init_secret, 32);
 
+    // Two passes, in the order RFC 9420 lays down: updates and removes before
+    // adds. Applying them as they happen to arrive is not the same thing - a
+    // leaf freed by a remove is available to an add in the same commit, so the
+    // two orders build different trees, and the author of the commit follows
+    // the spec's order whatever order it wrote them in.
+    for (int pass = 0; pass < 2; pass++)
     for (unsigned int i = 0; i < applied_count; i++)
     {
         const proposal* p = &applied[i];
+
+        bool is_add = p->type == PROPOSAL_ADD;
+        if (is_add != (pass == 1)) continue;
 
         if (p->type == PROPOSAL_ADD)
         {
@@ -1514,6 +1713,7 @@ bool mls::process_commit(group_state* g,
             if (leaf == 0xFFFFFFFF) { *out_error = "в дереве нет места"; return false; }
             g->leaves[leaf] = p->add.leaf;
             g->leaf_used[leaf] = true;
+            add_unmerged_leaf(g, leaf);
         }
         else if (p->type == PROPOSAL_REMOVE)
         {
@@ -1522,8 +1722,11 @@ bool mls::process_commit(group_state* g,
                 g->leaf_used[p->remove_index] = false;
                 if (p->remove_index == g->my_leaf)
                 {
-                    // Removed from the group. Nothing that follows is ours.
-                    g->established = false;
+                    // Removed from the group. Not a failure to understand the
+                    // commit but the end of our membership, so this one does
+                    // reach the live group: there is nothing left to protect
+                    // frames to.
+                    g_live->established = false;
                     *out_error = "нас удалили из группы";
                     return false;
                 }
@@ -1550,13 +1753,7 @@ bool mls::process_commit(group_state* g,
         pr.init(base + path_start, path_end - path_start);
 
         if (!apply_update_path(g, sender_leaf, &pr, sending_epoch, commit_secret, out_error))
-        {
-            // The tree is half rewritten by now and nothing downstream could
-            // trust it, so the group is marked broken rather than left looking
-            // healthy while deriving keys nobody else shares.
-            g->established = false;
             return false;
-        }
     }
 
     g->epoch = sending_epoch + 1;
@@ -1600,7 +1797,6 @@ bool mls::process_commit(group_state* g,
     if (!tag_ok)
     {
         *out_error = "confirmation_tag не сошёлся";
-        g->established = false;
         return false;
     }
 
@@ -1614,6 +1810,9 @@ bool mls::process_commit(group_state* g,
         g->interim_transcript_hash_len = 32;
         input.free_writer();
     }
+
+    // Proved. Only now does the group this client actually uses move.
+    *g_live = work;
 
     log_line("mls: применён чужой коммит, эпоха %llu, предложений %u",
              g->epoch, applied_count);

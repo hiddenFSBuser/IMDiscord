@@ -6,6 +6,7 @@
 #include "dave/dave_tests.h"
 #include "audio/noise.h"
 #include "audio/loopback.h"
+#include "audio/music.h"
 #include "video/encoder.h"
 #include "net/proxy.h"
 #include "net/tlsconn.h"
@@ -195,7 +196,44 @@ extern "C" void __stdcall im_entry()
 
         if (wanted)
         {
+            // The second half of the test goes through http::, which needs
+            // its agent set the same way the client sets it.
+            proxy::init();
+            http::init("IMDiscord/1.0");
+
             bool ok = tlsnet::self_test("discord.com");
+            WSACleanup();
+            log_shutdown();
+            ExitProcess(ok ? 0 : 1);
+        }
+    }
+
+    // "--mp3test <path>" decodes a track the way the music player will and
+    // writes the result beside the log as a wav, so what comes out of the
+    // decoder and the resampler can be listened to rather than reasoned about.
+    {
+        const wchar_t* found = 0;
+        for (const wchar_t* p = cmdline; *p; p++)
+        {
+            if (p[0] == L'-' && p[1] == L'-' && p[2] == L'm' && p[3] == L'p' && p[4] == L'3' &&
+                p[5] == L't' && p[6] == L'e' && p[7] == L's' && p[8] == L't')
+            {
+                found = p + 9;
+                break;
+            }
+        }
+
+        if (found)
+        {
+            while (*found == L' ' || *found == L'"') found++;
+
+            wchar_t path[MAX_PATH];
+            int n = 0;
+            while (found[n] && found[n] != L'"' && n < MAX_PATH - 1) { path[n] = found[n]; n++; }
+            while (n > 0 && path[n - 1] == L' ') n--;
+            path[n] = 0;
+
+            bool ok = music::self_test(path);
             WSACleanup();
             log_shutdown();
             ExitProcess(ok ? 0 : 1);

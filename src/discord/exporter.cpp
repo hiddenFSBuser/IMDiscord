@@ -221,7 +221,7 @@ namespace
                                     rel, rel);
                         else
                             cnprint(local, sizeof(local), "<a href=\"%s\">%s</a>", rel,
-                                    a->filename ? a->filename : "файл");
+                                    a->filename ? a->filename : tr("файл"));
 
                         put_line(&markup, local);
                         put(&markup, "</div>");
@@ -235,7 +235,7 @@ namespace
                                 a->url, a->url);
                     else
                         cnprint(line, sizeof(line), "<a href=\"%s\">%s</a>", a->url,
-                                a->filename ? a->filename : "файл");
+                                a->filename ? a->filename : tr("файл"));
                     put_line(&markup, line);
                     put(&markup, "</div>");
                 }
@@ -265,14 +265,14 @@ namespace
     {
         switch (type)
         {
-        case 1:  return "добавил участника в беседу";
-        case 2:  return "убрал участника из беседы";
-        case 3:  return "начал звонок";
-        case 4:  return "сменил название беседы";
-        case 5:  return "сменил значок беседы";
-        case 6:  return "закрепил сообщение";
-        case 7:  return "зашёл на сервер";
-        case 18: return "создал ветку";
+        case 1:  return tr("добавил участника в беседу");
+        case 2:  return tr("убрал участника из беседы");
+        case 3:  return tr("начал звонок");
+        case 4:  return tr("сменил название беседы");
+        case 5:  return tr("сменил значок беседы");
+        case 6:  return tr("закрепил сообщение");
+        case 7:  return tr("зашёл на сервер");
+        case 18: return tr("создал ветку");
         default: return 0;
         }
     }
@@ -338,7 +338,7 @@ bool exporter::channel_to_html(snowflake channel_id, const wchar_t* path,
         else if (c && c->is_dm() && c->recipients.count)
         {
             duser* peer = store::find_user(c->recipients[0]);
-            cnprint(title, sizeof(title), "%s", peer ? peer->display_name() : "личные сообщения");
+            cnprint(title, sizeof(title), "%s", peer ? peer->display_name() : tr("личные сообщения"));
         }
         else
         {
@@ -359,7 +359,7 @@ bool exporter::channel_to_html(snowflake channel_id, const wchar_t* path,
     {
         char meta[192];
         cnprint(meta, sizeof(meta),
-                "канал %llu &middot; сообщений %u &middot; сохранённых отрезков %d",
+                tr("канал %llu &middot; сообщений %u &middot; сохранённых отрезков %d"),
                 channel_id, messages.count, span_count);
         put_line(&page, meta);
     }
@@ -373,7 +373,7 @@ bool exporter::channel_to_html(snowflake channel_id, const wchar_t* path,
         // run together look like a conversation that never happened.
         if (i && span_count && !covered_together(spans, span_count, messages[i - 1].id, m->id))
         {
-            put(&page, "<div class=\"gap\">пропуск: между этими сообщениями история не сохранялась</div>");
+            put(&page, tr("<div class=\"gap\">пропуск: между этими сообщениями история не сохранялась</div>"));
         }
 
         const char* sys = (!m->content || !m->content[0]) ? system_text(m->type) : 0;
@@ -405,7 +405,7 @@ bool exporter::channel_to_html(snowflake channel_id, const wchar_t* path,
         escape_html(m->author, &page);
         put(&page, "</span><span class=\"when\">");
         escape_html(m->timestamp, &page);
-        if (m->deleted) put(&page, " &middot; удалено");
+        if (m->deleted) put(&page, tr(" &middot; удалено"));
         put(&page, "</span></div><div class=\"text\">");
         escape_html(m->content, &page);
         put(&page, "</div>");
@@ -677,7 +677,7 @@ namespace
                 store::guard guard;
                 dchannel* c = store::find_channel(targets[i]);
                 cnprint(g_warm_status, sizeof(g_warm_status), "%s",
-                        (c && c->name) ? c->name : "канал");
+                        (c && c->name) ? c->name : tr("канал"));
             }
 
             warm_channel(targets[i]);
@@ -686,7 +686,7 @@ namespace
 
         targets.dispose();
 
-        cnprint(g_warm_status, sizeof(g_warm_status), "готово");
+        cnprint(g_warm_status, sizeof(g_warm_status), tr("готово"));
         InterlockedExchange(&g_warming, 0);
         archive::snapshot_save();
         return 0;
@@ -700,7 +700,7 @@ void exporter::warm_start()
 
     InterlockedExchange(&g_warming, 1);
     InterlockedExchange(&g_warm_messages, 0);
-    cnprint(g_warm_status, sizeof(g_warm_status), "начинаем");
+    cnprint(g_warm_status, sizeof(g_warm_status), tr("начинаем"));
 
     if (g_warm_thread) { CloseHandle(g_warm_thread); g_warm_thread = 0; }
     g_warm_thread = CreateThread(0, 0, warm_thread, 0, 0, 0);

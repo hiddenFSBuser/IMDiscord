@@ -10,6 +10,7 @@
 #include "dave_fixture.h"
 #include "core/crypto.h"
 #include "core/log.h"
+#include "system/io/ufile.h"
 
 namespace
 {
@@ -798,6 +799,20 @@ namespace
         ok = mls::build_commit(&alice, &add_carol, 1, &commit2, &welcome2);
         check("commit: alice adds carol", ok);
 
+        // Written out so the bytes can be read against RFC 9420 by something
+        // other than the code that produced them. Every check in this file
+        // holds this implementation against itself, which is exactly the kind
+        // of agreement that survives a shared misreading of the spec - and a
+        // commit discord silently ignores is what that looks like from here.
+        if (ok)
+        {
+            wchar_t path[MAX_PATH];
+            if (ufile::app_path(L"mls_commit.bin", path, MAX_PATH))
+                ufile::write_all(path, commit2.data, commit2.size);
+            if (ufile::app_path(L"mls_welcome.bin", path, MAX_PATH))
+                ufile::write_all(path, welcome2.data, welcome2.size);
+        }
+
         if (ok)
         {
             const char* why = "";
@@ -818,6 +833,106 @@ namespace
 
         commit2.free_buffer();
         welcome2.free_buffer();
+        if (!ok) return;
+
+        // ---- Alice removes Carol; Bob follows ----
+        //
+        // Somebody leaving is the half this used to be missing. A commit that
+        // carried only the adds left the author on an epoch the group had
+        // left the moment a viewer closed the stream, and from there nothing
+        // it sent could be opened by anyone still watching.
+        const unsigned char bye_auth[4] = { 'b', 'y', 'e', '!' };
+        mls::proposal_message drop_carol;
+        ccfset(&drop_carol, 0, sizeof(drop_carol));
+        drop_carol.prop.type = mls::PROPOSAL_REMOVE;
+        drop_carol.prop.remove_index = 2;
+        drop_carol.auth_content_bytes = bye_auth;
+        drop_carol.auth_content_len = sizeof(bye_auth);
+
+        mls::cached_proposal known_remove;
+        drop_carol.compute_ref(known_remove.ref);
+        known_remove.prop = drop_carol.prop;
+
+        ubuffer commit3, welcome3;
+        commit3.init();
+        welcome3.init();
+
+        ok = mls::build_commit(&alice, &drop_carol, 1, &commit3, &welcome3);
+        check("remove: alice commits it", ok);
+        check("remove: no welcome for a commit that lets nobody in",
+              ok && welcome3.size == 0);
+        check("remove: carol's leaf is free again", ok && !alice.leaf_used[2]);
+
+        if (ok)
+        {
+            const char* why = "";
+            bool applied = mls::process_commit(&bob, commit3.data, commit3.size,
+                                               &known_remove, 1, &why);
+            if (!applied) log_line("selftest: process_commit refused the remove: %s", why);
+
+            check("remove: bob applies it", applied);
+            check("remove: epochs match", applied && bob.epoch == alice.epoch);
+            check("remove: exporters match",
+                  applied && bytes_equal(bob.exporter_secret, alice.exporter_secret, 32));
+            check("remove: bob sees carol gone", applied && !bob.leaf_used[2]);
+        }
+
+        commit3.free_buffer();
+        welcome3.free_buffer();
+
+        // ---- a leaf added under a parent that is not blank ----
+        //
+        // Every parent is blank in a group this code builds on its own, so
+        // nothing above ever exercises what happens when one is not. A real
+        // group's tree arrives from a Welcome with rekeyed parents in it, and
+        // an Add has to record the new leaf in each of them: they are hashed
+        // into the tree hash, and a tree hash nobody else computes is a
+        // confirmation tag that fails on the next commit.
+        //
+        // Two clients that both leave it out still agree with each other,
+        // which is why this went unnoticed here and showed up only against
+        // discord's own clients. The check is against the rule, not against
+        // ourselves.
+        {
+            unsigned char before[32];
+            compute_tree_hash(&alice, before);
+
+            // The root of a two leaf tree, made to look rekeyed.
+            unsigned int root = mls_tree::root(alice.leaf_count);
+            mls::parent_node* p = &alice.parents[root];
+            ccfset(p, 0, sizeof(*p));
+            p->used = true;
+            p->parent_hash_len = 0;
+
+            unsigned char after_parent[32];
+            compute_tree_hash(&alice, after_parent);
+            check("unmerged: a parent that is not blank changes the tree hash",
+                  !bytes_equal(before, after_parent, 32));
+
+            const unsigned char dave_auth[5] = { 'd', 'a', 'v', 'e', '!' };
+            mls::proposal_message add_dave;
+            ccfset(&add_dave, 0, sizeof(add_dave));
+            add_dave.prop.type = mls::PROPOSAL_ADD;
+            add_dave.prop.add = carol_kp;
+            add_dave.auth_content_bytes = dave_auth;
+            add_dave.auth_content_len = sizeof(dave_auth);
+
+            ubuffer commit4, welcome4;
+            commit4.init();
+            welcome4.init();
+
+            bool built = mls::build_commit(&alice, &add_dave, 1, &commit4, &welcome4);
+            check("unmerged: the add commits", built);
+
+            const mls::parent_node* after = &alice.parents[root];
+            check("unmerged: the new leaf is recorded in the parent",
+                  built && after->unmerged_count == 1);
+            check("unmerged: it is the leaf that was allocated",
+                  built && after->unmerged_count == 1 && after->unmerged[0] == 2);
+
+            commit4.free_buffer();
+            welcome4.free_buffer();
+        }
     }
 }
 

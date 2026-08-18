@@ -51,6 +51,11 @@ namespace store
     // One entry of a member list: the user, their nickname and whatever
     // presence came with it.
     void add_guild_member(dguild* g, const jval* member);
+
+    // A role created or changed on the server. The same call serves both, so
+    // the dispatcher does not have to know which it is holding.
+    void upsert_role(dguild* g, const jval* role);
+    void remove_role(dguild* g, snowflake role_id);
     void remove_guild(snowflake id);
 
     // ---- messages ----
@@ -79,6 +84,16 @@ namespace store
     // Null when the user is not in any voice channel we know about.
     const dvoice_state* find_voice_state(snowflake user_id);
     void clear_voice_states_for_channel(snowflake channel_id);
+
+    // Who a direct-message or group call is still ringing.
+    //
+    // Separate from the voice states because it is a different fact: a state
+    // says somebody is in the call, this says somebody has been asked to join
+    // and has not answered. Without it an unanswered call looks identical to
+    // no call at all.
+    void set_call_ringing(snowflake channel_id, const ulist<snowflake>* users);
+    void clear_call_ringing(snowflake channel_id);
+    bool call_is_ringing(snowflake channel_id);
     const ulist<dvoice_state>& voice_states();
 
     // ---- permissions ----
@@ -89,6 +104,11 @@ namespace store
     // circuit to everything.
     unsigned long long member_permissions(const dguild* g, snowflake user_id,
                                           const dchannel* c);
+
+    // Whether one member may be moderated by another: discord refuses when the
+    // target's highest role sits at or above the actor's, whatever permissions
+    // the actor holds. The owner is above everyone and answerable to no one.
+    bool outranks(const dguild* g, snowflake actor_id, snowflake target_id);
 
     // Whether a channel should appear to that member at all. The member list
     // on the right is the set of people for whom this is true of the channel

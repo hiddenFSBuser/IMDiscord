@@ -235,9 +235,12 @@ namespace
         log_line("watch: %s %s%s", prefix, text, n < size ? " ..." : "");
     }
 
+    // NV12 now, not RGBA: the conversion happens on the graphics card when the
+    // picture is sampled, so what travels through here is what the decoder
+    // produced. Three bytes for every two pixels instead of four for each.
     bool frame_reserve(vframe* f, int w, int h)
     {
-        int need = w * h * 4;
+        int need = w * h * 3 / 2;
         if (need <= 0) return false;
 
         if (need > f->cap)
@@ -1236,12 +1239,12 @@ namespace
 
         vdec::submit(payload, (int)payload_len, GetTickCount64() * 1000ULL);
 
-        const unsigned char* rgba = 0;
+        const unsigned char* planes = 0;
         int w = 0, h = 0;
-        while (vdec::next(&rgba, &w, &h))
+        while (vdec::next_nv12(&planes, &w, &h))
         {
             if (!frame_reserve(&g_decode, w, h)) break;
-            ccpy(g_decode.rgba, rgba, (size_t)w * h * 4);
+            ccpy(g_decode.rgba, planes, (size_t)w * h * 3 / 2);
 
             EnterCriticalSection(&g_frame_lock);
             vframe swap = g_ready;

@@ -70,7 +70,7 @@ bool gfx::load()
     g_d3d11 = load_system(L"d3d11.dll");
     if (!g_d3d11)
     {
-        ccstrncpy(g_why, "в системе нет d3d11.dll", sizeof(g_why) - 1);
+        ccstrncpy(g_why, tr("в системе нет d3d11.dll"), sizeof(g_why) - 1);
         log_line("gfx: %s", g_why);
         return false;
     }
@@ -80,7 +80,7 @@ bool gfx::load()
 
     if (!g_create)
     {
-        ccstrncpy(g_why, "d3d11.dll без нужной точки входа", sizeof(g_why) - 1);
+        ccstrncpy(g_why, tr("d3d11.dll без нужной точки входа"), sizeof(g_why) - 1);
         log_line("gfx: %s", g_why);
         FreeLibrary(g_d3d11);
         g_d3d11 = 0;

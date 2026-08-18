@@ -11,6 +11,7 @@
 #include "discord/archive.h"
 #include "discord/store.h"
 #include "discord/rest.h"
+#include "discord/science.h"
 #include "discord/gateway.h"
 #include "discord/voice.h"
 #include "video/screenshare.h"
@@ -322,8 +323,9 @@ int ui_share_height()
 int ui_share_fps()
 {
     int f = storage::settings_get_int("share_fps", 30);
-    if (f < 5) f = 5;
-    if (f > 60) f = 60;
+
+    if (f < 1) f = 1;
+    if (f > SHARE_FPS_MAX) f = SHARE_FPS_MAX;
     return f;
 }
 
@@ -558,6 +560,21 @@ static void draw_glyph(ImDrawList* dl, ui_icon icon, ImVec2 center, float s, ImU
                     ImVec2(center.x + s * 0.26f, center.y + s * 0.44f), fg, t);
         break;
     }
+
+    case ICON_MUSIC:
+    {
+        // A quaver: one filled head, a stem, and a flag off the top.
+        float t = s * 0.11f;
+        float head_x = center.x - s * 0.18f;
+        float head_y = center.y + s * 0.28f;
+
+        dl->AddCircleFilled(ImVec2(head_x, head_y), s * 0.17f, fg, 12);
+        dl->AddLine(ImVec2(head_x + s * 0.16f, head_y),
+                    ImVec2(head_x + s * 0.16f, center.y - s * 0.42f), fg, t);
+        dl->AddLine(ImVec2(head_x + s * 0.16f, center.y - s * 0.42f),
+                    ImVec2(head_x + s * 0.46f, center.y - s * 0.24f), fg, t);
+        break;
+    }
     }
 }
 
@@ -609,12 +626,16 @@ void ui_avatar(const duser* u, float size, bool show_status)
     const texture* t = tex::get(url);
     if (t->ready())
     {
+        // As round as the person asked for. A half of the size is the circle
+        // discord uses; zero is a square.
         dl->AddImageRounded(t->id(), p, ImVec2(p.x + size, p.y + size),
-                            ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, size * 0.5f);
+                            ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE,
+                            size * theme::avatar_rounding());
     }
     else
     {
-        dl->AddCircleFilled(ImVec2(p.x + size * 0.5f, p.y + size * 0.5f), size * 0.5f, col::bg_hover);
+        dl->AddRectFilled(p, ImVec2(p.x + size, p.y + size), col::bg_hover,
+                          size * theme::avatar_rounding());
         const char* name = u ? u->display_name() : "?";
         char initial[8] = { name[0], 0 };
         ImVec2 ts = ImGui::CalcTextSize(initial);
@@ -640,7 +661,11 @@ void ui_guild_bubble(const dguild* g, float size, bool active)
     char url[320];
     cdn::guild_icon(g, 128, url, sizeof(url));
 
-    float rounding = active ? size * 0.3f : size * 0.5f;
+    // A server bubble squares off a little when it is the one being read,
+    // which is discord's own touch. Both ends move with the setting so the
+    // difference between them survives a person choosing square avatars.
+    float full = theme::avatar_rounding();
+    float rounding = active ? size * full * 0.6f : size * full;
 
     if (url[0])
     {
@@ -687,7 +712,7 @@ const char* ui_channel_display_name(const dchannel* c, char* buffer, int cap)
     if (c->type == CH_DM && c->recipients.count > 0)
     {
         duser* u = store::find_user(c->recipients[0]);
-        ccstrncpy(buffer, u ? u->display_name() : "Личные сообщения", cap - 1);
+        ccstrncpy(buffer, u ? u->display_name() : tr("Личные сообщения"), cap - 1);
         return buffer;
     }
 
@@ -701,11 +726,11 @@ const char* ui_channel_display_name(const dchannel* c, char* buffer, int cap)
             if (buffer[0]) ccstrncpy(buffer + ccslenf(buffer), ", ", cap - (int)ccslenf(buffer) - 1);
             ccstrncpy(buffer + ccslenf(buffer), u->display_name(), cap - (int)ccslenf(buffer) - 1);
         }
-        if (!buffer[0]) ccstrncpy(buffer, "Групповой чат", cap - 1);
+        if (!buffer[0]) ccstrncpy(buffer, tr("Групповой чат"), cap - 1);
         return buffer;
     }
 
-    ccstrncpy(buffer, "без названия", cap - 1);
+    ccstrncpy(buffer, tr("без названия"), cap - 1);
     return buffer;
 }
 
@@ -725,7 +750,7 @@ void ui_copy_id(snowflake id)
 void ui_copy_id_item(snowflake id, const char* label)
 {
     if (!id) return;
-    if (ImGui::MenuItem(label ? label : "Скопировать ID")) ui_copy_id(id);
+    if (ImGui::MenuItem(label ? label : tr("Скопировать ID"))) ui_copy_id(id);
 }
 
 void ui_open_profile(snowflake user_id, snowflake guild_id)
@@ -733,6 +758,7 @@ void ui_open_profile(snowflake user_id, snowflake guild_id)
     g_ui.profile_user = user_id;
     g_ui.profile_guild = guild_id;
     g_ui.open_profile_popup = true;
+    science::user_profile_viewed(user_id);
 
     duser* u = store::find_user(user_id);
     if (!u || !u->profile_loaded) api::fetch_user_profile(user_id, guild_id);
@@ -770,12 +796,12 @@ void ui_attach_bytes(const char* name, const char* content_type, const void* dat
     // Discord's free tier rejects anything past 25 MB outright.
     if (!size || size > (25u << 20))
     {
-        api::set_last_error("Файл слишком большой (лимит 25 МБ)");
+        api::set_last_error(tr("Файл слишком большой (лимит 25 МБ)"));
         return;
     }
     if (g_ui.pending_files.count >= 10)
     {
-        api::set_last_error("Не больше 10 файлов за раз");
+        api::set_last_error(tr("Не больше 10 файлов за раз"));
         return;
     }
 
@@ -800,7 +826,7 @@ void ui_attach_path(const wchar_t* path)
     if (!ufile::read_all(path, &blob))
     {
         blob.free_buffer();
-        api::set_last_error("Не удалось прочитать файл");
+        api::set_last_error(tr("Не удалось прочитать файл"));
         return;
     }
 
@@ -913,7 +939,7 @@ void ui_paste_from_clipboard()
                 }
                 else
                 {
-                    api::set_last_error("Формат изображения в буфере не поддерживается");
+                    api::set_last_error(tr("Формат изображения в буфере не поддерживается"));
                 }
                 png.free_buffer();
                 GlobalUnlock(handle);
@@ -977,7 +1003,7 @@ void ui_view_offline_banner()
     unsigned int secs = offline::seconds();
     char detail[320];
     if (secs >= 60)
-        cnprint(detail, sizeof(detail), "%s  (уже %u мин)", offline::detail(), secs / 60);
+        cnprint(detail, sizeof(detail), tr("%s  (уже %u мин)"), offline::detail(), secs / 60);
     else
         cnprint(detail, sizeof(detail), "%s", offline::detail());
     ImGui::TextUnformatted(detail);
@@ -993,7 +1019,7 @@ void ui_view_offline_banner()
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(0, 0, 0, 105));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(0, 0, 0, 140));
 
-    if (ImGui::Button("Попробовать подключиться", ImVec2(button_w, OFFLINE_BANNER_HEIGHT - 18.0f)))
+    if (ImGui::Button(tr("Попробовать подключиться"), ImVec2(button_w, OFFLINE_BANNER_HEIGHT - 18.0f)))
     {
         int active = storage::active_account();
         const saved_account* entry = storage::account_at(active);
@@ -1112,11 +1138,11 @@ bool ui_proxy_editor(proxy_config* out, bool* own)
     if (own)
     {
         bool flag = g_ui.proxy_own;
-        if (ImGui::Checkbox("Свой прокси для этого аккаунта", &flag)) g_ui.proxy_own = flag;
+        if (ImGui::Checkbox(tr("Свой прокси для этого аккаунта"), &flag)) g_ui.proxy_own = flag;
         if (!g_ui.proxy_own)
         {
-            ui_text_muted("Пойдёт через общий");
-            if (ImGui::Button("Сохранить", ImVec2(110, 0)))
+            ui_text_muted(tr("Пойдёт через общий"));
+            if (ImGui::Button(tr("Сохранить"), ImVec2(110, 0)))
             {
                 ccfset(out, 0, sizeof(*out));
                 *own = false;
@@ -1130,11 +1156,11 @@ bool ui_proxy_editor(proxy_config* out, bool* own)
     // more often than as five separate values, and retyping it by hand is
     // where the typos come from.
     ImGui::SetNextItemWidth(-58.0f);
-    bool entered = ImGui::InputTextWithHint("##ppaste", "socks5://логин:пароль@адрес:порт",
+    bool entered = ImGui::InputTextWithHint("##ppaste", tr("socks5://логин:пароль@адрес:порт"),
                                             g_ui.proxy_paste, sizeof(g_ui.proxy_paste),
                                             ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
-    if ((ImGui::Button("Разобрать", ImVec2(-1, 0)) || entered) && g_ui.proxy_paste[0])
+    if ((ImGui::Button(tr("Разобрать"), ImVec2(-1, 0)) || entered) && g_ui.proxy_paste[0])
     {
         proxy_config parsed;
         if (proxy::parse_url(g_ui.proxy_paste, &parsed))
@@ -1145,11 +1171,11 @@ bool ui_proxy_editor(proxy_config* out, bool* own)
         else
         {
             ccfset(g_ui.proxy_paste, 0, sizeof(g_ui.proxy_paste));
-            ccstrncpy(g_ui.proxy_paste, "не разобрал", sizeof(g_ui.proxy_paste) - 1);
+            ccstrncpy(g_ui.proxy_paste, tr("не разобрал"), sizeof(g_ui.proxy_paste) - 1);
         }
     }
 
-    const char* kinds[] = { "Без прокси", "SOCKS5", "SOCKS4", "HTTPS" };
+    const char* kinds[] = { tr("Без прокси"), "SOCKS5", "SOCKS4", "HTTPS" };
     ImGui::SetNextItemWidth(-1);
     if (ImGui::BeginCombo("##pkind", kinds[g_ui.proxy_kind & 3]))
     {
@@ -1163,26 +1189,26 @@ bool ui_proxy_editor(proxy_config* out, bool* own)
         float full = ImGui::GetContentRegionAvail().x;
 
         ImGui::SetNextItemWidth(full * 0.66f);
-        ImGui::InputTextWithHint("##phost", "адрес", g_ui.proxy_host, sizeof(g_ui.proxy_host));
+        ImGui::InputTextWithHint("##phost", tr("адрес"), g_ui.proxy_host, sizeof(g_ui.proxy_host));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##pport", "порт", g_ui.proxy_port, sizeof(g_ui.proxy_port),
+        ImGui::InputTextWithHint("##pport", tr("порт"), g_ui.proxy_port, sizeof(g_ui.proxy_port),
                                  ImGuiInputTextFlags_CharsDecimal);
 
         ImGui::SetNextItemWidth(full * 0.5f - 4.0f);
-        ImGui::InputTextWithHint("##puser", "логин", g_ui.proxy_user, sizeof(g_ui.proxy_user));
+        ImGui::InputTextWithHint("##puser", tr("логин"), g_ui.proxy_user, sizeof(g_ui.proxy_user));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##ppass", "пароль", g_ui.proxy_pass, sizeof(g_ui.proxy_pass),
+        ImGui::InputTextWithHint("##ppass", tr("пароль"), g_ui.proxy_pass, sizeof(g_ui.proxy_pass),
                                  ImGuiInputTextFlags_Password);
 
         // Said now rather than discovered when somebody tries to join a call.
         if (g_ui.proxy_kind == PROXY_HTTPS)
-            ui_text_muted("HTTPS не пропускает UDP - звонки будут недоступны");
+            ui_text_muted(tr("HTTPS не пропускает UDP - звонки будут недоступны"));
         else if (g_ui.proxy_kind == PROXY_SOCKS4)
-            ui_text_muted("SOCKS4 не умеет UDP - звонки будут недоступны");
+            ui_text_muted(tr("SOCKS4 не умеет UDP - звонки будут недоступны"));
         else
-            ui_text_muted("Звонки пойдут через UDP ASSOCIATE, если прокси его умеет");
+            ui_text_muted(tr("Звонки пойдут через UDP ASSOCIATE, если прокси его умеет"));
     }
 
     proxy_config draft;
@@ -1193,7 +1219,7 @@ bool ui_proxy_editor(proxy_config* out, bool* own)
     ccstrncpy(draft.pass, g_ui.proxy_pass, sizeof(draft.pass) - 1);
     draft.port = (unsigned short)ccstrtoull(g_ui.proxy_port, 0, 10);
 
-    if (ImGui::Button("Сохранить", ImVec2(110, 0)))
+    if (ImGui::Button(tr("Сохранить"), ImVec2(110, 0)))
     {
         *out = draft;
         if (own) *own = g_ui.proxy_own;
@@ -1206,17 +1232,17 @@ bool ui_proxy_editor(proxy_config* out, bool* own)
         if (proxy::checking())
         {
             ImGui::BeginDisabled();
-            ImGui::Button("Проверяю...", ImVec2(110, 0));
+            ImGui::Button(tr("Проверяю..."), ImVec2(110, 0));
             ImGui::EndDisabled();
         }
-        else if (ImGui::Button("Проверить", ImVec2(110, 0)))
+        else if (ImGui::Button(tr("Проверить"), ImVec2(110, 0)))
         {
             proxy::begin_check(&draft);
         }
         ImGui::SameLine();
     }
 
-    if (ImGui::Button("Закрыть", ImVec2(-1, 0))) g_ui.proxy_editing = -1;
+    if (ImGui::Button(tr("Закрыть"), ImVec2(-1, 0))) g_ui.proxy_editing = -1;
 
     if (proxy::check_result()[0])
     {
@@ -1249,7 +1275,7 @@ void ui_view_accounts_popup()
         if (me)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
-            ImGui::TextUnformatted("Сейчас в аккаунте");
+            ImGui::TextUnformatted(tr("Сейчас в аккаунте"));
             ImGui::PopStyleColor();
 
             ui_avatar(me, 20.0f, false);
@@ -1257,7 +1283,7 @@ void ui_view_accounts_popup()
             ImGui::TextUnformatted(me->display_name());
 
             ImGui::SameLine(0, 8);
-            if (ImGui::SmallButton("Профиль"))
+            if (ImGui::SmallButton(tr("Профиль")))
             {
                 ui_open_profile(me->id, 0);
                 ImGui::CloseCurrentPopup();
@@ -1267,10 +1293,10 @@ void ui_view_accounts_popup()
             // without setting this the client showed its owner as offline for
             // ever, which reads as invisible mode and is simply untrue.
             struct { const char* label; const char* value; unsigned char code; ImU32 tint; } choices[] = {
-                { "В сети",       "online",    STATUS_ONLINE,  col::green  },
-                { "Неактивен",    "idle",      STATUS_IDLE,    col::yellow },
-                { "Не беспокоить","dnd",       STATUS_DND,     col::red    },
-                { "Невидимка",    "invisible", STATUS_OFFLINE, col::text_muted },
+                { tr("В сети"),       "online",    STATUS_ONLINE,  col::green  },
+                { tr("Неактивен"),    "idle",      STATUS_IDLE,    col::yellow },
+                { tr("Не беспокоить"),"dnd",       STATUS_DND,     col::red    },
+                { tr("Невидимка"),    "invisible", STATUS_OFFLINE, col::text_muted },
             };
 
             ImGui::Dummy(ImVec2(0, 4));
@@ -1289,7 +1315,7 @@ void ui_view_accounts_popup()
             }
 
             if (offline::active())
-                ui_text_muted("Статус сменится, когда связь вернётся");
+                ui_text_muted(tr("Статус сменится, когда связь вернётся"));
 
             ImGui::Separator();
         }
@@ -1304,17 +1330,17 @@ void ui_view_accounts_popup()
     // because it is the one most people will ever touch.
     {
         proxy_config shared = storage::default_proxy();
-        const char* kinds[] = { "нет", "SOCKS5", "SOCKS4", "HTTPS" };
+        const char* kinds[] = { tr("нет"), "SOCKS5", "SOCKS4", "HTTPS" };
 
         char summary[160];
         if (shared.in_use())
             cnprint(summary, sizeof(summary), "%s %s:%u", kinds[shared.kind & 3],
                     shared.host, (unsigned int)shared.port);
         else
-            ccstrncpy(summary, "напрямую", sizeof(summary) - 1);
+            ccstrncpy(summary, tr("напрямую"), sizeof(summary) - 1);
 
-        if (ImGui::SmallButton(g_ui.proxy_editing == PROXY_SLOT_DEFAULT ? "свернуть"
-                                                                       : "общий прокси"))
+        if (ImGui::SmallButton(g_ui.proxy_editing == PROXY_SLOT_DEFAULT ? tr("свернуть")
+                                                                       : tr("общий прокси")))
         {
             if (g_ui.proxy_editing == PROXY_SLOT_DEFAULT) g_ui.proxy_editing = -1;
             else ui_proxy_editor_open(PROXY_SLOT_DEFAULT, &shared, true);
@@ -1358,8 +1384,8 @@ void ui_view_accounts_popup()
         ImGui::PushStyleColor(ImGuiCol_Text, current ? col::green : col::text_normal);
 
         char label[96];
-        cnprint(label, sizeof(label), "%s%s", entry->name[0] ? entry->name : "Аккаунт",
-                current ? "  (сейчас)" : "");
+        cnprint(label, sizeof(label), "%s%s", entry->name[0] ? entry->name : tr("Аккаунт"),
+                current ? tr("  (сейчас)") : "");
 
         // Sized so every row lines up and the forget button always fits.
         if (ImGui::Selectable(label, current, 0, ImVec2(215.0f, 26.0f)) && !current && !busy)
@@ -1367,31 +1393,31 @@ void ui_view_accounts_popup()
         ImGui::PopStyleColor();
 
         if (!current && ImGui::IsItemHovered())
-            ImGui::SetTooltip("Переключиться на этот аккаунт");
+            ImGui::SetTooltip(tr("Переключиться на этот аккаунт"));
 
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, col::bg_panel);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col::red);
         if (ImGui::SmallButton("x")) forget = i;
         ImGui::PopStyleColor(2);
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Забыть этот аккаунт");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Забыть этот аккаунт"));
 
         // One line per account saying where its traffic goes, and a way in.
         {
-            const char* kinds[] = { "нет", "SOCKS5", "SOCKS4", "HTTPS" };
+            const char* kinds[] = { tr("нет"), "SOCKS5", "SOCKS4", "HTTPS" };
             bool own = storage::account_overrides_proxy(i);
 
             char summary[192];
             if (!own)
-                ccstrncpy(summary, "общий прокси", sizeof(summary) - 1);
+                ccstrncpy(summary, tr("общий прокси"), sizeof(summary) - 1);
             else if (entry->proxy.in_use())
                 cnprint(summary, sizeof(summary), "%s %s:%u", kinds[entry->proxy.kind & 3],
                         entry->proxy.host, (unsigned int)entry->proxy.port);
             else
-                ccstrncpy(summary, "напрямую", sizeof(summary) - 1);
+                ccstrncpy(summary, tr("напрямую"), sizeof(summary) - 1);
 
             ImGui::Indent(30.0f);
-            if (ImGui::SmallButton(g_ui.proxy_editing == i ? "свернуть" : "прокси"))
+            if (ImGui::SmallButton(g_ui.proxy_editing == i ? tr("свернуть") : tr("прокси")))
             {
                 if (g_ui.proxy_editing == i) g_ui.proxy_editing = -1;
                 else ui_proxy_editor_open(i, &entry->proxy, own);
@@ -1416,8 +1442,8 @@ void ui_view_accounts_popup()
             }
 
             if (i == active)
-                ui_text_muted("Применится сразу, но открытый гейтвей переподключится "
-                              "только при следующем входе");
+                ui_text_muted(tr("Применится сразу, но открытый гейтвей переподключится "
+                              "только при следующем входе"));
 
             ImGui::Separator();
             ImGui::Unindent(30.0f);
@@ -1430,12 +1456,12 @@ void ui_view_accounts_popup()
 
     if (!g_ui.adding_account)
     {
-        if (ImGui::Button("Добавить аккаунт", ImVec2(-1, 0))) g_ui.adding_account = true;
+        if (ImGui::Button(tr("Добавить аккаунт"), ImVec2(-1, 0))) g_ui.adding_account = true;
     }
     else
     {
         ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
-        ImGui::TextUnformatted("Токен нового аккаунта");
+        ImGui::TextUnformatted(tr("Токен нового аккаунта"));
         ImGui::PopStyleColor();
 
         ImGui::SetNextItemWidth(-1);
@@ -1445,15 +1471,15 @@ void ui_view_accounts_popup()
 
         // Chosen before signing in, because signing in is itself a request and
         // it has to go the right way round.
-        if (ImGui::SmallButton(g_ui.proxy_editing == PROXY_SLOT_NEW ? "свернуть прокси"
-                                                                    : "прокси для этого аккаунта"))
+        if (ImGui::SmallButton(g_ui.proxy_editing == PROXY_SLOT_NEW ? tr("свернуть прокси")
+                                                                    : tr("прокси для этого аккаунта")))
         {
             if (g_ui.proxy_editing == PROXY_SLOT_NEW) g_ui.proxy_editing = -1;
             else ui_proxy_editor_open(PROXY_SLOT_NEW, &g_ui.new_proxy, g_ui.new_proxy_own);
         }
         ImGui::SameLine();
         ui_text_muted(g_ui.new_proxy_own && g_ui.new_proxy.in_use() ? g_ui.new_proxy.host
-                                                                    : "общий");
+                                                                    : tr("общий"));
 
         if (g_ui.proxy_editing == PROXY_SLOT_NEW)
         {
@@ -1467,9 +1493,9 @@ void ui_view_accounts_popup()
             }
         }
 
-        bool go = ImGui::Button("Войти", ImVec2(120, 0));
+        bool go = ImGui::Button(tr("Войти"), ImVec2(120, 0));
         ImGui::SameLine();
-        if (ImGui::Button("Отмена", ImVec2(120, 0)))
+        if (ImGui::Button(tr("Отмена"), ImVec2(120, 0)))
         {
             g_ui.adding_account = false;
             ccfset(g_ui.token_input, 0, sizeof(g_ui.token_input));
@@ -1495,7 +1521,7 @@ void ui_view_accounts_popup()
     if (busy)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
-        ImGui::TextUnformatted("Входим...");
+        ImGui::TextUnformatted(tr("Входим..."));
         ImGui::PopStyleColor();
     }
 
@@ -1509,7 +1535,7 @@ void ui_view_accounts_popup()
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Button, col::bg_panel);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col::red);
-    if (ImGui::Button("Выйти", ImVec2(-1, 0)))
+    if (ImGui::Button(tr("Выйти"), ImVec2(-1, 0)))
     {
         g_ui.pending_logout = true;
         ImGui::CloseCurrentPopup();
@@ -1556,7 +1582,7 @@ void ui_view_login()
     ImGui::TextUnformatted("IMDiscord");
     ImGui::PopFont();
 
-    ui_text_muted("Вход по токену аккаунта");
+    ui_text_muted(tr("Вход по токену аккаунта"));
     ImGui::Dummy(ImVec2(0, 6));
 
     // Reachable before signing in, because a proxy is often the reason
@@ -1564,17 +1590,17 @@ void ui_view_login()
     // is no account yet to attach it to.
     {
         proxy_config shared = storage::default_proxy();
-        const char* kinds[] = { "нет", "SOCKS5", "SOCKS4", "HTTPS" };
+        const char* kinds[] = { tr("нет"), "SOCKS5", "SOCKS4", "HTTPS" };
 
         char summary[160];
         if (shared.in_use())
             cnprint(summary, sizeof(summary), "%s %s:%u", kinds[shared.kind & 3],
                     shared.host, (unsigned int)shared.port);
         else
-            ccstrncpy(summary, "соединение напрямую", sizeof(summary) - 1);
+            ccstrncpy(summary, tr("соединение напрямую"), sizeof(summary) - 1);
 
-        if (ImGui::SmallButton(g_ui.proxy_editing == PROXY_SLOT_DEFAULT ? "свернуть"
-                                                                       : "прокси"))
+        if (ImGui::SmallButton(g_ui.proxy_editing == PROXY_SLOT_DEFAULT ? tr("свернуть")
+                                                                       : tr("прокси")))
         {
             if (g_ui.proxy_editing == PROXY_SLOT_DEFAULT) g_ui.proxy_editing = -1;
             else ui_proxy_editor_open(PROXY_SLOT_DEFAULT, &shared, true);
@@ -1597,7 +1623,7 @@ void ui_view_login()
 
     ImGui::Dummy(ImVec2(0, 6));
 
-    ImGui::TextUnformatted("Токен");
+    ImGui::TextUnformatted(tr("Токен"));
 
     ImGuiInputTextFlags token_flags = ImGuiInputTextFlags_EnterReturnsTrue;
     if (!g_ui.token_visible) token_flags |= ImGuiInputTextFlags_Password;
@@ -1606,21 +1632,21 @@ void ui_view_login()
     bool submitted = ImGui::InputText("##token", g_ui.token_input, sizeof(g_ui.token_input), token_flags);
 
     ImGui::SameLine();
-    if (ui_icon_button(g_ui.token_visible ? "Скрыть##tok" : "Показать##tok", ImVec2(88, 0),
+    if (ui_icon_button(g_ui.token_visible ? tr("Скрыть##tok") : tr("Показать##tok"), ImVec2(88, 0),
                        col::bg_input, col::bg_hover))
         g_ui.token_visible = !g_ui.token_visible;
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Вырезание и копирование работают только в открытом виде");
+        ImGui::SetTooltip(tr("Вырезание и копирование работают только в открытом виде"));
 
     ImGui::Dummy(ImVec2(0, 8));
 
     if (g_ui.login_busy)
     {
-        ui_text_muted("Проверка токена...");
+        ui_text_muted(tr("Проверка токена..."));
     }
     else
     {
-        if (ImGui::Button("Войти", ImVec2(140, 34)) || submitted)
+        if (ImGui::Button(tr("Войти"), ImVec2(140, 34)) || submitted)
             begin_login(g_ui.token_input);
     }
 
@@ -1636,13 +1662,13 @@ void ui_view_login()
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, col::bg_input);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col::bg_hover);
-        if (ImGui::Button("Открыть сохранённое", ImVec2(200, 34)))
+        if (ImGui::Button(tr("Открыть сохранённое"), ImVec2(200, 34)))
             g_ui.pending_offline = fallback;
         ImGui::PopStyleColor(2);
 
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Не ждать ответа: открыть серверы, друзей и переписку из "
-                              "архива. Подключение можно будет повторить в любой момент.");
+            ImGui::SetTooltip(tr("Не ждать ответа: открыть серверы, друзей и переписку из "
+                              "архива. Подключение можно будет повторить в любой момент."));
     }
 
     if (g_ui.login_error[0])
@@ -1658,7 +1684,7 @@ void ui_view_login()
         ImGui::Dummy(ImVec2(0, 10));
         ImGui::Separator();
         ImGui::Dummy(ImVec2(0, 6));
-        ui_text_muted("Сохранённые аккаунты");
+        ui_text_muted(tr("Сохранённые аккаунты"));
 
         int pick = -1;
         int drop = -1;
@@ -1679,21 +1705,21 @@ void ui_view_login()
             ui_avatar(&shim, 22.0f, false);
             ImGui::SameLine();
 
-            if (ImGui::Selectable(entry->name[0] ? entry->name : "Аккаунт", false, 0,
+            if (ImGui::Selectable(entry->name[0] ? entry->name : tr("Аккаунт"), false, 0,
                                   ImVec2(270.0f, 24.0f)) && !g_ui.login_busy)
                 pick = i;
 
             ImGui::SameLine();
-            if (ImGui::SmallButton("архив")) g_ui.pending_offline = i;
+            if (ImGui::SmallButton(tr("архив"))) g_ui.pending_offline = i;
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Открыть этот аккаунт из сохранённого, без подключения");
+                ImGui::SetTooltip(tr("Открыть этот аккаунт из сохранённого, без подключения"));
 
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Button, col::bg_panel);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col::red);
             if (ImGui::SmallButton("x")) drop = i;
             ImGui::PopStyleColor(2);
-            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Забыть");
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Забыть"));
 
             ImGui::PopID();
         }
@@ -1708,14 +1734,14 @@ void ui_view_login()
     ImGui::Dummy(ImVec2(0, 8));
 
     ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
-    ImGui::TextWrapped("Токены сохраняются зашифрованными и привязаны к этому компьютеру. "
-                       "На другой машине файл не расшифруется.");
+    ImGui::TextWrapped(tr("Токены сохраняются зашифрованными и привязаны к этому компьютеру. "
+                       "На другой машине файл не расшифруется."));
     ImGui::PopStyleColor();
 
     if (storage::has_token())
     {
         ImGui::Dummy(ImVec2(0, 6));
-        if (ImGui::Button("Удалить сохранённый токен", ImVec2(-1, 28)))
+        if (ImGui::Button(tr("Удалить сохранённый токен"), ImVec2(-1, 28)))
         {
             storage::clear_token();
             ccfset(g_ui.login_error, 0, sizeof(g_ui.login_error));
@@ -1810,6 +1836,35 @@ void ui_init()
         begin_login(token);
         ccfset(token, 0, sizeof(token));
     }
+}
+
+// Whether the next frame has to be drawn at once, or whether the client can
+// wait for something to happen first.
+//
+// A chat window at rest is a still picture, and drawing it a hundred and forty
+// times a second is most of what this process costs when nobody is touching
+// it. The whole interface is rebuilt every frame - every guild walked, every
+// channel, the voice roster with a lock taken per person - so the saving is
+// the whole of that work, not just the drawing.
+//
+// Anything that moves by itself has to be named here, because nothing else
+// will ask for a redraw: a picture arriving, a level meter, a typing line
+// running out, or the store changing underneath.
+bool ui_wants_redraw()
+{
+    if (voice::state() != VOICE_IDLE) return true;          // meters, speaking rings
+    if (streamview::state() != WATCH_IDLE) return true;     // somebody's screen
+    if (voice::watched_camera()) return true;               // somebody's camera
+
+    screenshare_state share = screenshare::state();
+    if (share != SHARE_IDLE && share != SHARE_FAILED) return true;
+
+    // Something arrived, was edited or was deleted since the last frame drew.
+    static unsigned int seen = 0;
+    unsigned int now = store::revision();
+    if (now != seen) { seen = now; return true; }
+
+    return false;
 }
 
 void ui_frame()
@@ -1989,6 +2044,15 @@ void ui_frame()
 
     ui_view_profile_popup();
     ui_view_server_info_popup();
+    ui_view_roles_popup();
+    ui_view_invites_popup();
+    ui_view_webhooks_popup();
+    ui_view_new_channel_popup();
+    ui_view_channel_perms_popup();
+    ui_view_privacy_popup();
+    ui_view_audit_popup();
+    ui_view_music_popup();
+    ui_view_guild_edit_popup();
     ui_view_channel_info_popup();
     ui_view_share_popup();
 
@@ -1997,6 +2061,7 @@ void ui_frame()
     ui_view_settings_popup();
     ui_view_image_viewer();
     ui_view_stream_window();
+    ui_view_camera_window();
     ui_view_offline_banner();
     ui_view_accounts_popup();
 

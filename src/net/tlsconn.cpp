@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "tlsconn.h"
+#include "http.h"
 #include "proxy.h"
 #include "core/log.h"
 
@@ -329,6 +330,29 @@ bool tlsnet::self_test(const char* host)
         }
     }
     log_line("tlstest: тело начинается с %.80s", body);
+
+    // And the same request again through the client's own HTTP layer, which
+    // is what every real call goes through. The hand written socket above
+    // proves the transport; this proves what is built on top of it - and it
+    // is where cookies discord sets are picked up, which the raw socket path
+    // never sees.
+    {
+        http_response res;
+        res.init();
+
+        bool ok = http::get("https://discord.com/api/v9/gateway", &res);
+
+        ubuffer jar;
+        jar.init(1024);
+        http::cookies_header(&jar);
+
+        log_line("tlstest: через http:: - %s, код %d, cookie %u байт",
+                 ok ? "прошло" : "НЕ прошло", res.status, jar.size);
+        if (jar.size) log_line("tlstest: cookie: %.200s", jar.c_str());
+
+        jar.free_buffer();
+        res.free_response();
+    }
 
     return status[9] == '2';
 }

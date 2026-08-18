@@ -215,6 +215,83 @@ namespace
         return value;
     }
 
+    // ---- cookies ---------------------------------------------------------
+    //
+    // One jar for the process, the same way the proxy is one setting: every
+    // request here goes to discord, and the cookies it sets are about this
+    // installation rather than about one account.
+    struct cookie
+    {
+        char name[64];
+        char value[512];
+    };
+
+    const int MAX_COOKIES = 24;
+
+    cookie g_cookies[MAX_COOKIES];
+    int g_cookie_count = 0;
+    CRITICAL_SECTION g_cookie_lock;
+    volatile long g_cookie_lock_ready = 0;
+
+    void cookie_lock()
+    {
+        if (InterlockedCompareExchange(&g_cookie_lock_ready, 1, 0) == 0)
+            InitializeCriticalSection(&g_cookie_lock);
+        EnterCriticalSection(&g_cookie_lock);
+    }
+
+    void cookie_unlock() { LeaveCriticalSection(&g_cookie_lock); }
+
+    // "name=value; Path=/; Secure; HttpOnly" - everything after the first
+    // semicolon is about how a browser should manage it and is not sent back.
+    void remember_cookie(const char* value)
+    {
+        while (*value == ' ') value++;
+
+        const char* eq = 0;
+        for (const char* p = value; *p && *p != ';'; p++)
+            if (*p == '=') { eq = p; break; }
+
+        if (!eq || eq == value) return;
+
+        char name[64];
+        int n = (int)(eq - value);
+        if (n > (int)sizeof(name) - 1) n = (int)sizeof(name) - 1;
+        for (int i = 0; i < n; i++) name[i] = value[i];
+        name[n] = 0;
+
+        char val[512];
+        int v = 0;
+        for (const char* p = eq + 1; *p && *p != ';' && v < (int)sizeof(val) - 1; p++)
+            val[v++] = *p;
+        val[v] = 0;
+
+        cookie_lock();
+
+        // A cookie set again replaces the one held, which is what a browser
+        // does and what keeps a rotating one - discord rotates __cf_bm -
+        // from filling the jar.
+        for (int i = 0; i < g_cookie_count; i++)
+        {
+            if (ccscmp(g_cookies[i].name, name) != 0) continue;
+            ccstrncpy(g_cookies[i].value, val, sizeof(g_cookies[i].value) - 1);
+            cookie_unlock();
+            return;
+        }
+
+        if (g_cookie_count < MAX_COOKIES)
+        {
+            // Said once per name, so the log shows what discord set on this
+            // client without turning into a line per request.
+            log_line("http: cookie %s принят", name);
+            ccstrncpy(g_cookies[g_cookie_count].name, name, sizeof(name) - 1);
+            ccstrncpy(g_cookies[g_cookie_count].value, val, sizeof(val) - 1);
+            g_cookie_count++;
+        }
+
+        cookie_unlock();
+    }
+
     bool header_is(const char* line, const char* name)
     {
         unsigned int n = (unsigned int)ccslenf(name);
@@ -396,6 +473,14 @@ bool http::request(const char* method, const char* url, const char* headers_utf8
         head.append_str("Accept-Encoding: identity\r\n");
         head.append_str("Connection: keep-alive\r\n");
 
+        {
+            ubuffer jar;
+            jar.init(1024);
+            http::cookies_header(&jar);
+            if (jar.size) head.append_fmt("Cookie: %s\r\n", jar.c_str());
+            jar.free_buffer();
+        }
+
         if (headers_utf8 && headers_utf8[0]) head.append_str(headers_utf8);
 
         if (body && body_len) head.append_fmt("Content-Length: %u\r\n", body_len);
@@ -455,7 +540,9 @@ bool http::request(const char* method, const char* url, const char* headers_utf8
             if (!read_line(&r, line, sizeof(line))) break;
             if (!line[0]) break;                     // blank line ends the headers
 
-            if (header_is(line, "content-type"))
+            if (header_is(line, "set-cookie"))
+                remember_cookie(header_value(line));
+            else if (header_is(line, "content-type"))
                 ccstrncpy(out->content_type, header_value(line), sizeof(out->content_type) - 1);
             else if (header_is(line, "content-length"))
             {
@@ -651,4 +738,27 @@ void jobs::post(job_fn fn, void* user)
 int jobs::pending()
 {
     return (int)g_job_pending;
+}
+
+void http::cookies_header(ubuffer* out)
+{
+    if (!out) return;
+    out->clear();
+
+    cookie_lock();
+    for (int i = 0; i < g_cookie_count; i++)
+    {
+        if (out->size) out->append_str("; ");
+        out->append_str(g_cookies[i].name);
+        out->append_str("=");
+        out->append_str(g_cookies[i].value);
+    }
+    cookie_unlock();
+}
+
+void http::clear_cookies()
+{
+    cookie_lock();
+    g_cookie_count = 0;
+    cookie_unlock();
 }

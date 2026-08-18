@@ -134,3 +134,43 @@ void format_timestamp(const char* iso, char* out, int cap)
     else
         cnprint(out, cap, "%02d.%02d.%04d %02d:%02d", local.wDay, local.wMonth, local.wYear, local.wHour, local.wMinute);
 }
+
+unsigned long long iso_to_unix_ms(const char* iso)
+{
+    if (!iso || ccslenf(iso) < 19) return 0;
+
+    SYSTEMTIME utc;
+    ccfset(&utc, 0, sizeof(utc));
+    utc.wYear = (WORD)read_int(iso + 0, 4);
+    utc.wMonth = (WORD)read_int(iso + 5, 2);
+    utc.wDay = (WORD)read_int(iso + 8, 2);
+    utc.wHour = (WORD)read_int(iso + 11, 2);
+    utc.wMinute = (WORD)read_int(iso + 14, 2);
+    utc.wSecond = (WORD)read_int(iso + 17, 2);
+
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&utc, &ft)) return 0;
+
+    unsigned long long ticks = ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    if (ticks < 116444736000000000ULL) return 0;
+
+    return (ticks - 116444736000000000ULL) / 10000ULL;
+}
+
+void unix_ms_to_iso(unsigned long long ms, char* out, int cap)
+{
+    if (cap > 0) out[0] = 0;
+    if (!ms) return;
+
+    unsigned long long ticks = ms * 10000ULL + 116444736000000000ULL;
+
+    FILETIME ft;
+    ft.dwLowDateTime = (DWORD)(ticks & 0xFFFFFFFFULL);
+    ft.dwHighDateTime = (DWORD)(ticks >> 32);
+
+    SYSTEMTIME st;
+    if (!FileTimeToSystemTime(&ft, &st)) return;
+
+    cnprint(out, cap, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+}

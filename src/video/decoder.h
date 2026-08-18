@@ -29,6 +29,16 @@ namespace vdec
     // when nothing is ready, which is normal while the decoder fills up.
     bool next(const unsigned char** rgba, int* width, int* height);
 
+    // The same picture without the colour conversion: the visible region as
+    // tightly packed NV12, luma plane first and the interleaved chroma pairs
+    // after it. width*height*3/2 bytes.
+    //
+    // Two million pixels thirty times a second is real work, and none of it
+    // needs a processor - a graphics card does this conversion as part of
+    // sampling. Handing the planes over instead also cuts what has to be
+    // copied to the card from four bytes a pixel to one and a half.
+    bool next_nv12(const unsigned char** nv12, int* width, int* height);
+
     // The visible size of the last picture. Zero until the first one arrives.
     int width();
     int height();

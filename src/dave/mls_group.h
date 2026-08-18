@@ -67,6 +67,17 @@ namespace mls
         unsigned char node_private[MAX_NODES][hpke::NSK];
         bool node_private_set[MAX_NODES];
 
+        // The GroupContext extensions, exactly as the group carries them.
+        //
+        // Kept verbatim rather than understood: this client has no use for any
+        // of them, but the context is hashed into the key schedule, so writing
+        // it back with an empty extensions field produces different keys from
+        // everybody else's. A DAVE group always has at least one - the server
+        // is an external sender and says so here - and the effect was that
+        // every commit after joining failed its confirmation tag.
+        unsigned char context_extensions[1024];
+        unsigned int context_extensions_len;
+
         unsigned char tree_hash[32];
         unsigned char confirmed_transcript_hash[32];
         unsigned int confirmed_transcript_hash_len;
@@ -103,6 +114,17 @@ namespace mls
     bool build_commit(group_state* g,
                       const proposal_message* proposals, unsigned int proposal_count,
                       ubuffer* out_commit, ubuffer* out_welcome);
+
+    // Which leaf sent a commit, without applying anything. The server hands a
+    // commit back to its own author looking like everybody else's, and the
+    // author is the one member who cannot process it - the state it leads to
+    // was computed when it was written, so it has to be swapped in rather than
+    // calculated. Telling the two apart by comparing bytes does not hold: what
+    // comes back has been through the server. This reads the sender out of the
+    // FramedContent, which is what the sender field is for.
+    //
+    // False when the message cannot be parsed far enough to tell.
+    bool commit_sender(const void* message, unsigned int len, unsigned int* out_leaf);
 
     // Joins an existing group from a Welcome: decrypts our GroupSecrets with
     // the key package's init key, unwraps the GroupInfo, rebuilds the tree and

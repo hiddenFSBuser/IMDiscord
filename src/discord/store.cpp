@@ -267,6 +267,7 @@ dchannel* store::upsert_channel(const jval* v, snowflake guild_id)
     if (v->has("guild_id")) c->guild_id = v->sf("guild_id");
     if (v->has("parent_id")) c->parent_id = v->sf("parent_id");
     if (v->has("last_message_id")) c->last_message_id = v->sf("last_message_id");
+    if (v->has("owner_id")) c->owner_id = v->sf("owner_id");
     if (v->has("name")) c->name = dup_field(v, "name");
     if (v->has("topic")) c->topic = dup_field(v, "topic");
     if (v->has("icon")) c->icon = dup_field(v, "icon");
@@ -396,6 +397,7 @@ dguild* store::upsert_guild(const jval* v)
             role.position = r->i32("position", 0);
             role.permissions = r->sf("permissions");   // arrives as a string
             role.hoist = r->boolean("hoist", false);
+            role.mentionable = r->boolean("mentionable", false);
             g->roles.push(role);
         }
     }
@@ -433,6 +435,7 @@ dguild* store::upsert_guild(const jval* v)
             ccfset(&mem, 0, sizeof(mem));
             mem.user_id = mu->id;
             mem.nick = dup_field(m, "nick");
+            mem.timeout_until_ms = iso_to_unix_ms(m->str("communication_disabled_until", 0));
             mem.roles = ulist<snowflake>();
             read_member_roles(&mem, m);
             g->members.push(mem);
@@ -459,6 +462,64 @@ dguild* store::upsert_guild(const jval* v)
 // by position, and inside each one the text channels before the voice ones,
 // each group by its own position. Getting this wrong is not subtle - the
 // sidebar simply looks wrong to anybody who has used discord.
+void store::upsert_role(dguild* g, const jval* role)
+{
+    if (!g || !role || role->type != JTYPE_OBJ) return;
+
+    snowflake id = role->sf("id");
+    if (!id) return;
+
+    drole* found = 0;
+    for (unsigned int i = 0; i < g->roles.count; i++)
+        if (g->roles[i].id == id) { found = &g->roles[i]; break; }
+
+    if (!found)
+    {
+        drole fresh;
+        ccfset(&fresh, 0, sizeof(fresh));
+        fresh.id = id;
+        g->roles.push(fresh);
+        found = &g->roles[g->roles.count - 1];
+    }
+
+    found->name = dup_field(role, "name");
+    found->color = (unsigned int)role->i64("color", 0);
+    found->position = role->i32("position", 0);
+    found->permissions = role->sf("permissions");
+    found->hoist = role->boolean("hoist", false);
+    found->mentionable = role->boolean("mentionable", false);
+
+    bump_revision();
+}
+
+void store::remove_role(dguild* g, snowflake role_id)
+{
+    if (!g || !role_id) return;
+
+    for (unsigned int i = 0; i < g->roles.count; i++)
+    {
+        if (g->roles[i].id != role_id) continue;
+        g->roles.delete_at((int)i);
+        break;
+    }
+
+    // And off everybody who had it, because the server will not send a member
+    // update for each of them - a deleted role simply stops existing, and a
+    // member list still naming it would colour and sort people by nothing.
+    for (unsigned int i = 0; i < g->members.count; i++)
+    {
+        ulist<snowflake>* roles = &g->members[i].roles;
+        for (unsigned int k = 0; k < roles->count; k++)
+        {
+            if ((*roles)[k] != role_id) continue;
+            roles->delete_at((int)k);
+            break;
+        }
+    }
+
+    bump_revision();
+}
+
 void store::add_guild_member(dguild* g, const jval* member)
 {
     if (!g || !member || member->type != JTYPE_OBJ) return;
@@ -479,10 +540,18 @@ void store::add_guild_member(dguild* g, const jval* member)
 
     const char* nick = member->str("nick", 0);
 
+    // Absent means "no timeout" here rather than "unchanged": discord clears a
+    // timeout by sending the field as null, and reading that as nothing to do
+    // would leave a lifted timeout showing forever.
+    unsigned long long until = 0;
+    if (member->has("communication_disabled_until"))
+        until = iso_to_unix_ms(member->str("communication_disabled_until", 0));
+
     for (unsigned int i = 0; i < g->members.count; i++)
     {
         if (g->members[i].user_id != uid) continue;
         if (nick) g->members[i].nick = intern(nick);
+        if (member->has("communication_disabled_until")) g->members[i].timeout_until_ms = until;
         read_member_roles(&g->members[i], member);
         return;
     }
@@ -491,6 +560,7 @@ void store::add_guild_member(dguild* g, const jval* member)
     ccfset(&fresh, 0, sizeof(fresh));
     fresh.user_id = uid;
     fresh.nick = nick ? intern(nick) : 0;
+    fresh.timeout_until_ms = until;
     fresh.roles = ulist<snowflake>();
     read_member_roles(&fresh, member);
     g->members.push(fresh);
@@ -610,6 +680,38 @@ unsigned long long store::member_permissions(const dguild* g, snowflake user_id,
     }
 
     return base;
+}
+
+// The position of the highest role somebody holds. @everyone sits at zero, so
+// a member with no roles of their own compares as zero too.
+static int top_role_position(const dguild* g, snowflake user_id)
+{
+    const dmember* m = 0;
+    for (unsigned int i = 0; i < g->members.count; i++)
+        if (g->members[i].user_id == user_id) { m = &g->members[i]; break; }
+
+    if (!m) return 0;
+
+    int best = 0;
+    for (unsigned int i = 0; i < m->roles.count; i++)
+    {
+        const drole* r = store::find_role(g, m->roles[i]);
+        if (r && r->position > best) best = r->position;
+    }
+    return best;
+}
+
+bool store::outranks(const dguild* g, snowflake actor_id, snowflake target_id)
+{
+    if (!g || !actor_id || !target_id || actor_id == target_id) return false;
+
+    // The owner outranks everybody, and nobody outranks the owner - not even
+    // an administrator, which is the one case where holding every permission
+    // is still not enough.
+    if (g->owner_id == actor_id) return true;
+    if (g->owner_id == target_id) return false;
+
+    return top_role_position(g, actor_id) > top_role_position(g, target_id);
 }
 
 bool store::can_view_channel(const dguild* g, snowflake user_id, const dchannel* c)
@@ -1063,6 +1165,59 @@ const dvoice_state* store::find_voice_state(snowflake user_id)
     for (unsigned int i = 0; i < g_voice.count; i++)
         if (g_voice[i].user_id == user_id) return &g_voice[i];
     return 0;
+}
+
+namespace
+{
+    // One entry per call that is ringing somebody. A handful at most - a
+    // person is not in twenty calls - so a list walked linearly is the whole
+    // of what this needs.
+    struct ringing_call
+    {
+        snowflake channel_id;
+        unsigned int count;
+    };
+
+    ulist<ringing_call> g_ringing;
+
+}
+
+void store::set_call_ringing(snowflake channel_id, const ulist<snowflake>* users)
+{
+    if (!channel_id) return;
+
+    unsigned int count = users ? users->count : 0;
+
+    for (unsigned int i = 0; i < g_ringing.count; i++)
+    {
+        if (g_ringing[i].channel_id != channel_id) continue;
+
+        if (!count) g_ringing.delete_at(i);
+        else        g_ringing[i].count = count;
+        return;
+    }
+
+    if (!count) return;
+
+    ringing_call fresh;
+    fresh.channel_id = channel_id;
+    fresh.count = count;
+    g_ringing.push(fresh);
+}
+
+void store::clear_call_ringing(snowflake channel_id)
+{
+
+    for (unsigned int i = g_ringing.count; i > 0; i--)
+        if (g_ringing[i - 1].channel_id == channel_id) g_ringing.delete_at(i - 1);
+}
+
+bool store::call_is_ringing(snowflake channel_id)
+{
+
+    for (unsigned int i = 0; i < g_ringing.count; i++)
+        if (g_ringing[i].channel_id == channel_id) return true;
+    return false;
 }
 
 void store::clear_voice_states_for_channel(snowflake channel_id)

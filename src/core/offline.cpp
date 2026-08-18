@@ -81,8 +81,8 @@ const char* offline::headline()
 {
     switch (g_reason)
     {
-    case OFFLINE_NO_NETWORK:    return "Нет связи с discord — показано сохранённое";
-    case OFFLINE_TOKEN_REVOKED: return "Токен больше не действует — показано сохранённое";
+    case OFFLINE_NO_NETWORK:    return tr("Нет связи с discord — показано сохранённое");
+    case OFFLINE_TOKEN_REVOKED: return tr("Токен больше не действует — показано сохранённое");
     default:                    return "";
     }
 }
@@ -92,9 +92,9 @@ const char* offline::detail()
     switch (g_reason)
     {
     case OFFLINE_NO_NETWORK:
-        return "Серверы, друзья и переписка читаются из архива. Кэш картинок не чистится.";
+        return tr("Серверы, друзья и переписка читаются из архива. Кэш картинок не чистится.");
     case OFFLINE_TOKEN_REVOKED:
-        return "Войди заново или переключи аккаунт. Всё сохранённое остаётся на месте.";
+        return tr("Войди заново или переключи аккаунт. Всё сохранённое остаётся на месте.");
     default:
         return "";
     }

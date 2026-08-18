@@ -78,7 +78,7 @@ void oslib::init()
     if (g_mm)
         g_activate = (pfn_ActivateAudioInterfaceAsync)
             GetProcAddress(g_mm, "ActivateAudioInterfaceAsync");
-    if (!g_activate) note_missing("захват звука по процессу");
+    if (!g_activate) note_missing(tr("захват звука по процессу"));
 
     if (g_missing[0]) log_line("oslib: этой системе не хватает: %s", g_missing);
     else              log_line("oslib: всё нужное на месте");

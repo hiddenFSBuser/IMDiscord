@@ -73,3 +73,9 @@ void operator delete[](void* p, size_t) noexcept;
 inline void* operator new(size_t, void* where) noexcept { return where; }
 inline void operator delete(void*, void*) noexcept {}
 #endif
+
+// ---- interface language --------------------------------------------------
+// tr() takes the Russian text in the source and hands back whatever language
+// is chosen. It is here rather than included per file because by now nearly
+// every file that says anything to the person needs it.
+#include "core/lang.h"

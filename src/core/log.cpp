@@ -6,12 +6,43 @@ static HANDLE g_log_file = INVALID_HANDLE_VALUE;
 static CRITICAL_SECTION g_log_lock;
 static bool g_log_ready = false;
 
+namespace
+{
+    // Whether this run is one of the "--*test" modes rather than the client.
+    //
+    // Those write somewhere else and leave the ordinary log alone. A test run
+    // that overwrites the record of the session somebody is trying to explain
+    // is worse than no test at all, and it has already happened here more than
+    // once - including to the very session that was being asked about.
+    bool test_run()
+    {
+        const wchar_t* cmd = GetCommandLineW();
+
+        for (const wchar_t* p = cmd; *p; p++)
+        {
+            if (p[0] != L'-' || p[1] != L'-') continue;
+
+            // Every one of them ends in "test": selftest, mp4test, mp3test,
+            // audiotest, tlstest, wstest, proxytest, capturetest.
+            for (const wchar_t* q = p + 2; *q && *q != L' '; q++)
+            {
+                if (q[0] == L't' && q[1] == L'e' && q[2] == L's' && q[3] == L't' &&
+                    (q[4] == 0 || q[4] == L' '))
+                    return true;
+            }
+        }
+        return false;
+    }
+}
+
 void log_init()
 {
     if (g_log_ready) return;
 
     InitializeCriticalSection(&g_log_lock);
     g_log_ready = true;
+
+    bool testing = test_run();
 
     wchar_t path[MAX_PATH];
     wchar_t chosen[MAX_PATH];
@@ -25,13 +56,33 @@ void log_init()
     // Something has to succeed here. A run that leaves no trace anywhere turns
     // every question about it into guesswork, which is exactly how a whole
     // debugging round was wasted.
+    //
+    // The previous run is moved aside first. Opening this one truncates it,
+    // and what somebody wants to look at is almost always what happened just
+    // before they closed the client and started it again to fetch the file -
+    // which is precisely the run that used to be destroyed by fetching it.
+    if (!testing)
+    {
+        wchar_t live[MAX_PATH];
+        wchar_t kept[MAX_PATH];
+
+        if (ufile::app_path(L"imdiscord.log", live, MAX_PATH) &&
+            ufile::app_path(L"imdiscord.prev.log", kept, MAX_PATH))
+        {
+            DeleteFileW(kept);
+            MoveFileW(live, kept);
+        }
+    }
+
     for (int attempt = 1; attempt <= 5 && g_log_file == INVALID_HANDLE_VALUE; attempt++)
     {
         char narrow[64];
         wchar_t name[64];
 
-        if (attempt == 1) ccstrncpy(narrow, "imdiscord.log", sizeof(narrow) - 1);
-        else              cnprint(narrow, sizeof(narrow), "imdiscord.%d.log", attempt);
+        const char* base = testing ? "imdiscord.test" : "imdiscord";
+
+        if (attempt == 1) cnprint(narrow, sizeof(narrow), "%s.log", base);
+        else              cnprint(narrow, sizeof(narrow), "%s.%d.log", base, attempt);
         chartowcs(narrow, name, 64);
 
         if (!ufile::app_path(name, path, MAX_PATH)) break;
@@ -61,7 +112,12 @@ void log_init()
         }
     }
 
-    log_line("---- IMDiscord start (pid %u) ----", (unsigned int)GetCurrentProcessId());
+    // The build this log came out of, not just the run. Several rounds of
+    // chasing one defect have turned on the question "was that the version
+    // with the fix in it", and a log that cannot answer it costs a whole
+    // exchange to find out.
+    log_line("---- IMDiscord start (pid %u, сборка %s %s) ----",
+             (unsigned int)GetCurrentProcessId(), __DATE__, __TIME__);
     if (chosen[0])
     {
         char where[MAX_PATH];

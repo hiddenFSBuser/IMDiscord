@@ -13,6 +13,7 @@
 #include "core/offline.h"
 #include "system/io/ufile.h"
 #include "discord/rest.h"
+#include "discord/science.h"
 #include "discord/gateway.h"
 #include "discord/voice.h"
 
@@ -51,14 +52,20 @@ namespace
         ImVec2 start = ImGui::GetCursorScreenPos();
         float row_h = 52.0f;
 
+        // The row is one wide invisible button, and the real controls are put
+        // on top of it afterwards by moving the cursor back. Without this the
+        // row takes the click first - it is submitted first, so it becomes the
+        // active item on mouse down and the buttons behind it never see the
+        // press. That is why nothing in this list could be clicked.
+        ImGui::SetNextItemAllowOverlap();
         ImGui::InvisibleButton("##row", ImVec2(width - 40.0f, row_h));
         bool hovered = ImGui::IsItemHovered();
 
         if (ImGui::BeginPopupContextItem("##relctx"))
         {
-            if (ImGui::MenuItem("Открыть профиль")) ui_open_profile(u->id, 0);
+            if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, 0);
             ImGui::Separator();
-            ui_copy_id_item(u->id, "Скопировать ID пользователя");
+            ui_copy_id_item(u->id, tr("Скопировать ID пользователя"));
             ImGui::EndPopup();
         }
 
@@ -73,9 +80,9 @@ namespace
         dl->AddText(ImVec2(start.x + 54.0f, start.y + 10.0f), col::text_normal, u->display_name());
 
         const char* sub = "";
-        if (rel->type == REL_INCOMING) sub = "входящая заявка в друзья";
-        else if (rel->type == REL_OUTGOING) sub = "исходящая заявка";
-        else if (rel->type == REL_BLOCKED) sub = "заблокирован";
+        if (rel->type == REL_INCOMING) sub = tr("входящая заявка в друзья");
+        else if (rel->type == REL_OUTGOING) sub = tr("исходящая заявка");
+        else if (rel->type == REL_BLOCKED) sub = tr("заблокирован");
         else if (u->username) sub = u->username;
         dl->AddText(ImVec2(start.x + 54.0f, start.y + 28.0f), col::text_muted, sub);
 
@@ -84,34 +91,34 @@ namespace
 
         if (rel->type == REL_INCOMING)
         {
-            if (ui_icon_button("Принять##acc", ImVec2(96, 28), col::green, col::green))
+            if (ui_icon_button(tr("Принять##acc"), ImVec2(96, 28), col::green, col::green))
                 api::accept_friend_request(u->id);
             ImGui::SameLine(0, 6);
-            if (ui_icon_button("Отклонить##dec", ImVec2(96, 28), col::red, col::red))
+            if (ui_icon_button(tr("Отклонить##dec"), ImVec2(96, 28), col::red, col::red))
                 api::remove_relationship(u->id);
         }
         else if (rel->type == REL_OUTGOING)
         {
             ImGui::SetCursorScreenPos(ImVec2(bx - 100.0f, start.y + 12.0f));
-            if (ui_icon_button("Отменить##cancel", ImVec2(96, 28), col::bg_panel, col::red))
+            if (ui_icon_button(tr("Отменить##cancel"), ImVec2(96, 28), col::bg_panel, col::red))
                 api::remove_relationship(u->id);
         }
         else if (rel->type == REL_BLOCKED)
         {
             ImGui::SetCursorScreenPos(ImVec2(bx - 100.0f, start.y + 12.0f));
-            if (ui_icon_button("Разблокировать##unb", ImVec2(96, 28), col::bg_panel, col::bg_hover))
+            if (ui_icon_button(tr("Разблокировать##unb"), ImVec2(96, 28), col::bg_panel, col::bg_hover))
                 api::remove_relationship(u->id);
         }
         else
         {
-            if (ui_icon_button("Написать##msg", ImVec2(96, 28), col::accent, col::accent_hover))
+            if (ui_icon_button(tr("Написать##msg"), ImVec2(96, 28), col::accent, col::accent_hover))
             {
                 api::open_dm(u->id);
                 g_ui.show_friends = false;
                 g_ui.active_guild = 0;
             }
             ImGui::SameLine(0, 6);
-            if (ui_icon_button("Удалить##rem", ImVec2(96, 28), col::bg_panel, col::red))
+            if (ui_icon_button(tr("Удалить##rem"), ImVec2(96, 28), col::bg_panel, col::red))
                 api::remove_relationship(u->id);
         }
 
@@ -126,23 +133,41 @@ namespace
 
 void ui_view_friends(float width, float height)
 {
+    // Arriving at the screen, as distinct from moving between its tabs.
+    // Reported once per arrival rather than once per frame.
+    {
+        // A gap in the frames this drew on means the screen was closed and
+        // opened again. A plain "have we ever" flag would report the first
+        // arrival of the whole run and nothing after it.
+        static int last_frame = -10;
+        int now = ImGui::GetFrameCount();
+
+        if (now - last_frame > 1)
+        {
+            static const char* NAMES[] = { "ALL", "ONLINE", "PENDING",
+                                           "BLOCKED", "ADD_FRIEND" };
+            science::friends_list_viewed(NAMES[g_friends_tab]);
+        }
+        last_frame = now;
+    }
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetWindowPos();
     dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), col::bg_chat);
 
     ImGui::SetCursorPos(ImVec2(16, 12));
     ImGui::PushFont(g_app.font_bold);
-    ImGui::TextUnformatted("Друзья");
+    ImGui::TextUnformatted(tr("Друзья"));
     ImGui::PopFont();
 
     ImGui::SetCursorPos(ImVec2(16, 44));
 
     struct { const char* label; int tab; } tabs[] = {
-        { "Все", TAB_ALL },
-        { "В сети", TAB_ONLINE },
-        { "Ожидают", TAB_PENDING },
-        { "Заблокированные", TAB_BLOCKED },
-        { "Добавить", TAB_ADD },
+        { tr("Все"), TAB_ALL },
+        { tr("В сети"), TAB_ONLINE },
+        { tr("Ожидают"), TAB_PENDING },
+        { tr("Заблокированные"), TAB_BLOCKED },
+        { tr("Добавить"), TAB_ADD },
     };
 
     for (int i = 0; i < 5; i++)
@@ -152,7 +177,22 @@ void ui_view_friends(float width, float height)
         if (ui_icon_button(tabs[i].label, ImVec2(0, 28),
                            active ? col::accent : col::bg_panel,
                            active ? col::accent_hover : col::bg_hover))
+        {
             g_friends_tab = tabs[i].tab;
+
+            // Reported the way the official client reports it. The names are
+            // discord's own, and the add-friend one is the one that matters.
+            static const char* NAMES[] = { "ALL", "ONLINE", "PENDING",
+                                           "BLOCKED", "ADD_FRIEND" };
+            science::friends_list_clicked(NAMES[tabs[i].tab]);
+
+            // Discord will not show blocked accounts in the list itself; it
+            // sends people to a settings screen for them. Opening that tab
+            // here is the same intent, so it is reported the same way - the
+            // notice, the badge and the visit, exactly as arriving at that
+            // screen produces them.
+            if (tabs[i].tab == TAB_BLOCKED) science::blocked_settings_viewed();
+        }
     }
 
     ImGui::SetCursorPos(ImVec2(8, 86));
@@ -162,20 +202,64 @@ void ui_view_friends(float width, float height)
     {
         ImGui::Indent(8.0f);
         ImGui::Dummy(ImVec2(0, 8));
-        ImGui::TextUnformatted("Введите имя пользователя");
-        ui_text_muted("Новый формат: username. Старый: username#1234");
+        ImGui::TextUnformatted(tr("Введите имя пользователя"));
+        ui_text_muted(tr("Новый формат: username. Старый: username#1234"));
         ImGui::Dummy(ImVec2(0, 6));
 
         ImGui::SetNextItemWidth(340);
         bool go = ImGui::InputText("##friendname", g_ui.friend_input, sizeof(g_ui.friend_input),
                                    ImGuiInputTextFlags_EnterReturnsTrue);
+
+        // The field being focused is its own step in the sequence the official
+        // client sends before a request goes out.
+        if (ImGui::IsItemActivated()) science::add_friend_input_clicked();
         ImGui::SameLine();
-        if (ImGui::Button("Отправить заявку", ImVec2(180, 0)) || go)
+        if (ImGui::Button(tr("Отправить заявку"), ImVec2(180, 0)) || go)
         {
             if (g_ui.friend_input[0])
             {
+                api::clear_captcha();
+                ccstrncpy(g_ui.captcha_for, g_ui.friend_input,
+                          sizeof(g_ui.captcha_for) - 1);
                 api::send_friend_request(g_ui.friend_input);
-                ccfset(g_ui.friend_input, 0, sizeof(g_ui.friend_input));
+            }
+        }
+
+        // Discord refuses a request it finds unfamiliar until a captcha has
+        // been answered. Solving one is not something this client does or
+        // should do - it is put in front of the person, and whatever they come
+        // back with is carried on the retry and nothing else.
+        if (api::captcha_sitekey()[0])
+        {
+            ImGui::Dummy(ImVec2(0, 10));
+            ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+            ImGui::TextWrapped(tr("Discord просит пройти CAPTCHA для заявки к %s"),
+                               g_ui.captcha_for);
+            ImGui::PopStyleColor();
+
+            ui_text_muted(tr("Проще всего отправить эту заявку один раз из браузера. "
+                          "Если у вас есть готовый токен - вставьте его сюда."));
+
+            if (ImGui::Button(tr("Открыть Discord в браузере"), ImVec2(250, 0)))
+                ShellExecuteW(0, L"open", L"https://discord.com/channels/@me", 0, 0, SW_SHOWNORMAL);
+
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputTextWithHint("##captcha", tr("токен капчи"),
+                                     g_ui.captcha_token, sizeof(g_ui.captcha_token));
+
+            if (ImGui::Button(tr("Повторить с токеном"), ImVec2(200, 0)) &&
+                g_ui.captcha_token[0] && g_ui.captcha_for[0])
+            {
+                api::send_friend_request(g_ui.captcha_for, g_ui.captcha_token,
+                                         api::captcha_rqtoken());
+                ccfset(g_ui.captcha_token, 0, sizeof(g_ui.captcha_token));
+            }
+
+            ImGui::SameLine();
+            if (ImGui::Button(tr("Отмена"), ImVec2(120, 0)))
+            {
+                api::clear_captcha();
+                api::clear_last_error();
             }
         }
 
@@ -207,7 +291,7 @@ void ui_view_friends(float width, float height)
         {
             ImGui::Dummy(ImVec2(0, 20));
             ImGui::Indent(16.0f);
-            ui_text_muted("Здесь пока никого нет");
+            ui_text_muted(tr("Здесь пока никого нет"));
             ImGui::Unindent(16.0f);
         }
     }
@@ -290,6 +374,97 @@ namespace
     }
 }
 
+// The people in a group chat.
+//
+// A group has no roles, no permissions and no member chunks - it is a list of
+// recipients and an owner - so none of the machinery below applies to it and
+// it gets its own short function rather than a pile of branches inside that
+// one. Who is in the call is drawn here too: a group is the one place where
+// the call and the membership are the same small list of faces.
+static void draw_group_members(dchannel* c, float width)
+{
+    ulist<snowflake> in_call;
+    store::users_in_voice(c->id, &in_call);
+
+    char header[96];
+    cnprint(header, sizeof(header), tr("УЧАСТНИКИ - %u"), c->recipients.count + 1);
+
+    ImGui::Indent(10.0f);
+    ui_text_muted(header);
+    ImGui::Unindent(10.0f);
+    ImGui::Dummy(ImVec2(0, 4));
+
+    // Ourselves first, then everybody else. Discord counts the owner as a
+    // member of their own group and so does this.
+    for (unsigned int pass = 0; pass < 2; pass++)
+    {
+        unsigned int count = pass == 0 ? 1 : c->recipients.count;
+
+        for (unsigned int i = 0; i < count; i++)
+        {
+            duser* u = pass == 0 ? store::self() : store::find_user(c->recipients[i]);
+            if (!u) continue;
+
+            bool talking = false;
+            for (unsigned int k = 0; k < in_call.count && !talking; k++)
+                talking = in_call[k] == u->id;
+
+            ImGui::PushID((int)(u->id & 0x7FFFFFFF));
+
+            float row_w = width - 20.0f;
+            ImVec2 start = ImGui::GetCursorScreenPos();
+
+            ImGui::SetCursorScreenPos(ImVec2(start.x + 10.0f, start.y));
+            ImGui::InvisibleButton("##gm", ImVec2(row_w, 34.0f));
+
+            if (ImGui::IsItemHovered())
+                ImGui::GetWindowDrawList()->AddRectFilled(
+                    ImVec2(start.x + 10.0f, start.y),
+                    ImVec2(start.x + 10.0f + row_w, start.y + 34.0f), col::bg_hover, 4.0f);
+
+            if (ImGui::IsItemClicked()) ui_open_profile(u->id, 0);
+
+            if (ImGui::BeginPopupContextItem("##gmctx"))
+            {
+                if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, 0);
+                ImGui::Separator();
+                ui_copy_id_item(u->id, tr("Скопировать ID пользователя"));
+                ImGui::EndPopup();
+            }
+
+            ImGui::SetCursorScreenPos(ImVec2(start.x + 12.0f, start.y + 3.0f));
+            ui_avatar(u, 28.0f, true);
+
+            ImU32 tint = u->status != STATUS_OFFLINE ? col::text_normal : col::text_muted;
+
+            ImDrawList* d = ImGui::GetWindowDrawList();
+            d->AddText(ImVec2(start.x + 48.0f, start.y + 9.0f), tint, u->display_name());
+
+            // The owner of the group, and whoever is in the call right now.
+            float mark_x = start.x + 10.0f + row_w - 8.0f;
+
+            if (talking)
+            {
+                const char* label = tr("в звонке");
+                float w = ImGui::CalcTextSize(label).x;
+                mark_x -= w;
+                d->AddText(ImVec2(mark_x, start.y + 9.0f), col::green, label);
+                mark_x -= 8.0f;
+            }
+
+            if (c->owner_id && u->id == c->owner_id)
+            {
+                const char* label = tr("владелец");
+                float w = ImGui::CalcTextSize(label).x;
+                d->AddText(ImVec2(mark_x - w, start.y + 9.0f), col::text_muted, label);
+            }
+
+            ImGui::SetCursorScreenPos(ImVec2(start.x, start.y + 34.0f));
+            ImGui::PopID();
+        }
+    }
+}
+
 void ui_view_members(float width, float height)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -297,7 +472,18 @@ void ui_view_members(float width, float height)
     dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), col::bg_panel);
 
     dguild* g = store::find_guild(g_ui.active_guild);
-    if (!g) return;
+    if (!g)
+    {
+        // Not on a server: a group chat has a member list of its own, and it
+        // is the one thing this panel could usefully show there.
+        dchannel* group = store::find_channel(g_ui.active_channel);
+        if (group && group->type == CH_GROUP_DM)
+        {
+            ImGui::Dummy(ImVec2(0, 8));
+            draw_group_members(group, width);
+        }
+        return;
+    }
 
     // The list belongs to the channel being read, not to the server. Discord
     // shows the people who can see this channel, and on a server with private
@@ -309,7 +495,7 @@ void ui_view_members(float width, float height)
     ImGui::Indent(10.0f);
 
     ImGui::SetNextItemWidth(width - 24.0f);
-    ImGui::InputTextWithHint("##memberfilter", "Поиск участника", g_ui.member_filter, sizeof(g_ui.member_filter));
+    ImGui::InputTextWithHint("##memberfilter", tr("Поиск участника"), g_ui.member_filter, sizeof(g_ui.member_filter));
 
     if (ImGui::IsItemDeactivatedAfterEdit() && g_ui.member_filter[0])
         gateway::request_guild_members(g->id, g_ui.member_filter, 25);
@@ -369,17 +555,17 @@ void ui_view_members(float width, float height)
 
     char header[96];
     if (g->member_count > (int)g->members.count)
-        cnprint(header, sizeof(header), "УЧАСТНИКИ - %u из %d",
+        cnprint(header, sizeof(header), tr("УЧАСТНИКИ - %u из %d"),
                 slots.count, g->member_count);
     else
-        cnprint(header, sizeof(header), "УЧАСТНИКИ - %u", slots.count);
+        cnprint(header, sizeof(header), tr("УЧАСТНИКИ - %u"), slots.count);
 
     ImGui::Indent(10.0f);
     ui_text_muted(header);
     if (channel && channel->name)
     {
         char sub[128];
-        cnprint(sub, sizeof(sub), "с доступом к #%s", channel->name);
+        cnprint(sub, sizeof(sub), tr("с доступом к #%s"), channel->name);
         ui_text_muted(sub);
     }
     ImGui::Unindent(10.0f);
@@ -417,8 +603,8 @@ void ui_view_members(float width, float height)
 
             char title[96];
             if (slot->section)      cnprint(title, sizeof(title), "%s - %u", slot->section->name, run);
-            else if (slot->online)  cnprint(title, sizeof(title), "В СЕТИ - %u", run);
-            else                    cnprint(title, sizeof(title), "НЕ В СЕТИ - %u", run);
+            else if (slot->online)  cnprint(title, sizeof(title), tr("В СЕТИ - %u"), run);
+            else                    cnprint(title, sizeof(title), tr("НЕ В СЕТИ - %u"), run);
 
             ImGui::Dummy(ImVec2(0, 8));
             ui_text_muted(title);
@@ -439,10 +625,12 @@ void ui_view_members(float width, float height)
         // right button rather than just the name.
         if (ImGui::BeginPopupContextItem("##memctx"))
         {
-            if (ImGui::MenuItem("Открыть профиль")) ui_open_profile(u->id, g->id);
+            if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, g->id);
+            ui_member_roles_menu(g->id, u->id);
+            ui_member_moderation_menu(g->id, u->id);
             ImGui::Separator();
-            ui_copy_id_item(u->id, "Скопировать ID пользователя");
-            ui_copy_id_item(g->id, "Скопировать ID сервера");
+            ui_copy_id_item(u->id, tr("Скопировать ID пользователя"));
+            ui_copy_id_item(g->id, tr("Скопировать ID сервера"));
             ImGui::EndPopup();
         }
 
@@ -481,7 +669,7 @@ void ui_view_members(float width, float height)
         drawn++;
     }
 
-    if (!drawn) ui_text_muted("Никого - откройте канал, чтобы загрузить");
+    if (!drawn) ui_text_muted(tr("Никого - откройте канал, чтобы загрузить"));
 
     ImGui::Unindent(8.0f);
     ImGui::EndChild();
@@ -516,8 +704,8 @@ void ui_view_profile_popup()
 
     if (!u)
     {
-        ui_text_muted("Профиль загружается...");
-        if (ImGui::Button("Закрыть", ImVec2(120, 30))) ImGui::CloseCurrentPopup();
+        ui_text_muted(tr("Профиль загружается..."));
+        if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
         ImGui::PopStyleColor();
         return;
@@ -560,7 +748,7 @@ void ui_view_profile_popup()
             if (ImGui::IsItemHovered())
             {
                 ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-                ImGui::SetTooltip("Открыть баннер целиком");
+                ImGui::SetTooltip(tr("Открыть баннер целиком"));
             }
             ImGui::SetCursorScreenPos(back);
         }
@@ -597,7 +785,7 @@ void ui_view_profile_popup()
         if (ImGui::IsItemHovered())
         {
             ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
-            ImGui::SetTooltip("Открыть аватарку целиком");
+            ImGui::SetTooltip(tr("Открыть аватарку целиком"));
         }
     }
     ImGui::Dummy(ImVec2(0, 4));
@@ -613,12 +801,24 @@ void ui_view_profile_popup()
             cnprint(handle, sizeof(handle), "%s#%s", u->username, u->discriminator);
         else
             cnprint(handle, sizeof(handle), "%s", u->username);
-        ui_text_muted(handle);
+
+        // A field rather than a label, so the name can be selected and copied
+        // out. It is the username, not the display name above it, and it is
+        // the one thing on this card somebody actually needs to hand to
+        // something else - retyping it by hand is how a typo becomes a bug
+        // report about friend requests.
+        ImGui::SetNextItemWidth(240);
+        ImGui::InputText("##handle", handle, sizeof(handle), ImGuiInputTextFlags_ReadOnly);
+
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("Копировать##handle"))) ImGui::SetClipboardText(handle);
     }
 
     char id_text[48];
     cnprint(id_text, sizeof(id_text), "ID: %llu", u->id);
     ui_text_muted(id_text);
+    ImGui::SameLine();
+    if (ImGui::SmallButton(tr("Копировать##uid"))) ui_copy_id(u->id);
 
     if (u->bot)
     {
@@ -656,7 +856,7 @@ void ui_view_profile_popup()
 
         if (!editing)
         {
-            if (ImGui::Button("Изменить профиль", ImVec2(-1, 30)))
+            if (ImGui::Button(tr("Изменить профиль"), ImVec2(-1, 30)))
             {
                 editing = true;
                 editing_who = u->id;
@@ -668,27 +868,27 @@ void ui_view_profile_popup()
             }
 
             if (offline::active())
-                ui_text_muted("Пока нет связи, изменения не уйдут");
+                ui_text_muted(tr("Пока нет связи, изменения не уйдут"));
         }
         else
         {
             ImGui::Separator();
             ImGui::Dummy(ImVec2(0, 4));
 
-            ui_text_muted("Отображаемое имя");
+            ui_text_muted(tr("Отображаемое имя"));
             ImGui::SetNextItemWidth(-1);
             ImGui::InputText("##editname", edit_name, sizeof(edit_name));
 
-            ui_text_muted("О себе");
+            ui_text_muted(tr("О себе"));
             ImGui::InputTextMultiline("##editbio", edit_bio, sizeof(edit_bio),
                                       ImVec2(-1, 90));
 
             ImGui::Dummy(ImVec2(0, 4));
 
             bool blocked = offline::active();
-            if (blocked) ui_text_muted("Нет связи — сохранить нельзя");
+            if (blocked) ui_text_muted(tr("Нет связи — сохранить нельзя"));
 
-            if (!blocked && ImGui::Button("Сохранить", ImVec2(160, 30)))
+            if (!blocked && ImGui::Button(tr("Сохранить"), ImVec2(160, 30)))
             {
                 // The name is only sent when it actually changed: discord
                 // rejects a display name equal to the username, and sending
@@ -701,30 +901,30 @@ void ui_view_profile_popup()
             }
 
             if (!blocked) ImGui::SameLine();
-            if (ImGui::Button("Отмена", ImVec2(160, 30))) editing = false;
+            if (ImGui::Button(tr("Отмена"), ImVec2(160, 30))) editing = false;
 
             if (!blocked)
             {
                 ImGui::Dummy(ImVec2(0, 6));
-                ui_text_muted("Картинки заменяются сразу, отдельно от имени");
+                ui_text_muted(tr("Картинки заменяются сразу, отдельно от имени"));
 
-                if (ImGui::Button("Аватарка...", ImVec2(160, 26)))
+                if (ImGui::Button(tr("Аватарка..."), ImVec2(160, 26)))
                 {
                     wchar_t chosen[MAX_PATH];
                     if (ufile::open_dialog(chosen, MAX_PATH))
                         api::update_self_image(false, chosen);
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Баннер...", ImVec2(160, 26)))
+                if (ImGui::Button(tr("Баннер..."), ImVec2(160, 26)))
                 {
                     wchar_t chosen[MAX_PATH];
                     if (ufile::open_dialog(chosen, MAX_PATH))
                         api::update_self_image(true, chosen);
                 }
 
-                if (ImGui::SmallButton("убрать аватарку")) api::update_self_image(false, 0);
+                if (ImGui::SmallButton(tr("убрать аватарку"))) api::update_self_image(false, 0);
                 ImGui::SameLine();
-                if (ImGui::SmallButton("убрать баннер")) api::update_self_image(true, 0);
+                if (ImGui::SmallButton(tr("убрать баннер"))) api::update_self_image(true, 0);
             }
         }
 
@@ -733,7 +933,7 @@ void ui_view_profile_popup()
 
     if (!is_self)
     {
-        if (ImGui::Button("Написать", ImVec2(120, 32)))
+        if (ImGui::Button(tr("Написать"), ImVec2(120, 32)))
         {
             api::open_dm(u->id);
             g_ui.show_friends = false;
@@ -744,30 +944,30 @@ void ui_view_profile_popup()
 
         if (rel == REL_FRIEND)
         {
-            if (ui_icon_button("Удалить из друзей", ImVec2(170, 32), col::bg_input, col::red))
+            if (ui_icon_button(tr("Удалить из друзей"), ImVec2(170, 32), col::bg_input, col::red))
                 api::remove_relationship(u->id);
         }
         else if (rel == REL_INCOMING)
         {
-            if (ui_icon_button("Принять заявку", ImVec2(150, 32), col::green, col::green))
+            if (ui_icon_button(tr("Принять заявку"), ImVec2(150, 32), col::green, col::green))
                 api::accept_friend_request(u->id);
             ImGui::SameLine();
-            if (ui_icon_button("Отклонить", ImVec2(110, 32), col::bg_input, col::red))
+            if (ui_icon_button(tr("Отклонить"), ImVec2(110, 32), col::bg_input, col::red))
                 api::remove_relationship(u->id);
         }
         else if (rel == REL_OUTGOING)
         {
-            if (ui_icon_button("Отменить заявку", ImVec2(170, 32), col::bg_input, col::red))
+            if (ui_icon_button(tr("Отменить заявку"), ImVec2(170, 32), col::bg_input, col::red))
                 api::remove_relationship(u->id);
         }
         else if (rel == REL_BLOCKED)
         {
-            if (ui_icon_button("Разблокировать", ImVec2(170, 32), col::bg_input, col::bg_hover))
+            if (ui_icon_button(tr("Разблокировать"), ImVec2(170, 32), col::bg_input, col::bg_hover))
                 api::remove_relationship(u->id);
         }
         else
         {
-            if (ui_icon_button("Добавить в друзья", ImVec2(170, 32), col::green, col::green))
+            if (ui_icon_button(tr("Добавить в друзья"), ImVec2(170, 32), col::green, col::green))
             {
                 char handle[160];
                 if (u->discriminator && u->discriminator[0] && ccscmp(u->discriminator, "0") != 0)
@@ -780,7 +980,7 @@ void ui_view_profile_popup()
 
         if (rel != REL_BLOCKED)
         {
-            if (ui_icon_button("Заблокировать", ImVec2(150, 28), col::bg_input, col::red))
+            if (ui_icon_button(tr("Заблокировать"), ImVec2(150, 28), col::bg_input, col::red))
                 api::block_user(u->id);
         }
     }
@@ -796,7 +996,7 @@ void ui_view_profile_popup()
     }
 
     ImGui::Dummy(ImVec2(0, 8));
-    if (ImGui::Button("Закрыть", ImVec2(120, 30)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+    if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
     {
         api::clear_last_error();
         ImGui::CloseCurrentPopup();
@@ -805,7 +1005,7 @@ void ui_view_profile_popup()
     // The profile is where somebody looks a person up, so the id is offered
     // here too rather than only from the row that opened it.
     ImGui::SameLine();
-    if (ImGui::Button("Скопировать ID", ImVec2(150, 30))) ui_copy_id(u->id);
+    if (ImGui::Button(tr("Скопировать ID"), ImVec2(150, 30))) ui_copy_id(u->id);
 
     ImGui::Unindent(14.0f);
     ImGui::EndPopup();
@@ -833,11 +1033,11 @@ namespace
     {
         switch (level)
         {
-        case 0:  return "Нет";
-        case 1:  return "Низкий";
-        case 2:  return "Средний";
-        case 3:  return "Высокий";
-        case 4:  return "Очень высокий";
+        case 0:  return tr("Нет");
+        case 1:  return tr("Низкий");
+        case 2:  return tr("Средний");
+        case 3:  return tr("Высокий");
+        case 4:  return tr("Очень высокий");
         default: return "-";
         }
     }
@@ -870,8 +1070,8 @@ void ui_view_server_info_popup()
 
     if (!g)
     {
-        ui_text_muted("Сервер не найден");
-        if (ImGui::Button("Закрыть", ImVec2(120, 30))) ImGui::CloseCurrentPopup();
+        ui_text_muted(tr("Сервер не найден"));
+        if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
         ImGui::PopStyleColor();
         return;
@@ -889,16 +1089,16 @@ void ui_view_server_info_popup()
             {
                 char big[320];
                 cdn::guild_icon(g, 1024, big, sizeof(big));
-                ui_open_image_viewer(big, g->name ? g->name : "Сервер");
+                ui_open_image_viewer(big, g->name ? g->name : tr("Сервер"));
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Приблизить аватарку");
+                ImGui::SetTooltip(tr("Приблизить аватарку"));
         }
     }
     ImGui::EndGroup();
     ImGui::SameLine(0, 12);
     ImGui::BeginGroup();
-    ImGui::TextUnformatted(g->name ? g->name : "Сервер");
+    ImGui::TextUnformatted(g->name ? g->name : tr("Сервер"));
     if (g->description) ui_text_muted(g->description);
     ImGui::EndGroup();
 
@@ -910,7 +1110,7 @@ void ui_view_server_info_popup()
 
     // Row one: the two that matter, plus when this account arrived.
     ImGui::BeginGroup();
-    ui_text_muted("Создатель сервера");
+    ui_text_muted(tr("Создатель сервера"));
     {
         duser* owner = store::find_user(g->owner_id);
 
@@ -948,7 +1148,7 @@ void ui_view_server_info_popup()
         }
         else
         {
-            ui_text_muted(g->owner_id ? "загружается..." : "-");
+            ui_text_muted(g->owner_id ? tr("загружается...") : "-");
         }
     }
     ImGui::EndGroup();
@@ -957,14 +1157,14 @@ void ui_view_server_info_popup()
 
     char created[64];
     format_epoch_ms(g->created_ms(), created, sizeof(created));
-    info_cell("Дата создания", created, COLUMN);
+    info_cell(tr("Дата создания"), created, COLUMN);
 
     ImGui::SameLine(0, 24);
 
     char joined[64];
     joined[0] = 0;
     if (g->joined_at) format_timestamp(g->joined_at, joined, sizeof(joined));
-    info_cell("Ты зашёл", joined, COLUMN);
+    info_cell(tr("Ты зашёл"), joined, COLUMN);
 
     ImGui::Dummy(ImVec2(0, 14));
 
@@ -974,27 +1174,27 @@ void ui_view_server_info_popup()
         cnprint(vanity, sizeof(vanity), "discord.gg/%s", g->vanity_url_code);
     else
         vanity[0] = 0;
-    info_cell("Своя ссылка", vanity, COLUMN);
+    info_cell(tr("Своя ссылка"), vanity, COLUMN);
 
     ImGui::SameLine(0, 24);
-    info_cell("Уровень проверки", verification_name(g->verification_level), COLUMN);
+    info_cell(tr("Уровень проверки"), verification_name(g->verification_level), COLUMN);
 
     ImGui::SameLine(0, 24);
     char boosts[64];
-    cnprint(boosts, sizeof(boosts), "%d (уровень %d)", g->premium_subscribers, g->premium_tier);
-    info_cell("Бусты", boosts, COLUMN);
+    cnprint(boosts, sizeof(boosts), tr("%d (уровень %d)"), g->premium_subscribers, g->premium_tier);
+    info_cell(tr("Бусты"), boosts, COLUMN);
 
     ImGui::Dummy(ImVec2(0, 14));
 
     // Row three.
     char channels[32];
     cnprint(channels, sizeof(channels), "%u", g->channels.count);
-    info_cell("Каналов", channels, COLUMN);
+    info_cell(tr("Каналов"), channels, COLUMN);
 
     ImGui::SameLine(0, 24);
     char roles[32];
     cnprint(roles, sizeof(roles), "%u", g->roles.count);
-    info_cell("Ролей", roles, COLUMN);
+    info_cell(tr("Ролей"), roles, COLUMN);
 
     ImGui::SameLine(0, 24);
     api::fetch_guild_counts(g->id);
@@ -1002,18 +1202,18 @@ void ui_view_server_info_popup()
     char members[64];
     int total = g->approx_members ? g->approx_members : g->member_count;
     if (total > 0 && g->approx_online > 0)
-        cnprint(members, sizeof(members), "%d, в сети %d", total, g->approx_online);
+        cnprint(members, sizeof(members), tr("%d, в сети %d"), total, g->approx_online);
     else if (total > 0)
         cnprint(members, sizeof(members), "%d", total);
     else
-        cnprint(members, sizeof(members), "%u загружено", g->members.count);
-    info_cell("Участников", members, COLUMN);
+        cnprint(members, sizeof(members), tr("%u загружено"), g->members.count);
+    info_cell(tr("Участников"), members, COLUMN);
 
     ImGui::Dummy(ImVec2(0, 16));
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 8));
 
-    if (ImGui::Button("Закрыть", ImVec2(120, 30))) ImGui::CloseCurrentPopup();
+    if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30))) ImGui::CloseCurrentPopup();
 
     ImGui::EndPopup();
     ImGui::PopStyleColor();
@@ -1029,18 +1229,18 @@ namespace
     {
         switch (type)
         {
-        case CH_GUILD_TEXT:           return "Текстовый";
-        case CH_DM:                   return "Личные сообщения";
-        case CH_GUILD_VOICE:          return "Голосовой";
-        case CH_GROUP_DM:             return "Групповой чат";
-        case CH_CATEGORY:             return "Категория";
-        case CH_ANNOUNCEMENT:         return "Объявления";
-        case CH_ANNOUNCEMENT_THREAD:  return "Ветка объявлений";
-        case CH_PUBLIC_THREAD:        return "Ветка";
-        case CH_PRIVATE_THREAD:       return "Закрытая ветка";
-        case CH_STAGE:                return "Трибуна";
-        case CH_FORUM:                return "Форум";
-        default:                      return "Неизвестный";
+        case CH_GUILD_TEXT:           return tr("Текстовый");
+        case CH_DM:                   return tr("Личные сообщения");
+        case CH_GUILD_VOICE:          return tr("Голосовой");
+        case CH_GROUP_DM:             return tr("Групповой чат");
+        case CH_CATEGORY:             return tr("Категория");
+        case CH_ANNOUNCEMENT:         return tr("Объявления");
+        case CH_ANNOUNCEMENT_THREAD:  return tr("Ветка объявлений");
+        case CH_PUBLIC_THREAD:        return tr("Ветка");
+        case CH_PRIVATE_THREAD:       return tr("Закрытая ветка");
+        case CH_STAGE:                return tr("Трибуна");
+        case CH_FORUM:                return tr("Форум");
+        default:                      return tr("Неизвестный");
         }
     }
 
@@ -1079,8 +1279,8 @@ void ui_view_channel_info_popup()
 
     if (!c)
     {
-        ui_text_muted("Канал не найден");
-        if (ImGui::Button("Закрыть", ImVec2(120, 30))) ImGui::CloseCurrentPopup();
+        ui_text_muted(tr("Канал не найден"));
+        if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30))) ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
         ImGui::PopStyleColor();
         return;
@@ -1092,14 +1292,14 @@ void ui_view_channel_info_popup()
     char line[256];
 
     ImGui::PushFont(g_app.font_big);
-    cnprint(line, sizeof(line), "#%s", c->name ? c->name : "канал");
+    cnprint(line, sizeof(line), "#%s", c->name ? c->name : tr("канал"));
     ImGui::TextUnformatted(line);
     ImGui::PopFont();
 
     if (hidden)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
-        ImGui::TextUnformatted("Доступа нет - всё ниже получено из описания сервера");
+        ImGui::TextUnformatted(tr("Доступа нет - всё ниже получено из описания сервера"));
         ImGui::PopStyleColor();
     }
 
@@ -1115,7 +1315,7 @@ void ui_view_channel_info_popup()
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 6));
 
-    info_line("Тип", channel_kind_name(c->type));
+    info_line(tr("Тип"), channel_kind_name(c->type));
 
     cnprint(line, sizeof(line), "%llu", c->id);
     info_line("ID", line);
@@ -1123,17 +1323,17 @@ void ui_view_channel_info_popup()
     {
         char created[64];
         format_epoch_ms(snowflake_time_ms(c->id), created, sizeof(created));
-        info_line("Создан", created);
+        info_line(tr("Создан"), created);
     }
 
     if (c->parent_id)
     {
         dchannel* parent = store::find_channel(c->parent_id);
-        info_line("Категория", parent && parent->name ? parent->name : "-");
+        info_line(tr("Категория"), parent && parent->name ? parent->name : "-");
     }
 
     cnprint(line, sizeof(line), "%d", c->position);
-    info_line("Позиция", line);
+    info_line(tr("Позиция"), line);
 
     // The last message id is a timestamp, so a channel nobody can read still
     // says when it was last used. That is usually the thing people want to
@@ -1142,41 +1342,41 @@ void ui_view_channel_info_popup()
     {
         char when[64];
         format_epoch_ms(snowflake_time_ms(c->last_message_id), when, sizeof(when));
-        info_line("Последнее сообщение", when);
+        info_line(tr("Последнее сообщение"), when);
     }
     else
     {
-        info_line("Последнее сообщение", "нет данных");
+        info_line(tr("Последнее сообщение"), tr("нет данных"));
     }
 
     if (c->is_voice())
     {
-        cnprint(line, sizeof(line), "%d кбит/с", c->bitrate / 1000);
-        info_line("Битрейт", c->bitrate ? line : "-");
+        cnprint(line, sizeof(line), tr("%d кбит/с"), c->bitrate / 1000);
+        info_line(tr("Битрейт"), c->bitrate ? line : "-");
 
         if (c->user_limit) cnprint(line, sizeof(line), "%d", c->user_limit);
-        info_line("Лимит участников", c->user_limit ? line : "без лимита");
+        info_line(tr("Лимит участников"), c->user_limit ? line : tr("без лимита"));
     }
     else
     {
         if (c->rate_limit_per_user)
         {
-            cnprint(line, sizeof(line), "%d с", c->rate_limit_per_user);
-            info_line("Медленный режим", line);
+            cnprint(line, sizeof(line), tr("%d с"), c->rate_limit_per_user);
+            info_line(tr("Медленный режим"), line);
         }
-        info_line("Возрастное ограничение", c->nsfw ? "да" : "нет");
+        info_line(tr("Возрастное ограничение"), c->nsfw ? tr("да") : tr("нет"));
     }
 
     if (c->type == CH_PUBLIC_THREAD || c->type == CH_PRIVATE_THREAD ||
         c->type == CH_ANNOUNCEMENT_THREAD)
     {
-        info_line("Архивирована", c->archived ? "да" : "нет");
-        info_line("Закрыта", c->locked ? "да" : "нет");
+        info_line(tr("Архивирована"), c->archived ? tr("да") : tr("нет"));
+        info_line(tr("Закрыта"), c->locked ? tr("да") : tr("нет"));
 
         cnprint(line, sizeof(line), "%d", c->message_count);
-        info_line("Сообщений", line);
+        info_line(tr("Сообщений"), line);
         cnprint(line, sizeof(line), "%d", c->member_count);
-        info_line("Участников", line);
+        info_line(tr("Участников"), line);
     }
 
     // ---- who is allowed in
@@ -1185,12 +1385,12 @@ void ui_view_channel_info_popup()
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Separator();
         ImGui::Dummy(ImVec2(0, 6));
-        ImGui::TextUnformatted("Доступ");
+        ImGui::TextUnformatted(tr("Доступ"));
         ImGui::Dummy(ImVec2(0, 4));
 
         if (!c->overwrites.count)
         {
-            ui_text_muted("Своих правил нет - как у категории или у сервера");
+            ui_text_muted(tr("Своих правил нет - как у категории или у сервера"));
         }
 
         for (unsigned int i = 0; i < c->overwrites.count; i++)
@@ -1205,7 +1405,7 @@ void ui_view_channel_info_popup()
                 else
                 {
                     const drole* r = store::find_role(g, o->id);
-                    who = r && r->name ? r->name : "роль";
+                    who = r && r->name ? r->name : tr("роль");
                 }
             }
             else
@@ -1223,7 +1423,7 @@ void ui_view_channel_info_popup()
             ImU32 colour = denies_view ? col::red : (allows_view ? col::green : col::text_muted);
             ImGui::PushStyleColor(ImGuiCol_Text, colour);
             cnprint(line, sizeof(line), "%s  %s", who,
-                    denies_view ? "нет доступа" : (allows_view ? "доступ открыт" : "без изменений"));
+                    denies_view ? tr("нет доступа") : (allows_view ? tr("доступ открыт") : tr("без изменений")));
             ImGui::TextUnformatted(line);
             ImGui::PopStyleColor();
         }
@@ -1232,8 +1432,8 @@ void ui_view_channel_info_popup()
         // that was actually being asked.
         ImGui::Dummy(ImVec2(0, 4));
         ImGui::PushStyleColor(ImGuiCol_Text, hidden ? col::red : col::green);
-        ImGui::TextUnformatted(hidden ? "Этот аккаунт читать канал не может"
-                                      : "Этот аккаунт канал читать может");
+        ImGui::TextUnformatted(hidden ? tr("Этот аккаунт читать канал не может")
+                                      : tr("Этот аккаунт канал читать может"));
         ImGui::PopStyleColor();
     }
 
@@ -1241,7 +1441,7 @@ void ui_view_channel_info_popup()
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0, 6));
 
-    if (ImGui::Button("Закрыть", ImVec2(120, 30))) ImGui::CloseCurrentPopup();
+    if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30))) ImGui::CloseCurrentPopup();
 
     ImGui::EndPopup();
     ImGui::PopStyleColor();
@@ -1273,16 +1473,16 @@ namespace
     {
         switch (q)
         {
-        case 0:  return "Экономная";
-        case 2:  return "Высокая";
-        default: return "Обычная";
+        case 0:  return tr("Экономная");
+        case 2:  return tr("Высокая");
+        default: return tr("Обычная");
         }
     }
 
     void draw_censor_section()
     {
-        ImGui::TextUnformatted("Закрытые окна");
-        ui_text_muted("Выбранные окна зрители не увидят - на их месте будет заглушка");
+        ImGui::TextUnformatted(tr("Закрытые окна"));
+        ui_text_muted(tr("Выбранные окна зрители не увидят - на их месте будет заглушка"));
         ImGui::Dummy(ImVec2(0, 4));
 
         // What is already covered, including anything whose window has since
@@ -1296,11 +1496,11 @@ namespace
 
             bool alive = IsWindow((HWND)e->window) != 0;
             ImGui::PushStyleColor(ImGuiCol_Text, alive ? col::red : col::text_muted);
-            ImGui::TextUnformatted(e->title[0] ? e->title : "окно");
+            ImGui::TextUnformatted(e->title[0] ? e->title : tr("окно"));
             ImGui::PopStyleColor();
 
             ImGui::SameLine(300.0f);
-            if (ImGui::SmallButton(alive ? "открыть" : "убрать из списка"))
+            if (ImGui::SmallButton(alive ? tr("открыть") : tr("убрать из списка")))
             {
                 censor::remove(e->window);
                 ImGui::PopID();
@@ -1309,13 +1509,13 @@ namespace
             ImGui::PopID();
         }
 
-        if (!censor::count()) ui_text_muted("Пока ничего не закрыто");
+        if (!censor::count()) ui_text_muted(tr("Пока ничего не закрыто"));
 
         ImGui::Dummy(ImVec2(0, 6));
 
-        if (ImGui::SmallButton("Обновить список окон")) refresh_windows(true);
+        if (ImGui::SmallButton(tr("Обновить список окон"))) refresh_windows(true);
         ImGui::SameLine();
-        if (ImGui::SmallButton("Снять всё")) censor::clear();
+        if (ImGui::SmallButton(tr("Снять всё"))) censor::clear();
 
         ImGui::Dummy(ImVec2(0, 4));
 
@@ -1332,8 +1532,8 @@ namespace
             // Minimised windows are listed too: marking one you are about to
             // open is the whole point of setting this up in advance.
             char label[192];
-            cnprint(label, sizeof(label), "%s%s", w->name[0] ? w->name : "окно",
-                    w->minimized ? "   (свёрнуто)" : "");
+            cnprint(label, sizeof(label), "%s%s", w->name[0] ? w->name : tr("окно"),
+                    w->minimized ? tr("   (свёрнуто)") : "");
 
             if (w->minimized) ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
             if (ImGui::Checkbox(label, &on))
@@ -1346,43 +1546,43 @@ namespace
             if (ImGui::IsItemHovered())
             {
                 char size[80];
-                if (w->minimized) ccstrncpy(size, "свёрнуто - закроется, когда появится",
+                if (w->minimized) ccstrncpy(size, tr("свёрнуто - закроется, когда появится"),
                                             sizeof(size) - 1);
                 else cnprint(size, sizeof(size), "%d x %d", w->width, w->height);
                 ImGui::SetTooltip("%s", size);
             }
             ImGui::PopID();
         }
-        if (!g_window_count) ui_text_muted("Окон не нашлось");
+        if (!g_window_count) ui_text_muted(tr("Окон не нашлось"));
         ImGui::EndChild();
 
         ImGui::Dummy(ImVec2(0, 6));
-        ImGui::TextUnformatted("Чем закрывать");
+        ImGui::TextUnformatted(tr("Чем закрывать"));
 
         if (censor::has_cover_image())
         {
             char line[192];
-            cnprint(line, sizeof(line), "Картинка: %s", censor::cover_name());
+            cnprint(line, sizeof(line), tr("Картинка: %s"), censor::cover_name());
             ui_text_muted(line);
         }
         else
         {
-            ui_text_muted("Чёрный прямоугольник со словом CENSORED");
+            ui_text_muted(tr("Чёрный прямоугольник со словом CENSORED"));
         }
 
-        if (ImGui::SmallButton("Выбрать картинку..."))
+        if (ImGui::SmallButton(tr("Выбрать картинку...")))
         {
             wchar_t chosen[MAX_PATH];
             if (ufile::open_dialog(chosen, MAX_PATH))
             {
                 if (!censor::set_cover_image(chosen))
-                    api::set_last_error("Картинка не открылась");
+                    api::set_last_error(tr("Картинка не открылась"));
             }
         }
         if (censor::has_cover_image())
         {
             ImGui::SameLine();
-            if (ImGui::SmallButton("Вернуть заглушку")) censor::clear_cover_image();
+            if (ImGui::SmallButton(tr("Вернуть заглушку"))) censor::clear_cover_image();
         }
     }
 }
@@ -1414,7 +1614,7 @@ void ui_view_share_popup()
     bool live = (st != SHARE_IDLE && st != SHARE_FAILED);
 
     ImGui::PushFont(g_app.font_big);
-    ImGui::TextUnformatted(live ? "Демонстрация идёт" : "Демонстрация экрана");
+    ImGui::TextUnformatted(live ? tr("Демонстрация идёт") : tr("Демонстрация экрана"));
     ImGui::PopFont();
 
     if (live) ui_text_muted(screenshare::status_text());
@@ -1431,14 +1631,14 @@ void ui_view_share_popup()
     if (live)
     {
         char line[192];
-        cnprint(line, sizeof(line), "Идёт в %dp, %d к/с, ~%d кбит/с",
+        cnprint(line, sizeof(line), tr("Идёт в %dp, %d к/с, ~%d кбит/с"),
                 height, fps, ui_share_bitrate());
         ui_text_muted(line);
 
         // Sound can be turned on and off while the stream runs: only the audio
         // track changes, and the picture never stops.
         bool live_audio = ui_share_audio();
-        if (ImGui::Checkbox("Передавать звук системы", &live_audio))
+        if (ImGui::Checkbox(tr("Передавать звук системы"), &live_audio))
         {
             ui_set_share_audio(live_audio);
             screenshare::set_audio(live_audio);
@@ -1447,25 +1647,25 @@ void ui_view_share_popup()
         if (screenshare::audio_running())
         {
             ImGui::PushStyleColor(ImGuiCol_Text, col::green);
-            ImGui::TextUnformatted("Звук системы передаётся");
+            ImGui::TextUnformatted(tr("Звук системы передаётся"));
             ImGui::PopStyleColor();
         }
         else if (live_audio)
         {
             ImGui::PushStyleColor(ImGuiCol_Text, col::red);
-            ImGui::TextWrapped("Звук не пошёл: %s", screenshare::audio_error());
+            ImGui::TextWrapped(tr("Звук не пошёл: %s"), screenshare::audio_error());
             ImGui::PopStyleColor();
         }
         else
         {
-            ui_text_muted("Зрители слышат только микрофон");
+            ui_text_muted(tr("Зрители слышат только микрофон"));
         }
 
-        ui_text_muted("Размер и частоту можно поменять только перезапуском");
+        ui_text_muted(tr("Размер и частоту можно поменять только перезапуском"));
     }
     else
     {
-        ImGui::TextUnformatted("Размер картинки");
+        ImGui::TextUnformatted(tr("Размер картинки"));
 
         const int HEIGHTS[4] = { 1080, 720, 480, 360 };
         for (int i = 0; i < 4; i++)
@@ -1475,15 +1675,21 @@ void ui_view_share_popup()
             if (ImGui::RadioButton(label, height == HEIGHTS[i])) height = HEIGHTS[i];
             if (i < 3) ImGui::SameLine();
         }
-        ui_text_muted("Меньше - мягче картинка, но заметно легче каналу");
+        ui_text_muted(tr("Меньше - мягче картинка, но заметно легче каналу"));
 
         ImGui::Dummy(ImVec2(0, 6));
-        ImGui::TextUnformatted("Частота кадров");
+        ImGui::TextUnformatted(tr("Частота кадров"));
         ImGui::SetNextItemWidth(-1);
-        ImGui::SliderInt("##fps", &fps, 5, 60, "%d к/с");
+        // A slider, which also takes a typed number once tabbed into - and
+        // clamps it to the range rather than accepting something the encoder
+        // will refuse a moment later.
+        ImGui::SliderInt("##fps", &fps, 1, SHARE_FPS_MAX, tr("%d к/с"));
+
+        if (fps < 1) fps = 1;
+        if (fps > SHARE_FPS_MAX) fps = SHARE_FPS_MAX;
 
         ImGui::Dummy(ImVec2(0, 6));
-        ImGui::TextUnformatted("Качество");
+        ImGui::TextUnformatted(tr("Качество"));
         for (int i = 0; i < 3; i++)
         {
             if (ImGui::RadioButton(quality_name(i), quality == i)) quality = i;
@@ -1491,15 +1697,15 @@ void ui_view_share_popup()
         }
 
         char bits[128];
-        cnprint(bits, sizeof(bits), "Выйдет примерно %d кбит/с", ui_share_bitrate());
+        cnprint(bits, sizeof(bits), tr("Выйдет примерно %d кбит/с"), ui_share_bitrate());
         ui_text_muted(bits);
 
         // Said plainly rather than left to be discovered: the setting people
         // ask for by name does not exist in this pipeline.
-        ui_text_muted("Поток кодируется в H.264, не в JPEG - «качество» это битрейт");
+        ui_text_muted(tr("Поток кодируется в H.264, не в JPEG - «качество» это битрейт"));
 
         ImGui::Dummy(ImVec2(0, 8));
-        ImGui::TextUnformatted("Как читать экран");
+        ImGui::TextUnformatted(tr("Как читать экран"));
 
         for (int m = 0; m < CAPTURE_METHOD_COUNT; m++)
         {
@@ -1510,22 +1716,22 @@ void ui_view_share_popup()
         }
 
         if (ui_capture_method() == CAPTURE_DXGI)
-            ui_text_muted("Кадр берётся у композитора и не пересобирается, пока экран не менялся. "
-                          "Нужна Windows 8; при отказе сам вернётся на BitBlt");
+            ui_text_muted(tr("Кадр берётся у композитора и не пересобирается, пока экран не менялся. "
+                          "Нужна Windows 8; при отказе сам вернётся на BitBlt"));
         else
-            ui_text_muted("Полная перерисовка каждый кадр. Медленно, но работает везде");
+            ui_text_muted(tr("Полная перерисовка каждый кадр. Медленно, но работает везде"));
 
         ImGui::Dummy(ImVec2(0, 8));
 
         bool with_audio = ui_share_audio();
-        if (ImGui::Checkbox("Передавать звук системы", &with_audio))
+        if (ImGui::Checkbox(tr("Передавать звук системы"), &with_audio))
             ui_set_share_audio(with_audio);
 
         if (with_audio)
-            ui_text_muted("Свой звук исключён, чтобы никто не слышал сам себя. "
-                          "Вместе с ним не слышно и видео, проигранного в IMDiscord");
+            ui_text_muted(tr("Свой звук исключён, чтобы никто не слышал сам себя. "
+                          "Вместе с ним не слышно и видео, проигранного в IMDiscord"));
         else
-            ui_text_muted("Зрители услышат только микрофон");
+            ui_text_muted(tr("Зрители услышат только микрофон"));
 
         if (height != ui_share_height() || fps != ui_share_fps() || quality != ui_share_quality())
             ui_set_share_settings(height, fps, quality);
@@ -1544,18 +1750,18 @@ void ui_view_share_popup()
     if (live)
     {
         ImGui::PushStyleColor(ImGuiCol_Button, col::red);
-        if (ImGui::Button("Закончить", ImVec2(150, 32)))
+        if (ImGui::Button(tr("Закончить"), ImVec2(150, 32)))
         {
             screenshare::stop();
             ImGui::CloseCurrentPopup();
         }
         ImGui::PopStyleColor();
         ImGui::SameLine();
-        if (ImGui::Button("Свернуть", ImVec2(150, 32))) ImGui::CloseCurrentPopup();
+        if (ImGui::Button(tr("Свернуть"), ImVec2(150, 32))) ImGui::CloseCurrentPopup();
     }
     else
     {
-        if (ImGui::Button("Начать", ImVec2(150, 32)))
+        if (ImGui::Button(tr("Начать"), ImVec2(150, 32)))
         {
             // Width follows the height at sixteen by nine; the capture keeps
             // the screen's real shape inside that box anyway.
@@ -1565,7 +1771,7 @@ void ui_view_share_popup()
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Отмена", ImVec2(150, 32))) ImGui::CloseCurrentPopup();
+        if (ImGui::Button(tr("Отмена"), ImVec2(150, 32))) ImGui::CloseCurrentPopup();
     }
 
     ImGui::EndPopup();

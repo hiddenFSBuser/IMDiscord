@@ -12,6 +12,7 @@
 #include "discord/gateway.h"
 #include "discord/voice.h"
 #include "core/log.h"
+#include "audio/sounds.h"
 #include "core/crypto.h"
 #include "net/websocket.h"
 #include "net/json.h"
@@ -165,6 +166,11 @@ namespace
     share_layer g_layers[2];
     int g_layer_count = 0;
 
+    // When a picture was last handed to the encoders, and how many repeats of a
+    // still screen were skipped since. The counter is only for the log line.
+    unsigned long long g_last_encoded_us = 0;
+    unsigned int g_skipped_still = 0;
+
     // Layer zero is the full sized one and is what everything that still speaks
     // of "the" transport means: the sender report clock and the retransmission
     // cache both belong to it.
@@ -188,12 +194,36 @@ namespace
     mls::group_state g_group;
     bool g_group_ready = false;
 
+    // Building a commit advances the state of the group it is built on, there
+    // and then. Built on the live group - as this was - the sender jumps an
+    // epoch ahead of everybody the moment a second viewer arrives, and the
+    // commit that comes back can no longer be applied to anything: a commit
+    // does not encrypt its path to the leaf that wrote it, so its own author
+    // cannot process it, and the group it would have applied to has moved.
+    //
+    // So it is built on a copy, and the copy is swapped in only if the server
+    // picks our commit. Recognised by its bytes, because that is the only
+    // thing that comes back identifiable.
+    mls::group_state g_group_next;
+    ubuffer g_own_commit;
+    bool g_own_commit_ready = false;
+
     // Proposals kept from op 27. Ours are answered with a commit of our own,
     // but when somebody else's commit wins the race it arrives as op 29 naming
     // these by reference, and applying it is the only way to stay in step.
     mls::cached_proposal g_known[mls::MAX_MEMBERS];
     unsigned int g_known_count = 0;
     volatile long g_e2ee_ready = 0;
+
+    // When we last asked to be re-added after losing the group's thread.
+    unsigned long long g_last_rejoin_ms = 0;
+
+    // The commit named by op 29, waiting for the op 22 that says the whole
+    // connection is switching to it.
+    ubuffer g_pending_commit;
+    unsigned int g_pending_transition = 0;
+    bool g_have_pending_commit = false;
+    bool g_pending_is_ours = false;
     unsigned int g_dave_nonce = 0;
     volatile long g_protect_failures = 0;
     bool g_passthrough_logged = false;
@@ -207,9 +237,25 @@ namespace
     HANDLE g_frame_dump = 0;
     unsigned int g_frames_dumped = 0;
     volatile long g_udp_in = 0;
+    // Keyframes actually produced, and where the five second report last read
+    // each counter, so it can print what moved rather than only what has piled
+    // up since the stream began.
+    volatile long g_keyframes = 0;
+    unsigned int g_frames_mark = 0;
+    unsigned int g_keyframes_mark = 0;
+    unsigned int g_rr_mark = 0;
+    unsigned int g_pli_mark = 0;
+
     volatile long g_rtcp_receiver = 0;   // our packets are arriving
     volatile long g_rtcp_pli = 0;        // a viewer cannot decode and wants an IDR
     volatile long g_rtcp_nack = 0;       // packets went missing on the way
+    volatile long g_rtcp_ccfb = 0;       // transport-wide congestion feedback
+    volatile long g_rtcp_fir = 0;        // a full refresh, not just a keyframe
+
+    // Keyframe requests answered and folded together, and when the last one
+    // was answered.
+    unsigned long long g_last_pli_keyframe_ms = 0;
+    volatile long g_pli_coalesced = 0;
     volatile long g_rtx_sent = 0;        // answered from the send cache
     volatile long g_rtx_missed = 0;      // asked for after they aged out
 
@@ -544,7 +590,13 @@ namespace
         return ok;
     }
 
-    void send_key_package()
+    // Offers this client for membership. build_group says whether a fresh
+    // local group is built behind it: that belongs to the start of a
+    // connection, where there is nothing to lose, and not to asking to be
+    // re-added after losing the thread of an existing one - throwing the group
+    // away there is what dropped the stream into sending in the clear, with
+    // the viewers left on a picture nothing would ever unfreeze.
+    void send_key_package(bool build_group)
     {
         if (!g_sig_ready)
         {
@@ -586,6 +638,8 @@ namespace
         for (int i = 0; i < 8; i++)
             group_id[i] = (unsigned char)(dave_id >> (56 - i * 8));
 
+        if (!build_group) return;
+
         log_line("share/dave: group id %llu (rtc server %s)", dave_id, g_rtc_server_id);
 
         g_group_ready = mls::create_group(&g_group, group_id, 8, &g_key_package.leaf,
@@ -610,24 +664,70 @@ namespace
         w.free_writer();
     }
 
+    // Both defined further down, beside the rest of the group helpers. The
+    // DAVE logging here wants them, and a log line that cannot say how many
+    // people are in the group is a log line that answers nothing.
+    unsigned int group_members();
+    unsigned int group_members_of(const mls::group_state* g);
+
     void handle_proposals(const unsigned char* payload, unsigned int payload_len)
     {
         bool is_revoke = false;
         mls::proposal_message messages[16];
         unsigned int count = 0;
 
+        mls::proposal_ref revoked[16];
+        unsigned int revoked_count = 0;
+
         if (!mls::parse_proposals_payload(payload, payload_len, &is_revoke,
-                                          messages, 16, &count))
+                                          messages, 16, &count,
+                                          revoked, 16, &revoked_count))
         {
             log_line("share/dave: proposals could not be parsed");
             return;
         }
 
-        log_line("share/dave: %u proposal(s), revoke=%d", count, is_revoke ? 1 : 0);
+        log_line("share/dave: %u proposal(s), revoke=%d (%u ref), эпоха %llu, участников %u",
+                 count, is_revoke ? 1 : 0, revoked_count, g_group.epoch, group_members());
+
+        // Who each proposal is about. Without this the log says a proposal
+        // arrived and nothing else, and the question that actually matters -
+        // is this group adding somebody else, or is it adding us - has no
+        // answer in it. A client being added is not one of the members who
+        // should be committing the add.
+        for (unsigned int i = 0; i < count; i++)
+        {
+            const mls::proposal* p = &messages[i].prop;
+
+            if (p->type == mls::PROPOSAL_ADD)
+                log_line("share/dave:   добавить %llu%s",
+                         p->add.leaf.cred.user_id(),
+                         p->add.leaf.cred.user_id() == g_self_id ? " (это мы)" : "");
+            else if (p->type == mls::PROPOSAL_REMOVE)
+                log_line("share/dave:   убрать лист %u", p->remove_index);
+            else
+                log_line("share/dave:   предложение типа %u", p->type);
+        }
+
+        // A revoke takes back the proposals it names and no others. Forgetting
+        // the whole list was the easy answer and the wrong one: a commit
+        // arriving afterwards names proposals by reference, and one that was
+        // never revoked has to still be findable or the commit cannot be
+        // applied at all.
+        for (unsigned int i = 0; i < revoked_count; i++)
+        {
+            for (unsigned int k = 0; k < g_known_count; k++)
+            {
+                if (ccmp(g_known[k].ref, revoked[i].ref, 32) != 0) continue;
+
+                g_known[k] = g_known[g_known_count - 1];
+                g_known_count--;
+                break;
+            }
+        }
 
         // Kept whether or not our own commit is the one that lands: if another
         // member's does, op 29 names these and we have to be able to find them.
-        if (is_revoke) g_known_count = 0;
         for (unsigned int i = 0; i < count && !is_revoke && g_known_count < mls::MAX_MEMBERS; i++)
         {
             messages[i].compute_ref(g_known[g_known_count].ref);
@@ -641,15 +741,29 @@ namespace
         commit.init();
         welcome.init();
 
-        if (mls::build_commit(&g_group, messages, count, &commit, &welcome))
+        g_group_next = g_group;
+        g_own_commit_ready = false;
+
+        if (mls::build_commit(&g_group_next, messages, count, &commit, &welcome))
         {
+            g_own_commit.clear();
+            g_own_commit.append(commit.data, commit.size);
+            g_own_commit_ready = true;
+
             ubuffer out;
             out.init(commit.size + welcome.size + 16);
             out.append(commit.data, commit.size);
             out.append(welcome.data, welcome.size);
 
-            log_line("share/dave: sending commit+welcome (%u bytes)", out.size);
-            send_binary(VOP_MLS_COMMIT_WELCOME, out.data, out.size);
+            log_line("share/dave: commit+welcome (%u байт), эпоха %llu -> %llu, "
+                     "участников станет %u",
+                     out.size, g_group.epoch, g_group_next.epoch,
+                     group_members_of(&g_group_next));
+            // The result is checked: "the server ignored our commit" and "our
+            // commit never left" look identical from the outside, and one of
+            // them is a websocket problem rather than an MLS one.
+            if (!send_binary(VOP_MLS_COMMIT_WELCOME, out.data, out.size))
+                log_line("share/dave: коммит НЕ УШЁЛ - сокет отказал");
             out.free_buffer();
         }
         else
@@ -659,6 +773,74 @@ namespace
 
         commit.free_buffer();
         welcome.free_buffer();
+    }
+
+    // Moves the group to the epoch the held commit describes. Called when the
+    // server tells the connection to switch, not when the commit turned up.
+    void apply_pending_transition(unsigned int transition_id)
+    {
+        if (!g_have_pending_commit || transition_id != g_pending_transition)
+        {
+            // Nothing held for this one. Answering yes anyway is what lets the
+            // rest of the connection move on without us, so it is answered
+            // honestly instead.
+            send_transition_response(transition_id, !g_have_pending_commit);
+            return;
+        }
+
+        g_have_pending_commit = false;
+
+        bool applied = false;
+        const char* why = "";
+
+        if (g_pending_is_ours)
+        {
+            // A commit cannot be applied by its author - the state it leads to
+            // was built when it was written - so this is a swap.
+            if (g_own_commit_ready)
+            {
+                g_group = g_group_next;
+                g_own_commit_ready = false;
+                applied = true;
+            }
+            else
+            {
+                why = "наш коммит выиграл, а подготовленного состояния нет";
+            }
+        }
+        else
+        {
+            applied = mls::process_commit(&g_group, g_pending_commit.data,
+                                          g_pending_commit.size,
+                                          g_known, g_known_count, &why);
+            g_own_commit_ready = false;
+        }
+
+        log_line("share/dave: переход %u %s, эпоха %llu, участников %u%s%s",
+                 transition_id, applied ? "выполнен" : "ПРОВАЛЕН",
+                 g_group.epoch, group_members(),
+                 applied ? "" : ": ", applied ? "" : why);
+
+        if (applied)
+        {
+            g_known_count = 0;
+            dave::reset_ratchets();
+            g_dave_nonce = 0;
+            // A new epoch is a new key, so a viewer needs a frame to start from.
+            InterlockedExchange(&g_want_keyframe, 1);
+        }
+        else
+        {
+            unsigned long long now = GetTickCount64();
+            if (now - g_last_rejoin_ms > 10000)
+            {
+                g_last_rejoin_ms = now;
+                log_line("share/dave: просимся в группу заново");
+                send_key_package(false);
+            }
+        }
+
+        send_transition_response(transition_id, applied);
     }
 
     void handle_binary_payload(const unsigned char* data, unsigned int len)
@@ -677,7 +859,7 @@ namespace
         case VOP_MLS_EXTERNAL_SENDER:
             // Discord's own signing identity for the group. Answering with our
             // key package is what gets this connection added.
-            send_key_package();
+            send_key_package(true);
             break;
 
         case VOP_MLS_PROPOSALS:
@@ -693,25 +875,47 @@ namespace
 
             unsigned int transition_id = ((unsigned int)payload[0] << 8) | payload[1];
 
-            const char* why = "";
-            bool applied = mls::process_commit(&g_group, payload + 2, payload_len - 2,
-                                               g_known, g_known_count, &why);
+            unsigned int commit_len = payload_len - 2;
+            const unsigned char* commit_bytes = payload + 2;
 
-            log_line("share/dave: коммит %s (transition %u)%s%s",
-                     applied ? "применён" : "НЕ применён", transition_id,
-                     applied ? "" : ": ", applied ? "" : why);
+            // The server broadcasts the winning commit to everybody, its author
+            // included. Ours arrives back looking like anyone else's and cannot
+            // be applied like one - the state it leads to was built when it was
+            // written, so adopting it is a swap rather than a calculation.
+            //
+            // Which of the two it is comes out of the sender field, not out of
+            // comparing bytes: what comes back has been through the server and
+            // a re-serialisation that changes nothing about its meaning still
+            // fails a memcmp. The guess this used to fall back on - "it would
+            // not apply, so it must have been ours" - could put this client on
+            // an epoch nobody else has, and from there no viewer can open
+            // anything at all.
+            unsigned int sender = 0xFFFFFFFF;
+            bool know_sender = mls::commit_sender(commit_bytes, commit_len, &sender);
+            bool mine = know_sender && sender == g_group.my_leaf;
 
-            if (applied)
-            {
-                g_known_count = 0;
-                dave::reset_ratchets();
-                g_dave_nonce = 0;
-                // A new epoch is a new key, so a viewer needs a frame it can
-                // start from.
-                InterlockedExchange(&g_want_keyframe, 1);
-            }
+            // Held, not applied. The announce says which commit won; the
+            // server then tells the whole connection when to switch with op
+            // 22, and until it does everybody is still sending on the old
+            // epoch. Moving early means protecting frames with keys the
+            // viewers do not have yet and being unable to read theirs - and
+            // the voice side, which is the half of this client that works,
+            // has always waited.
+            //
+            // Transition zero is the exception: nobody to stay in step with,
+            // so it takes effect at once.
+            g_pending_commit.clear();
+            g_pending_commit.append(commit_bytes, commit_len);
+            g_have_pending_commit = true;
+            g_pending_transition = transition_id;
+            g_pending_is_ours = mine;
 
-            send_transition_response(transition_id, applied);
+            log_line("share/dave: %s коммит от листа %u (наш %u) ждёт перехода %u (%u байт)",
+                     mine ? "свой" : "чужой", sender, g_group.my_leaf,
+                     transition_id, commit_len);
+
+            if (transition_id == 0) apply_pending_transition(0);
+            else send_transition_response(transition_id, true);
             break;
         }
 
@@ -975,34 +1179,69 @@ namespace
             unsigned int pt = packet[1];
             if (pt < 200 || pt > 207) continue;
 
+            // The low five bits are the feedback format, and lumping the
+            // formats together made the counters say nothing: a generic NACK
+            // means packets were lost on the way, while transport-wide
+            // congestion feedback arrives constantly whether anything was lost
+            // or not. Counted as one number, "NACK 82" could mean either, and
+            // the difference is the whole question of why a viewer keeps
+            // asking for keyframes.
+            unsigned int fmt = packet[0] & 0x1F;
+
             if (pt == 201) InterlockedIncrement(&g_rtcp_receiver);
             else if (pt == 205)
             {
-                InterlockedIncrement(&g_rtcp_nack);
-                // Format 1 is a generic NACK; anything else on 205 is
-                // congestion control feedback and needs no reply.
-                if ((packet[0] & 0x1F) == 1) handle_nack(packet, got);
+                if (fmt == 1)
+                {
+                    InterlockedIncrement(&g_rtcp_nack);
+                    handle_nack(packet, got);
+                }
+                else
+                {
+                    InterlockedIncrement(&g_rtcp_ccfb);
+                }
             }
             else if (pt == 206)
             {
-                InterlockedIncrement(&g_rtcp_pli);
+                if (fmt == 4) InterlockedIncrement(&g_rtcp_fir);
+                else          InterlockedIncrement(&g_rtcp_pli);
+
                 // A viewer only asks for this when it cannot decode what it
-                // already has, so it gets answered at once.
-                InterlockedExchange(&g_want_keyframe, 1);
+                // already has, so it gets answered - but not every single
+                // time. At two requests a second, answering each one turns the
+                // whole stream into keyframes, and a keyframe is tens of
+                // packets that then get lost in their turn and are asked for
+                // again. The storm feeds itself; one a second breaks it.
+                unsigned long long ms = GetTickCount64();
+                if (ms - g_last_pli_keyframe_ms >= 1000)
+                {
+                    g_last_pli_keyframe_ms = ms;
+                    InterlockedExchange(&g_want_keyframe, 1);
+                }
+                else
+                {
+                    InterlockedIncrement(&g_pli_coalesced);
+                }
             }
         }
     }
 
     // How many leaves the group actually holds. A stream that nobody has joined
     // is a group of one.
-    unsigned int group_members()
+    unsigned int group_members_of(const mls::group_state* g)
     {
-        if (!g_group_ready || !g_group.established) return 0;
+        if (!g || !g->established) return 0;
 
         unsigned int n = 0;
-        for (unsigned int i = 0; i < g_group.leaf_count && i < mls::MAX_MEMBERS; i++)
-            if (g_group.leaf_used[i]) n++;
+        for (unsigned int i = 0; i < g->leaf_count && i < mls::MAX_MEMBERS; i++)
+            if (g->leaf_used[i]) n++;
         return n;
+    }
+
+    unsigned int group_members()
+    {
+        if (!g_group_ready) return 0;
+        return group_members_of(&g_group);
     }
 
     // A Go Live stream carries two tracks, not one. A working client keeps a
@@ -1217,6 +1456,11 @@ namespace
         set_status(SHARE_LIVE, "Демонстрация идёт");
         log_line("share: streaming %dx%d at %d fps, video ssrc %u", w, h, g_fps, g_video_ssrc);
 
+        // Here rather than at start(): this is the moment there is actually
+        // something going out, and a chime for a share that then failed to
+        // negotiate would be a lie.
+        sounds::play(SOUND_STREAM_START);
+
         // A viewer joining later needs an IDR to start from.
         for (int i = 0; i < g_layer_count; i++) venc::request_keyframe(&g_layers[i].enc);
 
@@ -1249,6 +1493,7 @@ namespace
                 if (asked || overdue)
                 {
                     last_keyframe_ms = ms;
+                    InterlockedIncrement(&g_keyframes);
                     for (int i = 0; i < g_layer_count; i++)
                         venc::request_keyframe(&g_layers[i].enc);
                 }
@@ -1273,6 +1518,22 @@ namespace
             capture_frame f;
             if (capture::grab(&f))
             {
+                // A still screen hands back the picture that was already sent.
+                // Scaling and encoding it again per layer is the bulk of what a
+                // share costs while nobody is doing anything, and it buys the
+                // viewer nothing - they are already looking at it.
+                //
+                // Not skipped forever, though: a viewer who joins during a
+                // still moment needs something to start from, and the encoder's
+                // own rate control wants to be fed occasionally. Once a second
+                // is far below what anyone notices on a frozen picture.
+                bool repeat = !f.fresh && (f.time_us - g_last_encoded_us) < 1000000ull;
+                if (repeat) g_skipped_still++;
+                else        g_last_encoded_us = f.time_us;
+
+                if (!repeat)
+                {
+
                 // Anything the person marked gets covered before a single
                 // encoder sees the frame, so nothing censored can reach the
                 // wire even on the layer nobody is watching.
@@ -1319,6 +1580,7 @@ namespace
                     venc::downscale_bgra(f.bgra, f.width, f.height, f.stride,
                                          L->scaled, L->w, L->h);
                     venc::submit(&L->enc, L->scaled, L->w, L->h, L->w * 4, f.time_us);
+                }
                 }
             }
 
@@ -1413,14 +1675,43 @@ namespace
             if (now - last_stats >= 5000)
             {
                 last_stats = now;
-                log_line("share: %u кадров, %u пакетов, %u КБ, e2ee %s, сбоев %u | "
-                         "от сервера %u: RR %u, PLI %u, NACK %u | RTX отдано %u, поздно %u",
-                         (unsigned int)g_frames, (unsigned int)g_packets,
-                         (unsigned int)(g_bytes / 1024),
-                         g_e2ee_ready ? "да" : "НЕТ", (unsigned int)g_protect_failures,
-                         (unsigned int)g_udp_in, (unsigned int)g_rtcp_receiver,
-                         (unsigned int)g_rtcp_pli, (unsigned int)g_rtcp_nack,
+
+                // Totals with the last five seconds beside them. A frozen
+                // viewer is a question about what changed, not about what has
+                // accumulated since the stream began, and reading that off a
+                // column of running totals is work nobody should have to do.
+                //
+                // The three that separate the causes: frames still going up
+                // with receiver reports still coming back means they are
+                // getting the packets, so a frozen picture is about keys or
+                // keyframes; receiver reports stopping means the packets are
+                // not arriving at all; frames not going up means this end
+                // stalled and the network is innocent.
+                unsigned int frames_now = (unsigned int)g_frames;
+                unsigned int rr_now = (unsigned int)g_rtcp_receiver;
+                unsigned int pli_now = (unsigned int)g_rtcp_pli;
+                unsigned int keys_now = (unsigned int)g_keyframes;
+
+                log_line("share: эпоха %llu, участников %u, e2ee %s | "
+                         "кадров %u (+%u), ключевых %u (+%u), пакетов %u, %u КБ, сбоев %u | "
+                         "от сервера %u: RR %u (+%u), PLI %u (+%u), склеено %u, FIR %u, "
+                         "NACK %u, ccfb %u | RTX отдано %u, поздно %u",
+                         g_group.epoch, group_members(), g_e2ee_ready ? "да" : "НЕТ",
+                         frames_now, frames_now - g_frames_mark,
+                         keys_now, keys_now - g_keyframes_mark,
+                         (unsigned int)g_packets, (unsigned int)(g_bytes / 1024),
+                         (unsigned int)g_protect_failures,
+                         (unsigned int)g_udp_in,
+                         rr_now, rr_now - g_rr_mark,
+                         pli_now, pli_now - g_pli_mark,
+                         (unsigned int)g_pli_coalesced, (unsigned int)g_rtcp_fir,
+                         (unsigned int)g_rtcp_nack, (unsigned int)g_rtcp_ccfb,
                          (unsigned int)g_rtx_sent, (unsigned int)g_rtx_missed);
+
+                g_frames_mark = frames_now;
+                g_keyframes_mark = keys_now;
+                g_rr_mark = rr_now;
+                g_pli_mark = pli_now;
             }
 
             // Nothing is sent to the main gateway while streaming. op 21 is not
@@ -1648,8 +1939,13 @@ namespace
             case VOP_SESSION_DESCRIPTION:
                 handle_session_description(d);
                 break;
-            case VOP_DAVE_PREPARE_TRANSITION:
             case VOP_DAVE_EXECUTE_TRANSITION:
+                // The switch itself. Everything held since op 29 happens here,
+                // together with the rest of the connection.
+                apply_pending_transition((unsigned int)d->i64("transition_id", 0));
+                break;
+
+            case VOP_DAVE_PREPARE_TRANSITION:
             case VOP_DAVE_PREPARE_EPOCH:
                 // The epoch machinery arrives as plain JSON; the group itself is
                 // rebuilt by the binary ops. Answering is what lets the server
@@ -1691,6 +1987,8 @@ namespace
 void screenshare::init()
 {
     ccfset(g_status, 0, sizeof(g_status));
+    g_own_commit.init(2048);
+    g_pending_commit.init(2048);
     capture::init();
     venc::init();
 }
@@ -1751,6 +2049,22 @@ bool screenshare::start(int monitor_index, int max_width, int max_height, int fp
     g_frames = 0;
     g_packets = 0;
     g_bytes = 0;
+    g_keyframes = 0;
+    g_rtcp_receiver = 0;
+    g_rtcp_pli = 0;
+    g_rtcp_nack = 0;
+    g_rtcp_ccfb = 0;
+    g_rtcp_fir = 0;
+    g_pli_coalesced = 0;
+    g_last_pli_keyframe_ms = 0;
+    g_last_rejoin_ms = 0;
+    g_have_pending_commit = false;
+    g_pending_transition = 0;
+    g_pending_is_ours = false;
+    g_frames_mark = 0;
+    g_keyframes_mark = 0;
+    g_rr_mark = 0;
+    g_pli_mark = 0;
     g_nonce_counter = 0;
     g_mode = MODE_NONE;
     g_media_ready = 0;
@@ -1789,6 +2103,11 @@ bool screenshare::start(int monitor_index, int max_width, int max_height, int fp
 void screenshare::stop()
 {
     if (!g_running && g_state == SHARE_IDLE) return;
+
+    // Our own share. The voice state dispatch that announces it names us, and
+    // the handler there deliberately skips ourselves - a client chiming at its
+    // own actions twice is worse than not chiming at all.
+    sounds::play(SOUND_STREAM_STOP);
 
     InterlockedExchange(&g_running, 0);
 

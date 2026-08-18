@@ -12,6 +12,19 @@ inline unsigned long long snowflake_time_ms(snowflake id)
     return (id >> 22) + DISCORD_EPOCH_MS;
 }
 
+// Wall clock in unix milliseconds. GetTickCount64 counts since boot and says
+// nothing about the date, which is what a timeout has to be written in.
+inline unsigned long long unix_now_ms()
+{
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+
+    unsigned long long ticks = ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    if (ticks < 116444736000000000ULL) return 0;
+
+    return (ticks - 116444736000000000ULL) / 10000ULL;
+}
+
 enum channel_type
 {
     CH_GUILD_TEXT = 0,
@@ -167,6 +180,11 @@ struct dmessage
     ulist<dattachment> attachments;
     ulist<dembed> embeds;
     ulist<dreaction> reactions;
+
+    // How tall this message drew last time, so the ones scrolled out of
+    // sight can be skipped without changing the length of the list. Zero
+    // until it has been drawn once.
+    float draw_height;
 };
 
 struct dmember
@@ -174,14 +192,26 @@ struct dmember
     snowflake user_id;
     const char* nick;
     ulist<snowflake> roles;
+
+    // When a timeout on this member runs out, as unix milliseconds. Zero when
+    // there is none. Discord leaves the stamp in place after it has passed
+    // rather than clearing it, so a value in the past means the same as none.
+    unsigned long long timeout_until_ms;
 };
 
 // The permission bits this client actually reasons about. Discord defines
-// several dozen; naming the three that matter here is clearer than carrying
+// several dozen; naming the ones that matter here is clearer than carrying
 // the whole table around for no reason.
-const unsigned long long PERM_ADMINISTRATOR = 1ULL << 3;
-const unsigned long long PERM_VIEW_CHANNEL  = 1ULL << 10;
-const unsigned long long PERM_CONNECT       = 1ULL << 20;
+const unsigned long long PERM_BAN_MEMBERS      = 1ULL << 2;
+const unsigned long long PERM_ADMINISTRATOR    = 1ULL << 3;
+const unsigned long long PERM_VIEW_CHANNEL     = 1ULL << 10;
+const unsigned long long PERM_MANAGE_MESSAGES  = 1ULL << 13;
+const unsigned long long PERM_CONNECT          = 1ULL << 20;
+const unsigned long long PERM_MUTE_MEMBERS     = 1ULL << 22;
+// Moving somebody out of a voice channel and disconnecting them are the same
+// permission: a disconnect is a move to nowhere.
+const unsigned long long PERM_MOVE_MEMBERS     = 1ULL << 24;
+const unsigned long long PERM_MODERATE_MEMBERS = 1ULL << 40;
 
 // One line of a channel's permission table: who it is about, and what it
 // turns on and off for them. Denies win over allows at the same level, and
@@ -206,6 +236,10 @@ struct dchannel
     int type;
     int position;
     ulist<snowflake> recipients; // DM / group DM
+
+    // Who owns a group chat. Only groups have one; a server's channel belongs
+    // to the server and a one to one DM belongs to nobody.
+    snowflake owner_id;
     ulist<doverwrite> overwrites;
     ulist<dmessage> messages;    // ascending by id
 
@@ -269,6 +303,11 @@ struct drole
     // member list. Most roles do not; without this the list would be one
     // heading per role and unreadable.
     bool hoist;
+
+    // Carried so that editing a role does not quietly clear it: the edit
+    // sends the whole role back, and a field nobody parsed would go out as
+    // false whatever it had been.
+    bool mentionable;
 };
 
 struct dguild
@@ -349,3 +388,11 @@ void format_timestamp(const char* iso, char* out, int cap);
 // Formats "DD.MM.YYYY, HH:MM" from a unix time in milliseconds. Used for the
 // dates that arrive as a snowflake rather than as text.
 void format_epoch_ms(unsigned long long ms, char* out, int cap);
+
+// An ISO8601 stamp as discord writes them ("2026-08-17T18:34:31.123+00:00")
+// to unix milliseconds. Zero when there is nothing to read. Any offset is
+// ignored: every stamp discord sends is already UTC.
+unsigned long long iso_to_unix_ms(const char* iso);
+
+// The other way, to the shape discord accepts in a request body.
+void unix_ms_to_iso(unsigned long long ms, char* out, int cap);

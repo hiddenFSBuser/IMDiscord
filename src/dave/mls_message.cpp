@@ -132,9 +132,12 @@ bool read_proposal_message(tls_reader* r, proposal_message* out)
 bool parse_proposals_payload(const void* data, unsigned int len,
                              bool* out_is_revoke,
                              proposal_message* out, unsigned int cap,
-                             unsigned int* out_count)
+                             unsigned int* out_count,
+                             proposal_ref* out_revoked, unsigned int revoked_cap,
+                             unsigned int* out_revoked_count)
 {
     *out_count = 0;
+    if (out_revoked_count) *out_revoked_count = 0;
 
     tls_reader r;
     r.init(data, len);
@@ -145,8 +148,31 @@ bool parse_proposals_payload(const void* data, unsigned int len,
 
     if (*out_is_revoke)
     {
-        // A revoke carries proposal references rather than proposals.
-        return true;
+        // A revoke carries proposal references rather than proposals: one
+        // opaque<V> of them, each the 32 byte ref of something offered
+        // earlier.
+        const unsigned char* body = 0;
+        unsigned int body_len = 0;
+        if (!r.opaque(&body, &body_len)) return false;
+
+        tls_reader refs;
+        refs.init(body, body_len);
+
+        while (refs.remaining() > 0)
+        {
+            const unsigned char* one = 0;
+            unsigned int one_len = 0;
+            if (!refs.opaque(&one, &one_len)) return false;
+            if (one_len != 32) return false;
+
+            if (out_revoked && out_revoked_count && *out_revoked_count < revoked_cap)
+            {
+                ccpy(out_revoked[*out_revoked_count].ref, one, 32);
+                (*out_revoked_count)++;
+            }
+        }
+
+        return refs.done();
     }
 
     const unsigned char* body = 0;

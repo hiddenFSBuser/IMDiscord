@@ -3,6 +3,8 @@
 #include "store.h"
 #include "rest.h"
 #include "voice.h"
+#include "audio/sounds.h"
+#include "science.h"
 #include "video/screenshare.h"
 #include "video/streamview.h"
 #include "archive.h"
@@ -120,19 +122,24 @@ namespace
         w.key("properties");
         w.begin_obj();
         w.kv_str("os", "Windows");
-        w.kv_str("browser", "Chrome");
+        // The same identity the REST side reports. Two halves of one client
+        // describing themselves as different browsers is exactly the sort of
+        // inconsistency that draws a captcha demand.
+        w.kv_str("browser", "Firefox");
         w.kv_str("device", "");
         w.kv_str("system_locale", "en-US");
         w.kv_bool("has_client_mods", false);
-        w.kv_str("browser_user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-        w.kv_str("browser_version", "120.0.0.0");
+        w.kv_str("browser_user_agent",
+                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) "
+                 "Gecko/20100101 Firefox/153.0");
+        w.kv_str("browser_version", "153.0");
         w.kv_str("os_version", "10");
         w.kv_str("referrer", "");
         w.kv_str("referring_domain", "");
         w.kv_str("referrer_current", "");
         w.kv_str("referring_domain_current", "");
         w.kv_str("release_channel", "stable");
-        w.kv_i64("client_build_number", 363557);
+        w.kv_i64("client_build_number", DISCORD_BUILD_NUMBER);
         w.kv_null("client_event_source");
         w.end_obj();
         w.key("presence");
@@ -163,7 +170,7 @@ namespace
         log_line("gateway: sending identify (%u bytes)", w.buf.size);
         send_json(c, &w);
         w.free_writer();
-        set_state(GW_IDENTIFYING, "Авторизация...");
+        set_state(GW_IDENTIFYING, tr("Авторизация..."));
     }
 
     void send_resume(gw_conn* c)
@@ -182,7 +189,7 @@ namespace
 
         send_json(c, &w);
         w.free_writer();
-        set_state(GW_IDENTIFYING, "Восстановление сессии...");
+        set_state(GW_IDENTIFYING, tr("Восстановление сессии..."));
     }
 
     void send_heartbeat(gw_conn* c)
@@ -240,6 +247,10 @@ namespace
 
         const char* sid = d->str("session_id", 0);
         if (sid) ccstrncpy(c->session_id, sid, sizeof(c->session_id) - 1);
+
+        // Analytics identifies the session by this, not by the auth token, so
+        // nothing can be reported until READY hands it over.
+        science::set_token(d->str("analytics_token", 0));
 
         // Discord hands out the voice regions in the order it thinks are best
         // for this connection, and a client is expected to name them back when
@@ -398,7 +409,7 @@ namespace
                  guilds->count, privates->count, rels->count);
 
         char text[192];
-        cnprint(text, sizeof(text), "В сети как %s",
+        cnprint(text, sizeof(text), tr("В сети как %s"),
                 me ? me->display_name() : "?");
         set_state(GW_READY, text);
         c->backoff_ms = 1000;
@@ -449,7 +460,7 @@ namespace
 
         if (ccscmp(type, "RESUMED") == 0)
         {
-            set_state(GW_READY, "Сессия восстановлена");
+            set_state(GW_READY, tr("Сессия восстановлена"));
             return;
         }
 
@@ -466,6 +477,20 @@ namespace
 
                 store::bump_revision();
             }
+
+            // Direct messages only, and not our own coming back. A chime for
+            // every message on every server would be unusable, and a server is
+            // where a person expects to be the one who goes looking.
+            if (ccscmp(type, "MESSAGE_CREATE") == 0)
+            {
+                store::guard g;
+                snowflake author = d->obj("author")->sf("id");
+                dchannel* c = store::find_channel(d->sf("channel_id"));
+
+                if (c && c->is_dm() && author && author != store::self_id())
+                    sounds::play(SOUND_NOTIFY);
+            }
+
             // Everything that passes through is kept, so a channel opens from
             // disk next time and still reads when there is no connection.
             archive::put_json(d);
@@ -599,6 +624,37 @@ namespace
             return;
         }
 
+        // Roles, created, changed and deleted. Without these the client keeps
+        // showing what the roles were when it connected, which after editing
+        // one from inside the client looks exactly like the edit failing.
+        if (ccscmp(type, "GUILD_ROLE_CREATE") == 0 ||
+            ccscmp(type, "GUILD_ROLE_UPDATE") == 0)
+        {
+            store::guard g;
+            dguild* guild = store::find_guild(d->sf("guild_id"));
+            if (guild) store::upsert_role(guild, d->obj("role"));
+            return;
+        }
+
+        if (ccscmp(type, "GUILD_ROLE_DELETE") == 0)
+        {
+            store::guard g;
+            dguild* guild = store::find_guild(d->sf("guild_id"));
+            if (guild) store::remove_role(guild, d->sf("role_id"));
+            return;
+        }
+
+        // Somebody's roles changed, which is what comes back from handing one
+        // out or taking it away.
+        if (ccscmp(type, "GUILD_MEMBER_UPDATE") == 0)
+        {
+            store::guard g;
+            dguild* guild = store::find_guild(d->sf("guild_id"));
+            if (guild) store::add_guild_member(guild, d);
+            store::bump_revision();
+            return;
+        }
+
         if (ccscmp(type, "GUILD_MEMBERS_CHUNK") == 0)
         {
             store::guard g;
@@ -620,6 +676,7 @@ namespace
                 ccfset(&mem, 0, sizeof(mem));
                 mem.user_id = u->id;
                 mem.nick = m->str("nick", 0) ? store::intern(m->str("nick", 0)) : 0;
+                mem.timeout_until_ms = iso_to_unix_ms(m->str("communication_disabled_until", 0));
                 guild->members.push(mem);
             }
             store::bump_revision();
@@ -653,11 +710,87 @@ namespace
         if (ccscmp(type, "VOICE_STATE_UPDATE") == 0)
         {
             snowflake uid = d->sf("user_id");
+            snowflake channel = d->sf("channel_id");
+
+            // What this person was doing a moment ago, read before the store is
+            // told the new state. Arriving, leaving and starting a share are
+            // all the same dispatch, and only the difference says which.
+            snowflake was_in = 0;
+            bool was_streaming = false;
             {
                 store::guard g;
+                const dvoice_state* before = store::find_voice_state(uid);
+                if (before)
+                {
+                    was_in = before->channel_id;
+                    was_streaming = before->self_stream;
+                }
                 store::set_voice_state(d, d->sf("guild_id"));
             }
+
+            // Only about the channel this client is sitting in. Somebody
+            // joining a call three servers away is not an event here.
+            snowflake mine = voice::current_channel();
+            if (mine)
+            {
+                bool here_now = channel == mine;
+                bool here_before = was_in == mine;
+
+                if (here_now && !here_before) sounds::play(SOUND_VOICE_JOIN);
+                else if (!here_now && here_before) sounds::play(SOUND_VOICE_LEAVE);
+
+                if (here_now && uid != store::self_id())
+                {
+                    bool streaming = d->boolean("self_stream", false);
+                    if (streaming && !was_streaming) sounds::play(SOUND_STREAM_START);
+                    else if (!streaming && was_streaming) sounds::play(SOUND_STREAM_STOP);
+                }
+            }
+
             if (uid == store::self_id()) voice::on_gateway_voice_state(d);
+            return;
+        }
+
+        // A call in a direct message or a group. Unlike a server's voice
+        // channel, which announces itself through the channel list, a call
+        // here exists only as this dispatch and the voice states it carries -
+        // so without reading it there is no way to know a call is running at
+        // all, which is exactly how it looked from the inside.
+        if (ccscmp(type, "CALL_CREATE") == 0 || ccscmp(type, "CALL_UPDATE") == 0)
+        {
+            store::guard g;
+
+            snowflake channel_id = d->sf("channel_id");
+
+            // CALL_CREATE carries everyone already in it. CALL_UPDATE mostly
+            // carries who is still being rung, and leaves the states alone.
+            const jval* states = d->arr("voice_states");
+            for (unsigned int i = 0; i < states->count; i++)
+                store::set_voice_state(states->at(i), 0);
+
+            // Who the call is ringing, so a chat that is calling this account
+            // can say so rather than only lighting up when somebody answers.
+            ulist<snowflake> ringing;
+
+            const jval* who = d->arr("ringing");
+            for (unsigned int i = 0; i < who->count; i++)
+                ringing.push(who->at(i)->as_snowflake());
+
+            store::set_call_ringing(channel_id, &ringing);
+            ringing.freelist();
+
+            store::bump_revision();
+            return;
+        }
+
+        if (ccscmp(type, "CALL_DELETE") == 0)
+        {
+            store::guard g;
+
+            snowflake channel_id = d->sf("channel_id");
+            store::clear_voice_states_for_channel(channel_id);
+            store::clear_call_ringing(channel_id);
+            store::bump_revision();
             return;
         }
 
@@ -784,14 +917,14 @@ namespace
 
         while (c->running)
         {
-            set_state(GW_CONNECTING, "Подключение к discord...");
+            set_state(GW_CONNECTING, tr("Подключение к discord..."));
 
             c->ws.init();
             if (!c->ws.connect(GATEWAY_URL, "Origin: https://discord.com\r\n",
                                c->proxy.in_use() ? &c->proxy : 0))
             {
                 c->ws.destroy();
-                set_state(GW_RECONNECTING, "Нет связи, повтор...");
+                set_state(GW_RECONNECTING, tr("Нет связи, повтор..."));
 
                 // The socket refusing to open is the earliest and plainest sign
                 // that there is no network; nothing else has to fail first.
@@ -835,13 +968,13 @@ namespace
 
             if (!c->running) break;
 
-            set_state(GW_RECONNECTING, "Переподключение...");
+            set_state(GW_RECONNECTING, tr("Переподключение..."));
             if (WaitForSingleObject(c->stop_event, c->backoff_ms) == WAIT_OBJECT_0) break;
             c->backoff_ms = c->backoff_ms < 30000 ? c->backoff_ms * 2 : 30000;
         }
 
         message.free_buffer();
-        set_state(GW_OFFLINE, "Отключено");
+        set_state(GW_OFFLINE, tr("Отключено"));
         return 0;
     }
 }
@@ -905,7 +1038,7 @@ void gateway::start()
 void gateway::stop()
 {
     stop_conn(active());
-    set_state(GW_OFFLINE, "Отключено");
+    set_state(GW_OFFLINE, tr("Отключено"));
 }
 
 // The current connection stops being the client's and becomes the one holding
