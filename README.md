@@ -43,3 +43,6 @@
 <p align="center">
     <img src="imgs\img1.png" alt="Icon" />
 </p>
+<p align="center">
+    <img src="imgs\img2.png" alt="Icon" />
+</p>
