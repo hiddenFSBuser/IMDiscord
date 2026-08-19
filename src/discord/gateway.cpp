@@ -60,6 +60,13 @@ namespace
         volatile long acked;
 
         char session_id[128];
+
+        // Where a resume has to go. READY names a host of its own for this,
+        // and it is not the address everybody connects to: the session lives
+        // on one node, and asking a different node to resume it gets an
+        // invalid session and a full identify - which looks exactly like a
+        // resume that discord refused, while nothing was ever wrong with it.
+        char resume_url[256];
         // Its own copy. A held connection has to keep identifying as the
         // account that opened it, long after the client has moved on.
         char token[512];
@@ -107,8 +114,73 @@ namespace
         return c->ws.send_text(w->buf.data, w->buf.size);
     }
 
+    // What a bot asks to be told about.
+    //
+    // Three of these are privileged and a bot that has not had them switched
+    // on in the developer portal is refused outright, with close code 4014 -
+    // so they are asked for, and dropped on that refusal rather than left as
+    // a wall somebody has to know about in advance.
+    const long long INTENT_MEMBERS = 1LL << 1;
+    const long long INTENT_PRESENCES = 1LL << 8;
+    const long long INTENT_MESSAGE_CONTENT = 1LL << 15;
+
+    const long long INTENTS_PRIVILEGED =
+        INTENT_MEMBERS | INTENT_PRESENCES | INTENT_MESSAGE_CONTENT;
+
+    // Guilds, moderation, voice states, messages, reactions, typing, and the
+    // same three in direct messages. Everything this client draws.
+    const long long INTENTS_PLAIN =
+        (1LL << 0) | (1LL << 2) | (1LL << 7) | (1LL << 9) | (1LL << 10) |
+        (1LL << 11) | (1LL << 12) | (1LL << 13) | (1LL << 14);
+
+    bool g_intents_denied = false;
+
     void send_identify(gw_conn* c)
     {
+        // A bot identifies with what it wants to hear about; a person's client
+        // identifies with what it is. Neither field belongs in the other's
+        // payload - discord answers a bot that sends capabilities, or a user
+        // that sends intents, by closing the socket.
+        if (api::is_bot())
+        {
+            long long intents = INTENTS_PLAIN;
+            if (!g_intents_denied) intents |= INTENTS_PRIVILEGED;
+
+            jwriter b;
+            b.init();
+            b.begin_obj();
+            b.kv_i64("op", OP_IDENTIFY);
+            b.key("d");
+            b.begin_obj();
+            b.kv_str("token", c->token);
+            b.kv_i64("intents", intents);
+            b.key("properties");
+            b.begin_obj();
+            b.kv_str("os", "windows");
+            b.kv_str("browser", "IMDiscord");
+            b.kv_str("device", "IMDiscord");
+            b.end_obj();
+            b.key("presence");
+            b.begin_obj();
+            b.kv_str("status", "online");
+            b.kv_i64("since", 0);
+            b.key("activities");
+            b.begin_arr();
+            b.end_arr();
+            b.kv_bool("afk", false);
+            b.end_obj();
+            b.end_obj();
+            b.end_obj();
+
+            log_line("gateway: identify бота, intents %lld%s", intents,
+                     g_intents_denied ? " (без привилегированных)" : "");
+
+            send_json(c, &b);
+            b.free_writer();
+            set_state(GW_IDENTIFYING, tr("Авторизация..."));
+            return;
+        }
+
         jwriter w;
         w.init();
         w.begin_obj();
@@ -247,6 +319,11 @@ namespace
 
         const char* sid = d->str("session_id", 0);
         if (sid) ccstrncpy(c->session_id, sid, sizeof(c->session_id) - 1);
+
+        const char* rurl = d->str("resume_gateway_url", 0);
+        c->resume_url[0] = 0;
+        if (rurl && rurl[0])
+            cnprint(c->resume_url, sizeof(c->resume_url), "%s/?v=9&encoding=json", rurl);
 
         // Analytics identifies the session by this, not by the auth token, so
         // nothing can be reported until READY hands it over.
@@ -461,6 +538,12 @@ namespace
         if (ccscmp(type, "RESUMED") == 0)
         {
             set_state(GW_READY, tr("Сессия восстановлена"));
+
+            // A resume that worked is a connection that worked, so the wait
+            // before the next attempt goes back to a second. Left growing, a
+            // run of ordinary drops would have the client sitting out half a
+            // minute before reconnecting from a socket that dies instantly.
+            c->backoff_ms = 1000;
             return;
         }
 
@@ -866,8 +949,22 @@ namespace
             offline::note_network_success();
             SetEvent(c->beat_event);
 
-            if (c->want_resume && c->session_id[0]) send_resume(c);
-            else send_identify(c);
+            // Logged either way. A resume that never happens is otherwise
+            // indistinguishable from one that failed, and the difference is
+            // the difference between a bug here and a decision at discord.
+            if (c->want_resume && c->session_id[0])
+            {
+                log_line("gateway: RESUME, сессия %.8s..., seq %ld%s",
+                         c->session_id, (long)c->sequence,
+                         c->resume_url[0] ? "" : " (общий адрес - READY не дал свой)");
+                send_resume(c);
+            }
+            else
+            {
+                if (c->want_resume)
+                    log_line("gateway: восстановить нечего - сессии нет, представляюсь заново");
+                send_identify(c);
+            }
             c->want_resume = false;
             break;
         }
@@ -920,7 +1017,10 @@ namespace
             set_state(GW_CONNECTING, tr("Подключение к discord..."));
 
             c->ws.init();
-            if (!c->ws.connect(GATEWAY_URL, "Origin: https://discord.com\r\n",
+            const char* where = (c->want_resume && c->resume_url[0]) ? c->resume_url
+                                                                    : GATEWAY_URL;
+
+            if (!c->ws.connect(where, "Origin: https://discord.com\r\n",
                                c->proxy.in_use() ? &c->proxy : 0))
             {
                 c->ws.destroy();
@@ -950,6 +1050,37 @@ namespace
 
             log_line("gateway: receive loop ended (close code %u)", c->ws.close_status);
 
+            // 4014: a privileged intent this bot has not been granted. Asking
+            // again without them is the difference between a client that
+            // explains itself and one that simply never connects.
+            if (c->ws.close_status == 4014 && api::is_bot() && !g_intents_denied)
+            {
+                g_intents_denied = true;
+                log_line("gateway: привилегированные intents не разрешены в портале - "
+                         "переподключаемся без них (не будет списка участников, "
+                         "статусов и текста сообщений)");
+                c->session_id[0] = 0;
+            }
+
+            // A socket that died on its own is the case resume exists for.
+            //
+            // Only two paths used to ask for one - the server saying reconnect,
+            // and a session it says is still good - so every ordinary drop
+            // ended in a fresh identify: the whole store thrown away and
+            // rebuilt, the open channel and the call with it. That is what
+            // being "kicked out" looked like, and a 1006 arrives on its own
+            // schedule, anywhere from a quarter of an hour to five hours in.
+            //
+            // Resuming asks discord to replay what was missed on the same
+            // session. If it will not, it answers with an invalid session and
+            // the identify happens then - one round trip later and nothing
+            // lost in the ordinary case.
+            if (!c->want_resume && c->session_id[0] && c->sequence > 0)
+            {
+                log_line("gateway: попробуем восстановить сессию (seq %ld)", (long)c->sequence);
+                c->want_resume = true;
+            }
+
             InterlockedExchange(&c->heartbeat_ms, 0);
             // The streams go first: they are signalled over this socket, so
             // once it is gone neither can be stopped or kept alive.
@@ -958,7 +1089,16 @@ namespace
             // account switch is. The voice connection and the stream have their
             // own sockets and their own accepted tokens; nothing about them
             // needs this one.
-            if (!g_hold_media)
+            //
+            // And unless this is the spare rather than the one in use. A held
+            // connection is the old account's socket, kept alive only so the
+            // server does not decide the call left with it; when it is finally
+            // let go it must take nothing with it. Letting it run this made
+            // release_hold end whatever call was running at the time - the
+            // call it was being held for included, which is the whole point of
+            // holding it - and the log showed exactly that: the hold released,
+            // and the voice socket dying four seconds behind it.
+            if (!g_hold_media && c == active())
             {
                 screenshare::on_gateway_disconnected();
                 streamview::on_gateway_disconnected();
@@ -1205,6 +1345,13 @@ void gateway::set_status(const char* status)
 
 void gateway::subscribe_guild(snowflake guild_id, snowflake channel_id)
 {
+    // Op 14 belongs to the client a person uses: it asks discord to start
+    // streaming the member list and typing for the part of a server being
+    // looked at. A bot is told about its servers whether it asks or not, and
+    // sending this on a bot connection is at best ignored and at worst a
+    // decode error that closes the socket.
+    if (api::is_bot()) return;
+
     jwriter w;
     w.init();
     w.begin_obj();

@@ -6,6 +6,7 @@
 #include "rtp_video.h"
 
 #include "discord/store.h"
+#include "discord/rest.h"
 #include "discord/gateway.h"
 #include "discord/voice.h"
 #include "core/log.h"
@@ -1742,6 +1743,17 @@ void streamview::shutdown()
 
 bool streamview::watch(snowflake guild_id, snowflake channel_id, snowflake user_id)
 {
+    // Go Live is a person's feature. The opcodes that set one up - 18 to
+    // start, 20 to watch - do not exist for a bot, and discord answers one
+    // that sends them by closing the gateway with 4001, unknown opcode. The
+    // whole client falls over for the sake of a button that was never going
+    // to work, so it is refused here with a reason instead.
+    if (api::is_bot())
+    {
+        log_line("stream: бот - просмотр демонстрации недоступен, op 20 уронил бы гейтвей");
+        return false;
+    }
+
     if (g_running) stop();
     if (!channel_id || !user_id) return false;
     if (user_id == store::self_id()) return false;

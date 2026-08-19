@@ -320,6 +320,7 @@ void storage::accounts_load()
                 ccstrncpy(entry.avatar, a->str("avatar", ""), sizeof(entry.avatar) - 1);
                 entry.id = a->sf("id");
 
+                entry.is_bot = a->boolean("bot", false);
                 entry.proxy_override = a->boolean("proxy_own", false);
 
                 const jval* px = a->obj("proxy");
@@ -403,6 +404,7 @@ void storage::accounts_save()
         w.kv_str("avatar", g_accounts[i].avatar);
         w.kv_snowflake("id", g_accounts[i].id);
 
+        if (g_accounts[i].is_bot) w.kv_bool("bot", true);
         if (g_accounts[i].proxy_override) w.kv_bool("proxy_own", true);
 
         if (g_accounts[i].proxy.kind != PROXY_NONE)
@@ -445,7 +447,7 @@ const saved_account* storage::account_at(int index)
 }
 
 int storage::account_remember(const char* token, unsigned long long id,
-                              const char* name, const char* avatar)
+                              const char* name, const char* avatar, bool is_bot)
 {
     accounts_load();
     if (!token || !token[0]) return -1;
@@ -472,6 +474,7 @@ int storage::account_remember(const char* token, unsigned long long id,
     saved_account* entry = &g_accounts[found];
     ccfset(entry->token, 0, sizeof(entry->token));
     ccstrncpy(entry->token, token, sizeof(entry->token) - 1);
+    entry->is_bot = is_bot;
     if (id) entry->id = id;
     if (name && name[0])
     {

@@ -133,6 +133,13 @@ namespace science
     // per screen for: "audit_log", "bans", "roles", "invites_v2", "profile".
     void guild_settings_viewed(const char* which, snowflake guild_id);
 
+    // Handing the server to somebody else: the box opening, the code being
+    // mailed out, and the transfer itself. Three events, as the capture shows
+    // them, and the two network ones carry what came back.
+    void transfer_ownership_opened(snowflake guild_id);
+    void transfer_ownership_code_sent(snowflake guild_id, int status);
+    void transfer_ownership_done(snowflake guild_id, int status);
+
     void user_profile_viewed(snowflake user_id);
     void join_voice_channel(snowflake channel_id, snowflake guild_id);
     void call_button_clicked(snowflake channel_id);

@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <!--
     IMDiscord - built without any CRT.
@@ -296,6 +296,8 @@
     <ClCompile Include="src\audio\music.cpp" />
     <ClCompile Include="src\libs\minimp3\minimp3_impl.cpp" />
     <ClCompile Include="src\ui\ui_music.cpp" />
+    <ClCompile Include="src\ui\ui_ownership.cpp" />
+    <ClCompile Include="src\ui\ui_delete_guild.cpp" />
     <ClCompile Include="src\ui\ui_moderate.cpp" />
     <ClCompile Include="src\ui\ui_people.cpp" />
     <ClCompile Include="src\ui\ui_sidebar.cpp" />

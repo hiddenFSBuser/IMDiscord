@@ -200,6 +200,19 @@ void ui_member_moderation_menu(snowflake guild_id, snowflake user_id)
         }
     }
 
+    // Only the owner can hand the crown on. Bots are offered too: discord is
+    // widely said to refuse them, but the refusal is theirs to make and it
+    // arrives as a plain error in the box - which is more useful than a menu
+    // row that is simply not there.
+    if (g->owner_id == me)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+        bool go = ImGui::MenuItem(tr("Передать владение"));
+        ImGui::PopStyleColor();
+
+        if (go) ui_open_ownership(guild_id, user_id);
+    }
+
     if (can_ban)
     {
         ImGui::PushStyleColor(ImGuiCol_Text, col::red);

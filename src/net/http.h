@@ -54,6 +54,12 @@ namespace http
     //
     // Only names and values are kept. Expiry, domain and path would matter to
     // a general purpose client; everything here goes to one host.
+    // A bot's requests carry none of the browser's furniture: no cookies,
+    // and the user agent discord asks bots to send rather than a browser's.
+    // Sending a request signed with a bot token but dressed as a browser is
+    // what discord's edge answered with "internal network error".
+    void set_bot_mode(bool on);
+
     void cookies_header(ubuffer* out);
     void clear_cookies();
 

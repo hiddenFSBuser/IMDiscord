@@ -194,6 +194,11 @@ namespace
     volatile long g_heartbeat_ms = 0;
     volatile long g_session_ready = 0;
 
+    // The next connection is a resume of the session that just died, not a
+    // new one. Read by the hello handler, which is the only place the two
+    // differ: everything after that is identical.
+    volatile long g_resuming = 0;
+
     char g_status[192];
     char g_endpoint[256];
     char g_voice_token[256];
@@ -504,6 +509,35 @@ namespace
         // the channel actually runs encrypted is the server's answer in the
         // session description, not our request.
         w.kv_i64("max_dave_protocol_version", 1);
+        w.end_obj();
+        w.end_obj();
+
+        send_json(&w);
+        w.free_writer();
+    }
+
+    // Coming back to a session that is still ours.
+    //
+    // Everything expensive about a voice connection lives behind the session
+    // rather than behind the socket: the udp flow, the negotiated keys, the
+    // dave group and its epoch. A resume keeps all of it, so the audio picks
+    // up where it stopped instead of the channel being rejoined from nothing
+    // - which is what a dropped socket used to cost.
+    //
+    // v8 wants the sequence number of the last payload we took, the same one
+    // the heartbeat carries, so the server can replay what was missed.
+    void send_resume()
+    {
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_i64("op", VOP_RESUME);
+        w.key("d");
+        w.begin_obj();
+        w.kv_snowflake("server_id", g_guild_id ? g_guild_id : g_channel_id);
+        w.kv_str("session_id", g_voice_session);
+        w.kv_str("token", g_voice_token);
+        w.kv_i64("seq_ack", g_last_seq);
         w.end_obj();
         w.end_obj();
 
@@ -2485,14 +2519,27 @@ namespace
         {
         case VOP_HELLO:
             InterlockedExchange(&g_heartbeat_ms, (long)d->i64("heartbeat_interval", 13750));
-            send_identify();
+            if (g_resuming) send_resume();
+            else            send_identify();
             // The voice gateway expects the first beat right away; waiting a
             // full interval earns close code 4006.
             send_heartbeat_now();
             break;
 
         case VOP_READY:
+            InterlockedExchange(&g_resuming, 0);
             handle_ready(d);
+            break;
+
+        case VOP_RESUMED:
+            // No session description follows this one and none is needed:
+            // the keys never went anywhere. The socket is simply back, and
+            // the tick thread with it.
+            InterlockedExchange(&g_resuming, 0);
+            InterlockedExchange(&g_session_ready, 1);
+            log_line("voice: сессия восстановлена");
+            set_status(VOICE_CONNECTED, g_dave_active ? tr("В канале, согласование E2EE...")
+                                                      : tr("В голосовом канале"));
             break;
 
         case VOP_SESSION_DESCRIPTION:
@@ -2639,6 +2686,24 @@ namespace
         doc.free_doc();
     }
 
+    // Which reasons for a dead socket are worth coming back from.
+    //
+    // 1006 is the one that matters and the one being complained about: no
+    // close frame at all, which is what a tcp connection dropped underneath
+    // us looks like from up here - a router forgetting the mapping, a
+    // network handover, discord's edge going away. It arrives on its own
+    // schedule, anywhere from a quarter of an hour to hours in, and until
+    // now it simply ended the call where it stood.
+    //
+    // The 4000s are discord saying why, and most of them are reasons not to
+    // come back: 4006 the session is void, 4014 we were removed from the
+    // channel, 4004 the token was refused. 4015 is its own voice server
+    // falling over, which is exactly what resuming exists for.
+    bool close_worth_resuming(unsigned int code)
+    {
+        return code == 1000 || code == 1001 || code == 1006 || code == 4015;
+    }
+
     DWORD WINAPI voice_ws_thread(LPVOID)
     {
         CoInitializeEx(0, COINIT_MULTITHREADED);
@@ -2652,31 +2717,95 @@ namespace
         message.init(1 << 14);
 
         set_status(VOICE_CONNECTING, tr("Подключение к голосовому серверу..."));
+        InterlockedExchange(&g_resuming, 0);
 
+        unsigned int close_code = 0;
+        unsigned int attempt = 0;
+        unsigned int backoff = 1000;
+
+        // Sticky: whether this voice session ever authenticated at all. A
+        // resume attempt that cannot even open a socket has no session of its
+        // own, and judging by the attempt rather than by the session would end
+        // the call on the first blip - which is the case reconnecting is for.
+        bool ever_ready = false;
+
+        // Built once and reused across attempts. destroy() deletes the lock
+        // every send goes through, and the heartbeat and tick threads are
+        // still running underneath: taking the socket apart and putting it
+        // back together beneath them is a race that would surface as a crash
+        // nowhere near the reconnect that caused it. close_handles() drops
+        // the connection and keeps the object.
         g_ws.init();
-        if (g_ws.connect(url, "Origin: https://discord.com\r\n", via))
-        {
-            for (;;)
-            {
-                bool binary = false;
-                ws_result r = g_ws.receive(&message, &binary);
-                if (r != WS_MESSAGE) break;
-                if (!g_running) break;
 
-                if (binary) handle_binary_payload(message.data, message.size);
-                else handle_voice_payload((const char*)message.c_str(), message.size);
-            }
-        }
-        else
+        for (;;)
         {
-            set_status(VOICE_FAILED, tr("Голосовой сервер недоступен"));
+            bool opened = g_ws.connect(url, "Origin: https://discord.com\r\n", via);
+            if (opened)
+            {
+                for (;;)
+                {
+                    bool binary = false;
+                    ws_result r = g_ws.receive(&message, &binary);
+                    if (r != WS_MESSAGE) break;
+                    if (!g_running) break;
+
+                    if (binary) handle_binary_payload(message.data, message.size);
+                    else handle_voice_payload((const char*)message.c_str(), message.size);
+                }
+            }
+            else if (!attempt)
+            {
+                set_status(VOICE_FAILED, tr("Голосовой сервер недоступен"));
+            }
+
+            // A connection that authenticated earns the budget back: four
+            // tries is meant to cover one outage, not the whole call.
+            if (g_session_ready)
+            {
+                ever_ready = true;
+                attempt = 0;
+                backoff = 1000;
+            }
+
+            // Only when the socket actually ran: a resume attempt that could
+            // not even connect leaves close_status untouched, and the code
+            // worth reporting is still the one that started all this.
+            if (opened) close_code = g_ws.close_status;
+
+            // Nothing may beat into a socket that is going away, and the tick
+            // thread parks itself on this flag - which stops it pumping audio
+            // into a session that is not answering. VOP_RESUMED puts it back.
+            InterlockedExchange(&g_heartbeat_ms, 0);
+            InterlockedExchange(&g_session_ready, 0);
+            g_ws.close_handles();
+
+            if (!g_running) break;
+
+            // Only a session that got as far as existing can be resumed, and
+            // discord does not keep a dropped one for long - a handful of
+            // tries over the first few seconds is the whole of the window.
+            // Past that the answer is 4006, which is the teardown below,
+            // reached the slow way.
+            bool worth = ever_ready && attempt < 4 &&
+                         (!opened || close_worth_resuming(close_code));
+            if (!worth) break;
+
+            attempt++;
+            InterlockedExchange(&g_resuming, 1);
+
+            log_line("voice: сокет умер (код %u) - восстанавливаю сессию, попытка %u",
+                     close_code, attempt);
+            set_status(VOICE_CONNECTING, tr("Связь потеряна, восстанавливаю..."));
+
+            if (WaitForSingleObject(g_stop_event, backoff) == WAIT_OBJECT_0) break;
+            backoff = backoff < 8000 ? backoff * 2 : 8000;
         }
 
         // The close code is the whole answer when a connection dies during an
         // account switch. 4006 means discord invalidated the session, which is
         // its decision and cannot be argued with from here; anything else means
         // this client dropped it and that is ours to fix.
-        g_last_close = g_ws.close_status;
+        g_last_close = close_code;
 
         // 4006 says the voice session we were handed is dead. Discord's own
         // view of us, though, is that we are still sitting in the channel - so
@@ -2687,7 +2816,7 @@ namespace
         //
         // Standing up and saying we have left is what makes the next join a
         // real transition again.
-        if (g_ws.close_status == 4006)
+        if (close_code == 4006)
         {
             log_line("voice: 4006 - объявляю выход, иначе сервер считает нас всё ещё в канале");
             ccfset(g_voice_session, 0, sizeof(g_voice_session));
@@ -2698,15 +2827,16 @@ namespace
         // to hold it should not outlive it.
         gateway::release_hold();
         if (!g_stop_reason[0])
-            g_stop_reason = g_ws.close_status == 4006 ? "сервер снёс сессию"
-                                                      : "сокет закрылся";
+            g_stop_reason = close_code == 4006 ? "сервер снёс сессию"
+                                               : "сокет закрылся";
 
         log_line("voice: websocket loop ended (close code %u, state %d)%s",
-                 g_ws.close_status, (int)g_state,
-                 g_ws.close_status == 4006 ? " - сессия аннулирована сервером" : "");
+                 close_code, (int)g_state,
+                 close_code == 4006 ? " - сессия аннулирована сервером" : "");
 
         message.free_buffer();
         InterlockedExchange(&g_session_ready, 0);
+        InterlockedExchange(&g_resuming, 0);
         InterlockedExchange(&g_heartbeat_ms, 0);
         g_ws.destroy();
 

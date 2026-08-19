@@ -9,6 +9,7 @@
 #include "rtp_video.h"
 
 #include "discord/store.h"
+#include "discord/rest.h"
 #include "discord/gateway.h"
 #include "discord/voice.h"
 #include "core/log.h"
@@ -2028,6 +2029,19 @@ bool screenshare::start(int monitor_index, int max_width, int max_height, int fp
     g_self_id = store::self_id();
 
     if (g_running) return false;
+
+    // Go Live is a person's feature. The opcodes that set one up - 18 to
+    // start, 20 to watch - do not exist for a bot, and discord answers one
+    // that sends them by closing the gateway with 4001, unknown opcode. The
+    // whole client falls over for the sake of a button that was never going
+    // to work, so it is refused here with a reason instead.
+    if (api::is_bot())
+    {
+        set_status(SHARE_FAILED, tr("Бот не может вести демонстрацию"));
+        log_line("share: бот - Go Live недоступен, op 18 уронил бы гейтвей");
+        return false;
+    }
+
 
     snowflake channel = voice::current_channel();
     if (!channel)

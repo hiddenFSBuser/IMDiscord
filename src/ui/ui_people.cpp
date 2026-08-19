@@ -347,6 +347,34 @@ void ui_draw_muted_marks(ImDrawList* dl, ImVec2 at, float size,
     }
 }
 
+// The owner's crown. Three peaks over a band, which is the shape everybody
+// already reads as "this one owns the place" - a word would have to be
+// translated and would still be longer than the name it follows.
+//
+// Concave, so it cannot be one filled path: the lower block and the three
+// peaks are drawn separately and meet along y = 0.52, where the seam is
+// invisible because both halves are the same colour.
+void ui_draw_crown(ImDrawList* dl, ImVec2 at, float size)
+{
+    const ImU32 gold = IM_COL32(0xF0, 0xB1, 0x32, 255);
+
+    float x = at.x, y = at.y, s = size;
+    float mid = y + s * 0.52f;
+
+    dl->AddRectFilled(ImVec2(x, mid), ImVec2(x + s, y + s * 0.76f), gold);
+
+    dl->AddTriangleFilled(ImVec2(x, y + s * 0.14f), ImVec2(x, mid),
+                          ImVec2(x + s * 0.28f, mid), gold);
+    dl->AddTriangleFilled(ImVec2(x + s * 0.24f, mid), ImVec2(x + s * 0.5f, y + s * 0.02f),
+                          ImVec2(x + s * 0.76f, mid), gold);
+    dl->AddTriangleFilled(ImVec2(x + s, y + s * 0.14f), ImVec2(x + s, mid),
+                          ImVec2(x + s * 0.72f, mid), gold);
+
+    // The rim, a hair below the body so the gap reads as a band rather than
+    // as the crown simply being taller.
+    dl->AddRectFilled(ImVec2(x, y + s * 0.82f), ImVec2(x + s, y + s * 0.98f), gold, 1.0f);
+}
+
 namespace
 {
     // A member's place in the list: which heading they sit under, and where
@@ -452,12 +480,10 @@ static void draw_group_members(dchannel* c, float width)
                 mark_x -= 8.0f;
             }
 
+            // The same crown as on a server: a group has an owner for the same
+            // reason and it is the same thing being said.
             if (c->owner_id && u->id == c->owner_id)
-            {
-                const char* label = tr("владелец");
-                float w = ImGui::CalcTextSize(label).x;
-                d->AddText(ImVec2(mark_x - w, start.y + 9.0f), col::text_muted, label);
-            }
+                ui_draw_crown(d, ImVec2(mark_x - 13.0f, start.y + 11.0f), 13.0f);
 
             ImGui::SetCursorScreenPos(ImVec2(start.x, start.y + 34.0f));
             ImGui::PopID();
@@ -651,6 +677,8 @@ void ui_view_members(float width, float height)
 
         // Whoever is in a voice channel and cannot speak or cannot hear says
         // so here, the same as in the channel list.
+        float right_edge = start.x + row_w;
+
         const dvoice_state* vs = store::find_voice_state(u->id);
         if (vs && vs->channel_id)
         {
@@ -661,7 +689,21 @@ void ui_view_members(float width, float height)
                 float marks = (mic_off && ears_off) ? 34.0f : 16.0f;
                 ui_draw_muted_marks(rows, ImVec2(start.x + row_w - marks, start.y + 10.0f),
                                     14.0f, mic_off, ears_off);
+                right_edge -= marks + 4.0f;
             }
+        }
+
+        // Next to the name rather than off at the edge of the row: it says
+        // something about this person, and at the edge it would read as
+        // another status mark like the two above. A long name pushes it left
+        // instead of letting it slide under the mute marks.
+        if (g->owner_id && u->id == g->owner_id)
+        {
+            float crown = 13.0f;
+            float x = start.x + 38.0f + ImGui::CalcTextSize(slot->name).x + 6.0f;
+            if (x + crown > right_edge) x = right_edge - crown;
+            if (x > start.x + 38.0f)
+                ui_draw_crown(rows, ImVec2(x, start.y + 11.0f), crown);
         }
 
         ImGui::SetCursorScreenPos(ImVec2(start.x, start.y + 34.0f));

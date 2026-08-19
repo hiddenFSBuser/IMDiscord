@@ -42,6 +42,7 @@ namespace
     struct login_job
     {
         char token[512];
+        bool is_bot;
     };
 
     // Set for test logins so a throwaway account does not overwrite the token
@@ -55,7 +56,7 @@ namespace
         char error[256];
         error[0] = 0;
 
-        if (api::verify_token(j->token, error, sizeof(error)))
+        if (api::verify_token(j->token, j->is_bot, error, sizeof(error)))
         {
             if (!g_ephemeral_login)
             {
@@ -80,7 +81,7 @@ namespace
                     }
                 }
 
-                int slot = storage::account_remember(j->token, id, name, avatar);
+                int slot = storage::account_remember(j->token, id, name, avatar, j->is_bot);
                 storage::set_active_account(slot);
 
                 // The route was already chosen and already used to make this
@@ -139,7 +140,7 @@ namespace
         http::set_proxy(&cfg);
     }
 
-    void begin_login(const char* token)
+    void begin_login(const char* token, bool is_bot)
     {
         if (g_ui.login_busy) return;
         if (!token || !token[0]) return;
@@ -161,6 +162,11 @@ namespace
         if (!j) return;
         ccfset(j, 0, sizeof(login_job));
         ccstrncpy(j->token, token, sizeof(j->token) - 1);
+        j->is_bot = is_bot;
+
+        // Everything from the very first request onwards is signed the way
+        // this kind of token has to be signed.
+        api::set_token(token, is_bot);
 
         InterlockedExchange(&g_ui.login_busy, 1);
         ccfset(g_ui.login_error, 0, sizeof(g_ui.login_error));
@@ -249,6 +255,7 @@ namespace
         char token[256];
         ccstrncpy(token, entry->token, sizeof(token) - 1);
         token[sizeof(token) - 1] = 0;
+        bool bot = entry->is_bot;
 
         // The voice session stays up: the whole point of switching accounts
         // mid-conversation is not to have to leave it.
@@ -256,7 +263,7 @@ namespace
         storage::set_active_account(index);
         apply_active_proxy();
 
-        begin_login(token);
+        begin_login(token, bot);
         ccfset(token, 0, sizeof(token));
     }
 
@@ -1493,6 +1500,15 @@ void ui_view_accounts_popup()
             }
         }
 
+    // Which kind of token this is. The two look alike, and the difference
+    // decides the prefix on every request and the shape of the identify - so
+    // it is asked once here rather than discovered by failing.
+    ImGui::Checkbox(tr("Токен бота"), &g_ui.login_is_bot);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(tr("Бот не может добавлять в друзья и заходить по ссылке - "
+                             "его добавляют через OAuth2. Телеметрия ему не шлётся."));
+        ImGui::Dummy(ImVec2(0, 4));
+
         bool go = ImGui::Button(tr("Войти"), ImVec2(120, 0));
         ImGui::SameLine();
         if (ImGui::Button(tr("Отмена"), ImVec2(120, 0)))
@@ -1511,6 +1527,7 @@ void ui_view_accounts_popup()
             ccfset(g_ui.token_input, 0, sizeof(g_ui.token_input));
 
             g_ui.adding_account = false;
+            g_ui.pending_is_bot = g_ui.login_is_bot;
             ccstrncpy(g_ui.pending_token, token, sizeof(g_ui.pending_token) - 1);
             ccfset(token, 0, sizeof(token));
 
@@ -1638,6 +1655,16 @@ void ui_view_login()
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip(tr("Вырезание и копирование работают только в открытом виде"));
 
+    ImGui::Dummy(ImVec2(0, 6));
+
+    // Which kind of token this is. The two look alike, and the difference
+    // decides the prefix on every request and the shape of the identify - so
+    // it is asked once here rather than discovered by failing.
+    ImGui::Checkbox(tr("Токен бота"), &g_ui.login_is_bot);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(tr("Бот не может добавлять в друзья и заходить по ссылке - "
+                             "его добавляют через OAuth2. Телеметрия ему не шлётся."));
+
     ImGui::Dummy(ImVec2(0, 8));
 
     if (g_ui.login_busy)
@@ -1647,7 +1674,7 @@ void ui_view_login()
     else
     {
         if (ImGui::Button(tr("Войти"), ImVec2(140, 34)) || submitted)
-            begin_login(g_ui.token_input);
+            begin_login(g_ui.token_input, g_ui.login_is_bot);
     }
 
     // Always offered, including while an attempt is still spinning. A server
@@ -1816,7 +1843,7 @@ void ui_init()
         {
             g_ephemeral_login = true;
             log_line("ui: test login from the environment");
-            begin_login(token);
+            begin_login(token, false);
             ccfset(token, 0, sizeof(token));
             return;
         }
@@ -1833,7 +1860,7 @@ void ui_init()
         log_line("ui: signing in as the last used account");
         char token[256];
         ccstrncpy(token, entry->token, sizeof(token) - 1);
-        begin_login(token);
+        begin_login(token, entry->is_bot);
         ccfset(token, 0, sizeof(token));
     }
 }
@@ -1894,8 +1921,11 @@ void ui_frame()
         ccstrncpy(token, g_ui.pending_token, sizeof(token) - 1);
         ccfset(g_ui.pending_token, 0, sizeof(g_ui.pending_token));
 
+        bool bot = g_ui.pending_is_bot;
+        g_ui.pending_is_bot = false;
+
         tear_down_session();
-        begin_login(token);
+        begin_login(token, bot);
         ccfset(token, 0, sizeof(token));
     }
 
@@ -2052,6 +2082,8 @@ void ui_frame()
     ui_view_privacy_popup();
     ui_view_audit_popup();
     ui_view_music_popup();
+    ui_view_ownership_popup();
+    ui_view_delete_guild_popup();
     ui_view_guild_edit_popup();
     ui_view_channel_info_popup();
     ui_view_share_popup();

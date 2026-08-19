@@ -316,7 +316,18 @@ void ui_view_guild_rail(float width, float height)
             ImGui::Separator();
             ui_copy_id_item(g->id, tr("Скопировать ID сервера"));
             ImGui::Separator();
-            if (ImGui::MenuItem(tr("Покинуть сервер")))
+            // The owner cannot leave - discord refuses while the crown is
+            // theirs - so they get the other way out instead. It asks for the
+            // server's name before it does anything.
+            if (g->owner_id && g->owner_id == store::self_id())
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+                bool go = ImGui::MenuItem(tr("Удалить сервер"));
+                ImGui::PopStyleColor();
+
+                if (go) ui_open_delete_guild(g->id);
+            }
+            else if (ImGui::MenuItem(tr("Покинуть сервер")))
             {
                 api::leave_guild(g->id);
                 if (g_ui.active_guild == g->id) { g_ui.active_guild = 0; g_ui.active_channel = 0; }
@@ -1891,6 +1902,15 @@ void ui_view_settings_popup()
         // the person. The middle setting is that line.
         int mode = (int)science::mode();
 
+        // A bot sends none of it whatever this says, so the control says so
+        // rather than sitting there offering a choice that does nothing.
+        if (api::is_bot())
+        {
+            ui_text_muted(tr("Режим бота: телеметрия не отправляется"));
+        }
+        else
+        {
+
         ImGui::SetNextItemWidth(240);
         if (ImGui::BeginCombo(tr("Телеметрия Discord"), science::mode_name((science_mode)mode)))
         {
@@ -1903,6 +1923,8 @@ void ui_view_settings_popup()
         ImGui::PushTextWrapPos(0.0f);
         ui_text_muted(science::mode_note((science_mode)mode));
         ImGui::PopTextWrapPos();
+
+        }
     }
 
     if (ImGui::Button(tr("Настроить приватность"), ImVec2(220, 28))) ui_open_privacy();

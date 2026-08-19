@@ -29,6 +29,9 @@ namespace
     char g_heartbeat_session[40];
     char g_installation_id[96];
 
+    // Whether the token above belongs to a bot application.
+    bool g_token_is_bot = false;
+
     // 8-4-4-4-12 hex, which is the shape these fields take. Random rather than
     // derived from anything: they identify a run, not a machine.
     void make_guid(char* out, int cap)
@@ -166,6 +169,9 @@ namespace
         if (auth[0])
         {
             out->append_str("Authorization: ");
+            // Bot tokens are prefixed; a user token sent with the prefix is
+            // refused, and so is a bot token sent without it.
+            if (g_token_is_bot) out->append_str("Bot ");
             out->append_str(auth);
             out->append_str("\r\n");
         }
@@ -175,6 +181,13 @@ namespace
             out->append_str(content_type);
             out->append_str("\r\n");
         }
+
+        // Everything below this line describes a person at a browser: which
+        // build they run, where they clicked, what their locale is. A bot has
+        // none of it, and sending it anyway is not merely untrue - discord's
+        // edge refuses the request, which is what "internal network error" on
+        // every message and every history load turned out to be.
+        if (g_token_is_bot) return;
         if (location && location[0])
         {
             // Either a bare place name, which is the common case, or a whole
@@ -215,6 +228,49 @@ namespace
     }
 
     // Pulls the human readable part out of a discord error body.
+    // "Invalid Form Body" is the whole of what the top of a 50035 says. Which
+    // field discord disliked, and why, sits one or more levels down under
+    // "errors", keyed by the field name, with the reason in an "_errors"
+    // array. Reporting only the top line leaves nothing to act on - it is the
+    // same sentence whether the code was mistyped or the account cannot be
+    // handed a server at all.
+    //
+    // Walks to the first "_errors" it finds and builds the dotted path on the
+    // way, so the report names the field.
+    bool first_form_error(const jval* node, char* path, int path_cap, const char** msg)
+    {
+        if (!node || node->type != JTYPE_OBJ) return false;
+
+        const jval* list = node->arr("_errors");
+        if (list->size())
+        {
+            const jval* first = list->at(0);
+            const char* m = first ? first->str("message", 0) : 0;
+            if (m) { *msg = m; return true; }
+        }
+
+        int used = 0;
+        while (path[used]) used++;
+
+        for (unsigned int i = 0; i < node->size(); i++)
+        {
+            const jmember* mem = node->member_at(i);
+            if (!mem || !mem->key || !mem->value) continue;
+
+            int at = used;
+            if (at && at < path_cap - 1) path[at++] = '.';
+            for (unsigned int k = 0; k < mem->key_len && at < path_cap - 1; k++)
+                path[at++] = mem->key[k];
+            path[at] = 0;
+
+            if (first_form_error(mem->value, path, path_cap, msg)) return true;
+
+            path[used] = 0;
+        }
+
+        return false;
+    }
+
     void record_api_error(const char* what, http_response* res)
     {
         // Two answers mean more than the request that got them. Nothing at all
@@ -253,7 +309,15 @@ namespace
         }
         else if (detail)
         {
-            cnprint(text, sizeof(text), "%s: %s", what, detail);
+            char field[128];
+            field[0] = 0;
+
+            const char* deep = 0;
+            if (doc.root && first_form_error(doc.root->obj("errors"), field,
+                                             sizeof(field), &deep))
+                cnprint(text, sizeof(text), "%s: %s - %s: %s", what, detail, field, deep);
+            else
+                cnprint(text, sizeof(text), "%s: %s", what, detail);
         }
         else if (res->body.size)
         {
@@ -291,14 +355,18 @@ void api::shutdown()
     g_ready = false;
 }
 
-void api::set_token(const char* t)
+void api::set_token(const char* t, bool bot)
 {
     ccfset(g_token, 0, sizeof(g_token));
     if (t) ccstrncpy(g_token, t, sizeof(g_token) - 1);
+
+    g_token_is_bot = bot;
+    http::set_bot_mode(bot);
 }
 
 const char* api::token() { return g_token; }
 bool api::has_token() { return g_token[0] != 0; }
+bool api::is_bot() { return g_token_is_bot; }
 
 void api::set_last_error(const char* text)
 {
@@ -375,12 +443,14 @@ bool api::call_as(const char* method, const char* path, const char* json_body,
     return ok;
 }
 
-bool api::verify_token(const char* token_value, char* out_error, int error_cap)
+bool api::verify_token(const char* token_value, bool is_bot, char* out_error, int error_cap)
 {
     char saved[512];
     ccstrncpy(saved, g_token, sizeof(saved) - 1);
     saved[sizeof(saved) - 1] = 0;
-    set_token(token_value);
+
+    bool saved_bot = g_token_is_bot;
+    set_token(token_value, is_bot);
 
     http_response res;
     res.init();
@@ -418,7 +488,7 @@ bool api::verify_token(const char* token_value, char* out_error, int error_cap)
     }
 
     res.free_response();
-    if (!ok) set_token(saved);
+    if (!ok) set_token(saved, saved_bot);
     ccfset(saved, 0, sizeof(saved));
     return ok;
 }
@@ -1442,6 +1512,108 @@ namespace
         if (ok) api::fetch_bans(guild_id);
     }
 
+    // ---- handing the server over -----------------------------------------
+
+    volatile long g_ownership_code_sent = 0;
+
+    // When it was mailed. The pincode does not last, and discord answers an
+    // expired one with the same "incorrect code" it gives a mistyped one, so
+    // the only way anybody can tell the two apart is by being told how old
+    // the code in front of them is. Written and read as one aligned 64-bit
+    // value, which needs no lock on the only platform this builds for.
+    volatile unsigned long long g_ownership_code_at = 0;
+
+    struct job_transfer
+    {
+        snowflake guild_id;
+        snowflake user_id;
+        char code[32];
+    };
+
+    void job_ownership_code(void* user)
+    {
+        job_transfer* j = (job_transfer*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/pincode", j->guild_id);
+
+        // No body at all. Discord answers 204 and puts a six digit code in the
+        // owner's mail; nothing about it comes back over the wire.
+        http_response res;
+        res.init();
+
+        bool ok = api::call("PUT", path, 0, &res) && res.ok();
+        if (ok)
+        {
+            g_ownership_code_at = unix_now_ms();
+            InterlockedExchange(&g_ownership_code_sent, 1);
+        }
+        else    record_api_error(tr("Код не отправлен"), &res);
+
+        // Logged because each one invalidates the code before it: two of these
+        // close together explain an "incorrect code" that is nobody's typo.
+        log_line("ownership: PUT /guilds/%llu/pincode -> %d", j->guild_id, res.status);
+
+        science::transfer_ownership_code_sent(j->guild_id, res.status);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_transfer_ownership(void* user)
+    {
+        job_transfer* j = (job_transfer*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_snowflake("owner_id", j->user_id);
+        w.kv_str("code", j->code);
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu", j->guild_id);
+
+        http_response res;
+        res.init();
+
+        if (api::call("PATCH", path, w.buf.c_str(), &res) && res.ok())
+        {
+            InterlockedExchange(&g_ownership_code_sent, 0);
+            api::set_last_error(tr("Сервер передан"));
+        }
+        else
+        {
+            record_api_error(tr("Не удалось передать сервер"), &res);
+        }
+
+        science::transfer_ownership_done(j->guild_id, res.status);
+
+        // The code itself stays out of the log - it is single use and there is
+        // nothing to learn from its value that its length does not say. What is
+        // worth keeping is discord's answer: a refusal here says only "Invalid
+        // Form Body" on screen unless the nested part came through.
+        log_line("ownership: PATCH /guilds/%llu owner=%llu code=%d симв -> %d %.300s",
+                 j->guild_id, j->user_id, (int)ccslenf(j->code), res.status,
+                 res.body.size ? res.text() : "");
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    job_transfer* make_transfer(snowflake guild_id, snowflake user_id, const char* code)
+    {
+        job_transfer* j = (job_transfer*)memalloc(sizeof(job_transfer));
+        if (!j) return 0;
+
+        ccfset(j, 0, sizeof(*j));
+        j->guild_id = guild_id;
+        j->user_id = user_id;
+        if (code) ccstrncpy(j->code, code, sizeof(j->code) - 1);
+        return j;
+    }
+
     // ---- moderation ------------------------------------------------------
     //
     // Kicking somebody out of voice, silencing them for the whole server and
@@ -2027,6 +2199,34 @@ namespace
         else
         {
             record_api_error(tr("Не удалось покинуть сервер"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_delete_guild(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/delete", j->a);
+
+        // POST with no body at all, and nothing comes back but a 204. Notably
+        // there is no science event for this one - the real client sends none,
+        // and inventing one would be the only packet here that discord has
+        // never seen.
+        http_response res;
+        res.init();
+
+        if (api::call("POST", path, 0, &res) && res.ok())
+        {
+            store::guard g;
+            store::remove_guild(j->a);
+        }
+        else
+        {
+            record_api_error(tr("Не удалось удалить сервер"), &res);
         }
 
         res.free_response();
@@ -2790,6 +2990,34 @@ int api::bans(ban_row* out, int cap)
 bool api::bans_loading() { return g_bans_busy != 0; }
 bool api::bans_forbidden() { return g_bans_denied != 0; }
 
+void api::request_ownership_code(snowflake guild_id)
+{
+    job_transfer* j = make_transfer(guild_id, 0, 0);
+    if (j) jobs::post(job_ownership_code, j);
+}
+
+void api::transfer_ownership(snowflake guild_id, snowflake user_id, const char* code)
+{
+    job_transfer* j = make_transfer(guild_id, user_id, code);
+    if (j) jobs::post(job_transfer_ownership, j);
+}
+
+bool api::ownership_code_sent() { return g_ownership_code_sent != 0; }
+
+unsigned long long api::ownership_code_age_ms()
+{
+    unsigned long long at = g_ownership_code_at;
+    if (!at) return 0;
+
+    unsigned long long now = unix_now_ms();
+    return now > at ? now - at : 0;
+}
+void api::clear_ownership_state()
+{
+    g_ownership_code_at = 0;
+    InterlockedExchange(&g_ownership_code_sent, 0);
+}
+
 void api::unban(snowflake guild_id, snowflake user_id)
 {
     job_ids* j = make_ids(guild_id, user_id);
@@ -3175,6 +3403,12 @@ void api::edit_role(snowflake guild_id, snowflake role_id, const char* name,
     if (name) ccstrncpy(j->name, name, sizeof(j->name) - 1);
 
     jobs::post(job_edit_role, j);
+}
+
+void api::delete_guild(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_delete_guild, j);
 }
 
 void api::leave_guild(snowflake guild_id)

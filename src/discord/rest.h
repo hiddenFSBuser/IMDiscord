@@ -31,9 +31,15 @@ namespace api
     void init();
     void shutdown();
 
-    void set_token(const char* token);
+    // A bot token is a different kind of credential, not just a different
+    // string: it is sent with a "Bot " prefix, it identifies with intents
+    // rather than with a browser's properties, and none of the analytics
+    // belongs to it. Which one this is has to be known before the first
+    // request, so it is chosen at sign-in rather than discovered.
+    void set_token(const char* token, bool bot = false);
     const char* token();
     bool has_token();
+    bool is_bot();
 
     // ---- raw, blocking; call from a job thread ----
     // location fills X-Context-Properties, which discord requires on the
@@ -51,7 +57,7 @@ namespace api
                  http_response* out, const char* auth_token);
 
     // ---- blocking, used by the login flow ----
-    bool verify_token(const char* token_value, char* out_error, int error_cap);
+    bool verify_token(const char* token_value, bool is_bot, char* out_error, int error_cap);
 
     // ---- async ----
     void fetch_messages(snowflake channel_id, snowflake before_id);
@@ -113,6 +119,8 @@ namespace api
     void block_user(snowflake user_id);
     void join_guild_by_invite(const char* invite_code);
     void leave_guild(snowflake guild_id);
+    // Owner only, and gone for good: discord keeps no copy to restore from.
+    void delete_guild(snowflake guild_id);
 
     // ---- links other people use ------------------------------------------
     //
@@ -199,6 +207,22 @@ namespace api
     bool bans_forbidden();
 
     void unban(snowflake guild_id, snowflake user_id);
+
+    // ---- handing the server over ------------------------------------------
+    //
+    // Two steps, and the second cannot be reached without the first: discord
+    // mails a six digit code to the owner's address and will not move the
+    // crown without it. Nothing here can read that mail, so the code is typed
+    // in by the person - which is the point of it.
+    void request_ownership_code(snowflake guild_id);
+    void transfer_ownership(snowflake guild_id, snowflake user_id, const char* code);
+
+    // Whether the code has been asked for on this guild, so the box can say
+    // what to do next rather than showing both steps at once.
+    bool ownership_code_sent();
+    // How long ago it was mailed, or 0 if none has been.
+    unsigned long long ownership_code_age_ms();
+    void clear_ownership_state();
 
     // ---- moderation ----
     //

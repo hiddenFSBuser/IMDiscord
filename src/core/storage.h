@@ -11,6 +11,12 @@
 struct saved_account
 {
     char token[256];
+
+    // A bot's token, signed in with the checkbox on the login screen. It has
+    // to be remembered: the prefix on the authorization header and the shape
+    // of the identify both depend on it, and both happen before anything has
+    // been fetched that could reveal it.
+    bool is_bot;
     char name[64];
     char avatar[64];          // hash, may be empty
     unsigned long long id;
@@ -48,7 +54,7 @@ namespace storage
     // Matches on user id, or on the token itself while the id is unknown.
     // Returns the index it ended up at, or -1.
     int account_remember(const char* token, unsigned long long id,
-                         const char* name, const char* avatar);
+                         const char* name, const char* avatar, bool is_bot = false);
     void account_forget(int index);
 
     // Which entry is signed in. -1 when none is.

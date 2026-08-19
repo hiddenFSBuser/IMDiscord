@@ -65,6 +65,19 @@ struct ui_state
     // The music player.
     bool open_music_popup;
 
+    // Handing a server to somebody else: which server, to whom, and the code
+    // discord mailed out.
+    snowflake ownership_guild;
+    snowflake ownership_user;
+    bool open_ownership_popup;
+    char ownership_code[32];
+
+    // Deleting a server: which one, and what the person has typed so far into
+    // the box that asks for its name back.
+    snowflake delete_guild_id;
+    bool open_delete_guild_popup;
+    char delete_guild_typed[128];
+
     // imgui refuses to cut or copy from a password field, so the token input
     // can be switched to plain text on demand.
     bool token_visible;
@@ -86,6 +99,13 @@ struct ui_state
     // A token typed into the switcher, signed in with on the next frame for
     // the same reason.
     char pending_token[512];
+
+    // Whether the token typed on the login screen, or the one waiting in
+    // pending_token, belongs to a bot. Chosen with a checkbox rather than
+    // guessed: the two kinds of token look alike, and trying one and then the
+    // other would mean a failed sign-in on every second attempt.
+    bool login_is_bot;
+    bool pending_is_bot;
     // The switcher grows a token field only once "add an account" is pressed,
     // so the common case is a plain list.
     bool adding_account;
@@ -263,6 +283,10 @@ void ui_open_privacy();
 void ui_view_audit_popup();
 void ui_view_music_popup();
 void ui_open_music();
+void ui_view_ownership_popup();
+void ui_open_ownership(snowflake guild_id, snowflake user_id);
+void ui_view_delete_guild_popup();
+void ui_open_delete_guild(snowflake guild_id);
 void ui_open_audit(snowflake guild_id);
 void ui_view_guild_edit_popup();
 void ui_open_guild_edit(snowflake guild_id);
@@ -306,6 +330,8 @@ void ui_set_share_audio(bool on);
 // Crossed-out microphone and headset, drawn at `at` in a box `size` across.
 void ui_draw_muted_marks(ImDrawList* dl, ImVec2 at, float size,
                          bool mic_off, bool ears_off);
+// The owner's crown, drawn at `at` in a box `size` across.
+void ui_draw_crown(ImDrawList* dl, ImVec2 at, float size);
 // The bottom panel grows by a row while a voice session is up.
 const float USER_ROW_HEIGHT = 58.0f;
 const float VOICE_ROW_HEIGHT = 46.0f;

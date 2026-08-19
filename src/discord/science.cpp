@@ -314,6 +314,16 @@ bool science::ready() { return g_token[0] != 0; }
 
 science_mode science::mode()
 {
+    // A bot sends none of this, whatever the setting says.
+    //
+    // Analytics is here for one reason: a person's client that never reports
+    // anything looks unlike every other client on the account, and discord
+    // answers that with captchas. A bot is not pretending to be a person and
+    // is never asked for one, so the whole mechanism is noise - and reporting
+    // a bot's activity as though somebody were sitting there watching would
+    // be a lie told for no purpose.
+    if (api::is_bot()) return SCIENCE_OFF;
+
     if (g_mode < 0) g_mode = storage::settings_get_int("science_mode", SCIENCE_MINIMAL);
     if (g_mode < SCIENCE_OFF || g_mode > SCIENCE_ALL) g_mode = SCIENCE_MINIMAL;
     return (science_mode)g_mode;
@@ -780,6 +790,56 @@ void science::guild_settings_viewed(const char* which, snowflake guild_id)
     common(&p);
     if (guild_id) p.kv_snowflake("guild_id", guild_id);
     emit(type, TIER_ACTION, &p);
+}
+
+void science::transfer_ownership_opened(snowflake guild_id)
+{
+    if ((int)science::mode() < (int)TIER_ACTION) return;
+
+    jwriter p;
+    p.init();
+    common(&p);
+    p.kv_str("impression_type", "modal");
+    if (guild_id) p.kv_snowflake("guild_id", guild_id);
+    p.kv_str("location_section", "impression_guild_transfer_ownership");
+    emit("impression_guild_transfer_ownership", TIER_ACTION, &p);
+}
+
+void science::transfer_ownership_code_sent(snowflake guild_id, int status)
+{
+    if ((int)science::mode() < (int)TIER_ACTION) return;
+
+    char url[96];
+    cnprint(url, sizeof(url), "/guilds/%llu/pincode", guild_id);
+
+    jwriter p;
+    p.init();
+    common(&p);
+    p.kv_i64("status_code", status);
+    p.kv_str("url", url);
+    p.kv_str("request_method", "put");
+    if (guild_id) p.kv_snowflake("guild_id", guild_id);
+    p.kv_bool("is_resend", false);
+    p.kv_str("location_section", "impression_guild_settings_members");
+    emit("network_action_guild_transfer_ownership_send_code", TIER_ACTION, &p);
+}
+
+void science::transfer_ownership_done(snowflake guild_id, int status)
+{
+    if ((int)science::mode() < (int)TIER_ACTION) return;
+
+    char url[96];
+    cnprint(url, sizeof(url), "/guilds/%llu", guild_id);
+
+    jwriter p;
+    p.init();
+    common(&p);
+    p.kv_i64("status_code", status);
+    p.kv_str("url", url);
+    p.kv_str("request_method", "patch");
+    if (guild_id) p.kv_snowflake("guild_id", guild_id);
+    p.kv_str("verification_type", "email");
+    emit("network_action_guild_transfer_ownership", TIER_ACTION, &p);
 }
 
 void science::user_profile_viewed(snowflake user_id)

@@ -87,6 +87,27 @@ void ui_view_guild_edit_popup()
         ImGui::PopStyleColor();
     }
 
+    // Well away from the two buttons above, and only for the owner. It does
+    // not delete anything by itself - it hands over to the box that asks for
+    // the server's name first.
+    if (g->owner_id && g->owner_id == store::self_id())
+    {
+        ImGui::Dummy(ImVec2(0, 16));
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, 6));
+
+        ImGui::PushStyleColor(ImGuiCol_Button, col::red);
+        bool go = ImGui::Button(tr("Удалить сервер"), ImVec2(200, 30));
+        ImGui::PopStyleColor();
+
+        if (go)
+        {
+            snowflake id = g->id;
+            ImGui::CloseCurrentPopup();
+            ui_open_delete_guild(id);
+        }
+    }
+
     ImGui::Separator();
     if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30)) || ImGui::IsKeyPressed(ImGuiKey_Escape, false))
     {

@@ -52,6 +52,8 @@ namespace
     bool g_ready = false;
 
     char g_agent[256] = { 0 };
+    char g_agent_user[256] = { 0 };
+    bool g_bot_mode = false;
     proxy_config g_proxy;
 
     // Guarded by g_lock. A request holds a connection out of the table while
@@ -473,6 +475,9 @@ bool http::request(const char* method, const char* url, const char* headers_utf8
         head.append_str("Accept-Encoding: identity\r\n");
         head.append_str("Connection: keep-alive\r\n");
 
+        // Cookies are a browser's business. A bot has no session to carry and
+        // discord does not expect one from it.
+        if (!g_bot_mode)
         {
             ubuffer jar;
             jar.init(1024);
@@ -761,4 +766,26 @@ void http::clear_cookies()
     cookie_lock();
     g_cookie_count = 0;
     cookie_unlock();
+}
+
+void http::set_bot_mode(bool on)
+{
+    if (on == g_bot_mode) return;
+    g_bot_mode = on;
+
+    if (on)
+    {
+        // Keep whatever was set for the person's client so signing back out
+        // of a bot restores it rather than leaving the bot's name behind.
+        if (!g_agent_user[0]) ccstrncpy(g_agent_user, g_agent, sizeof(g_agent_user) - 1);
+
+        // The shape discord's documentation asks bots for.
+        ccstrncpy(g_agent, "DiscordBot (https://github.com/hiddenFSBuser/IMDiscord, 1.0)",
+                  sizeof(g_agent) - 1);
+        http::clear_cookies();
+    }
+    else if (g_agent_user[0])
+    {
+        ccstrncpy(g_agent, g_agent_user, sizeof(g_agent) - 1);
+    }
 }
