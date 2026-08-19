@@ -47,6 +47,17 @@ namespace
         unsigned long long next_frame_ms;
         unsigned long long used_frame;
         unsigned long long used_ms;    // wall clock, for unloading
+
+        // Who this picture belongs to, and since when nobody here is them.
+        //
+        // Pictures fetched under one account are of no use to another, and
+        // there is no reason for somebody else's friends to sit in this
+        // machine's memory for the twenty minutes the ordinary rule allows.
+        // Signing back in makes owner match again, which is what stops and
+        // resets the clock - it needs no announcement from the switcher and
+        // cannot be left running by one.
+        snowflake owner;
+        unsigned long long foreign_since;
         unsigned int frames_shown;     // since the last rewind
         // What the decoder was counted as when it was added to the memory
         // total. Its own footprint moves across a rewind, so the number that
@@ -73,6 +84,13 @@ namespace
     // its decoder. The bytes on disk stay, so coming back to it is a local read
     // instead of a download.
     const unsigned long long UNLOAD_AFTER_MS = 20ULL * 60ULL * 1000ULL;
+
+    // And the shorter one, for pictures whose account is no longer the one
+    // signed in. Both clocks run at once and either can be the one that
+    // expires: a picture the current account has not looked at in twenty
+    // minutes goes, and so does one belonging to an account left five
+    // minutes ago, however recently it was on screen before the switch.
+    const unsigned long long FOREIGN_UNLOAD_AFTER_MS = 5ULL * 60ULL * 1000ULL;
 
     // The sweep walks every entry, so it runs on a timer rather than per frame.
     const unsigned long long COLLECT_EVERY_MS = 30ULL * 1000ULL;
@@ -619,6 +637,11 @@ const texture* tex::get(const char* url)
             e->used_frame = g_frame_counter;
             e->used_ms = GetTickCount64();
 
+            // Whoever is looking at it now owns it. Two accounts sharing an
+            // avatar is the ordinary case, and the one on screen is the one
+            // whose clock should apply.
+            e->owner = store::self_id();
+
             // Unloaded a while ago and wanted again: reload it. The bytes are
             // normally still on disk, so this does not go out to the network.
             if (e->tex.state == TEX_EMPTY)
@@ -645,6 +668,7 @@ const texture* tex::get(const char* url)
     e->tex.state = TEX_LOADING;
     e->used_frame = g_frame_counter;
     e->used_ms = GetTickCount64();
+    e->owner = store::self_id();
     ccstrncpy(e->url, url, sizeof(e->url) - 1);
     g_entries.push(e);
     LeaveCriticalSection(&g_lock);
@@ -728,7 +752,14 @@ void tex::collect()
     g_last_collect_ms = now;
 
     int dropped = 0;
+    int dropped_foreign = 0;
     long before = g_memory;
+
+    // Zero while an account switch is in flight: the store has been thrown
+    // away and the next one has not arrived. Everything would look foreign
+    // for that moment, so the account rule sits out until somebody is
+    // actually signed in.
+    snowflake me = store::self_id();
 
     EnterCriticalSection(&g_lock);
 
@@ -739,17 +770,38 @@ void tex::collect()
         // Only a finished entry can be let go. One still loading is being
         // written by a worker thread, and one that failed holds nothing.
         if (e->tex.state != TEX_READY) continue;
-        if (now - e->used_ms < UNLOAD_AFTER_MS) continue;
+
+        // Started when the account behind this picture stopped being the
+        // one signed in, cleared the moment it is again - which is the whole
+        // of "reset and pause when they come back".
+        if (me && e->owner && e->owner != me)
+        {
+            if (!e->foreign_since) e->foreign_since = now;
+        }
+        else
+        {
+            e->foreign_since = 0;
+        }
+
+        bool unseen = now - e->used_ms >= UNLOAD_AFTER_MS;
+        bool orphaned = e->foreign_since &&
+                        now - e->foreign_since >= FOREIGN_UNLOAD_AFTER_MS;
+
+        if (!unseen && !orphaned) continue;
 
         release_payload(e);
-        dropped++;
+        if (orphaned) dropped_foreign++;
+        else          dropped++;
     }
 
     LeaveCriticalSection(&g_lock);
 
-    if (dropped)
-        log_line("tex: unloaded %d images not seen for %llu min, freeing %ld KB",
-                 dropped, UNLOAD_AFTER_MS / 60000, (before - g_memory) / 1024);
+    if (dropped || dropped_foreign)
+        log_line("tex: unloaded %d images not seen for %llu min and %d left by "
+                 "another account %llu min ago, freeing %ld KB",
+                 dropped, UNLOAD_AFTER_MS / 60000,
+                 dropped_foreign, FOREIGN_UNLOAD_AFTER_MS / 60000,
+                 (before - g_memory) / 1024);
 }
 
 bool tex::fetch_blob(const char* url, ubuffer* out)

@@ -21,7 +21,11 @@ namespace gateway
     const char* session_id();
 
     // Raw op payload, already serialized. Used by the voice layer for op 4.
+    // Sends on the connection the call belongs to, which after an account
+    // switch is not the one in front.
     bool send_raw(const void* json, unsigned int len);
+    // Whose session that is, or 0 if it never got as far as READY.
+    snowflake call_owner_id();
 
     void update_voice_state(snowflake guild_id, snowflake channel_id, bool self_mute, bool self_deaf);
 

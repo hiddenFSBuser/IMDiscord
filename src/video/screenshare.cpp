@@ -2046,7 +2046,20 @@ bool screenshare::start(int monitor_index, int max_width, int max_height, int fp
     snowflake channel = voice::current_channel();
     if (!channel)
     {
-        set_status(SHARE_FAILED, "Сначала надо зайти в голосовой канал");
+        set_status(SHARE_FAILED, tr("Сначала надо зайти в голосовой канал"));
+        return false;
+    }
+
+    // The call can belong to an account that is no longer the one signed in:
+    // switching accounts keeps the old session alive precisely so the call
+    // survives it. A stream is built around who is streaming, so one started
+    // from here would carry this account's id into that account's session and
+    // be refused - with no explanation reaching the person who pressed it.
+    snowflake owner = gateway::call_owner_id();
+    if (owner && owner != g_self_id)
+    {
+        set_status(SHARE_FAILED, tr("Звонок идёт под другим аккаунтом"));
+        log_line("share: звонок принадлежит %llu, а вошли как %llu", owner, g_self_id);
         return false;
     }
 

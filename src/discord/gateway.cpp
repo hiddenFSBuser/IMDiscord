@@ -67,6 +67,18 @@ namespace
         // invalid session and a full identify - which looks exactly like a
         // resume that discord refused, while nothing was ever wrong with it.
         char resume_url[256];
+
+        // Whose connection this is. A held one belongs to the account that
+        // started the call, which after a switch is not the account signed
+        // in - and a Go Live built with the wrong id would be refused by a
+        // server that had no way to explain why.
+        snowflake user_id;
+
+        // Whether this connection has already been READY once. A second
+        // READY on the same connection means the session it had is gone and
+        // a new one was handed out - which is the moment, and the only
+        // moment, that a call cannot survive.
+        bool had_session;
         // Its own copy. A held connection has to keep identifying as the
         // account that opened it, long after the client has moved on.
         char token[512];
@@ -91,6 +103,12 @@ namespace
     gw_conn* active() { return &g_conns[g_active]; }
     gw_conn* spare()  { return &g_conns[g_active ^ 1]; }
     bool holding()    { return spare()->running != 0; }
+
+    // Anything about a call goes to the session that owns it. After a switch
+    // that is the held connection, not the one the client is now using: the
+    // new account is not in the channel and telling it to leave would do
+    // nothing at all.
+    gw_conn* voice_conn() { return holding() ? spare() : active(); }
 
     volatile long g_state = GW_OFFLINE;
     volatile long g_hold_media = 0;
@@ -315,6 +333,22 @@ namespace
 
     void handle_ready(gw_conn* c, const jval* d)
     {
+        // A second READY means the resume was refused and discord issued a
+        // new session. The voice state lived on the old one, so whatever was
+        // running is already dead on their side; ending it here is what stops
+        // it from sitting there sending into nothing.
+        //
+        // Before the store lock, because stopping a stream waits on its own
+        // threads and they have their own reasons to touch the store.
+        if (c->had_session && c == voice_conn() && !g_hold_media)
+        {
+            log_line("gateway: сессия заменена - медиа с прошлой не переживёт этого");
+            screenshare::on_gateway_disconnected();
+            streamview::on_gateway_disconnected();
+            voice::on_gateway_disconnected();
+        }
+        c->had_session = true;
+
         store::guard g;
 
         const char* sid = d->str("session_id", 0);
@@ -346,6 +380,7 @@ namespace
 
         duser* me = store::upsert_user(d->obj("user"));
         if (me) store::set_self_id(me->id);
+        c->user_id = d->obj("user")->sf("id");
 
         // Our own presence is not in the presence list - discord never tells a
         // client about itself that way. It comes from the account settings, and
@@ -492,14 +527,33 @@ namespace
         c->backoff_ms = 1000;
     }
 
+    // The dispatches that belong to the call rather than to the account.
+    //
+    // These are the ones a held connection has to be allowed to deliver: it
+    // is the session discord associates the call with, so every answer about
+    // that call arrives on it and nowhere else. Dropping them is what left a
+    // Go Live hanging after a switch and back - op 18 went out and the
+    // STREAM_CREATE that answers it was thrown away unread, so the share sat
+    // in "requesting" until the channel was rejoined on the new session.
+    bool call_dispatch(const char* type)
+    {
+        return ccscmp(type, "VOICE_STATE_UPDATE") == 0 ||
+               ccscmp(type, "VOICE_SERVER_UPDATE") == 0 ||
+               ccscmp(type, "STREAM_CREATE") == 0 ||
+               ccscmp(type, "STREAM_SERVER_UPDATE") == 0 ||
+               ccscmp(type, "STREAM_UPDATE") == 0 ||
+               ccscmp(type, "STREAM_DELETE") == 0;
+    }
+
     void handle_dispatch(gw_conn* c, const char* type, const jval* d)
     {
         if (!type) return;
 
         // A held connection is alive only to keep a call open. Folding its
         // dispatches into the store would drag the previous account's servers
-        // and messages back over the one that is signed in now.
-        if (!c->dispatching) return;
+        // and messages back over the one that is signed in now - everything
+        // except what the call itself is made of.
+        if (!c->dispatching && !call_dispatch(type)) return;
 
         if (ccscmp(type, "READY") == 0) { handle_ready(c, d); return; }
 
@@ -1090,15 +1144,30 @@ namespace
             // own sockets and their own accepted tokens; nothing about them
             // needs this one.
             //
-            // And unless this is the spare rather than the one in use. A held
-            // connection is the old account's socket, kept alive only so the
-            // server does not decide the call left with it; when it is finally
-            // let go it must take nothing with it. Letting it run this made
-            // release_hold end whatever call was running at the time - the
-            // call it was being held for included, which is the whole point of
-            // holding it - and the log showed exactly that: the hold released,
-            // and the voice socket dying four seconds behind it.
-            if (!g_hold_media && c == active())
+            // And unless this is not the connection the call is on. After an
+            // account switch the call sits on the held socket, kept alive only
+            // so the server does not decide the call left with it, and the one
+            // in front has nothing to do with it either way. Letting whichever
+            // socket happened to be in front run this made release_hold end
+            // whatever call was running at the time - the call it was being
+            // held for included, which is the whole point of holding it - and
+            // the log showed exactly that: the hold released, and the voice
+            // socket dying two milliseconds behind it.
+            //
+            // And unless the session is coming back. This is the one that was
+            // still throwing people out of calls.
+            //
+            // A call does not belong to this socket, it belongs to the
+            // session behind it, and a resume keeps that session. Discord
+            // asks for a reconnect on its own schedule - which is exactly the
+            // "fifteen minutes or five hours" of the complaint - and every
+            // one of those ended the call here, three lines before the
+            // reconnect that would have made it unnecessary. The log read:
+            // server asked for a reconnect, hold released, voice socket dead.
+            //
+            // If the resume is refused, the session really is gone, and the
+            // fresh READY tears the media down then - see handle_ready.
+            if (!g_hold_media && c == voice_conn() && !c->want_resume)
             {
                 screenshare::on_gateway_disconnected();
                 streamview::on_gateway_disconnected();
@@ -1223,22 +1292,21 @@ gateway_state gateway::state() { return (gateway_state)g_state; }
 const char* gateway::status_text() { return g_status; }
 const char* gateway::session_id() { return active()->session_id; }
 
+// Every caller of this is Go Live - starting one, ending one, or asking to
+// watch somebody else's - and all of it belongs to the call, so it goes
+// where the call lives.
+//
+// It used to go to whichever connection was in front. Switching accounts and
+// coming back leaves two: the one holding the call, and the fresh one the
+// account signed in on. Sending op 18 to the fresh one asks a session that
+// is not in the channel to start a stream in it, and discord simply says
+// nothing back.
 bool gateway::send_raw(const void* json, unsigned int len)
 {
-    return active()->ws.send_text(json, len);
+    return voice_conn()->ws.send_text(json, len);
 }
 
-namespace
-{
-    // Anything about a call goes to the session that owns it. After a switch
-    // that is the held connection, not the one the client is now using: the
-    // new account is not in the channel and telling it to leave would do
-    // nothing at all.
-    gw_conn* voice_conn()
-    {
-        return holding() ? spare() : active();
-    }
-}
+snowflake gateway::call_owner_id() { return voice_conn()->user_id; }
 
 void gateway::update_voice_state(snowflake guild_id, snowflake channel_id, bool self_mute, bool self_deaf)
 {
