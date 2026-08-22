@@ -70,7 +70,13 @@ void log_init()
             ufile::app_path(L"imdiscord.prev.log", kept, MAX_PATH))
         {
             DeleteFileW(kept);
-            MoveFileW(live, kept);
+
+            // Copying when the move will not go is not belt and braces: with a
+            // second copy of the client running, the move fails and the open
+            // below then truncates the live log anyway - so the run somebody
+            // wanted to read is destroyed and nothing is kept in its place.
+            // That has already eaten one investigation.
+            if (!MoveFileW(live, kept)) CopyFileW(live, kept, FALSE);
         }
     }
 

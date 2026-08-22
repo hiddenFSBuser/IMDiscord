@@ -202,6 +202,7 @@ struct dmember
 // The permission bits this client actually reasons about. Discord defines
 // several dozen; naming the ones that matter here is clearer than carrying
 // the whole table around for no reason.
+const unsigned long long PERM_CREATE_INVITE    = 1ULL << 0;
 const unsigned long long PERM_BAN_MEMBERS      = 1ULL << 2;
 const unsigned long long PERM_ADMINISTRATOR    = 1ULL << 3;
 const unsigned long long PERM_VIEW_CHANNEL     = 1ULL << 10;
@@ -211,6 +212,7 @@ const unsigned long long PERM_MUTE_MEMBERS     = 1ULL << 22;
 // Moving somebody out of a voice channel and disconnecting them are the same
 // permission: a disconnect is a move to nowhere.
 const unsigned long long PERM_MOVE_MEMBERS     = 1ULL << 24;
+const unsigned long long PERM_MANAGE_ROLES     = 1ULL << 28;
 const unsigned long long PERM_MODERATE_MEMBERS = 1ULL << 40;
 
 // One line of a channel's permission table: who it is about, and what it

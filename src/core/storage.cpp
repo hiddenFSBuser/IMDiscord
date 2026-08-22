@@ -318,6 +318,7 @@ void storage::accounts_load()
                 ccstrncpy(entry.token, token, sizeof(entry.token) - 1);
                 ccstrncpy(entry.name, a->str("name", ""), sizeof(entry.name) - 1);
                 ccstrncpy(entry.avatar, a->str("avatar", ""), sizeof(entry.avatar) - 1);
+                ccstrncpy(entry.group, a->str("group", ""), sizeof(entry.group) - 1);
                 entry.id = a->sf("id");
 
                 entry.is_bot = a->boolean("bot", false);
@@ -402,6 +403,7 @@ void storage::accounts_save()
         w.kv_str("token", g_accounts[i].token);
         w.kv_str("name", g_accounts[i].name);
         w.kv_str("avatar", g_accounts[i].avatar);
+        if (g_accounts[i].group[0]) w.kv_str("group", g_accounts[i].group);
         w.kv_snowflake("id", g_accounts[i].id);
 
         if (g_accounts[i].is_bot) w.kv_bool("bot", true);
@@ -500,6 +502,40 @@ void storage::account_forget(int index)
     else if (g_active_account > index) g_active_account--;
 
     accounts_save();
+}
+
+void storage::account_set_group(int index, const char* group)
+{
+    accounts_load();
+    if (index < 0 || index >= (int)g_accounts.count) return;
+
+    ccfset(g_accounts[index].group, 0, sizeof(g_accounts[index].group));
+    if (group) ccstrncpy(g_accounts[index].group, group,
+                         sizeof(g_accounts[index].group) - 1);
+
+    accounts_save();
+}
+
+int storage::account_groups(char out[][32], int cap)
+{
+    accounts_load();
+
+    int n = 0;
+    for (unsigned int i = 0; i < g_accounts.count && n < cap; i++)
+    {
+        const char* g = g_accounts[i].group;
+        if (!g[0]) continue;
+
+        bool had = false;
+        for (int k = 0; k < n; k++) if (ccscmp(out[k], g) == 0) { had = true; break; }
+        if (had) continue;
+
+        ccfset(out[n], 0, 32);
+        ccstrncpy(out[n], g, 31);
+        n++;
+    }
+
+    return n;
 }
 
 int storage::active_account()

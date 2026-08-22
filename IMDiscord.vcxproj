@@ -150,6 +150,9 @@
     <ClCompile Include="src\discord\gateway.cpp" />
     <ClCompile Include="src\discord\rest.cpp" />
     <ClCompile Include="src\discord\store.cpp" />
+    <ClCompile Include="src\discord\dmscan.cpp" />
+    <ClCompile Include="src\discord\people.cpp" />
+    <ClCompile Include="src\discord\warmup.cpp" />
     <ClCompile Include="src\discord\types.cpp" />
     <ClCompile Include="src\discord\voice.cpp" />
     <ClCompile Include="src\libs\customcrt\customcrt_clock.cpp" />
@@ -298,6 +301,10 @@
     <ClCompile Include="src\ui\ui_music.cpp" />
     <ClCompile Include="src\ui\ui_ownership.cpp" />
     <ClCompile Include="src\ui\ui_delete_guild.cpp" />
+    <ClCompile Include="src\ui\ui_rename.cpp" />
+    <ClCompile Include="src\ui\ui_onboarding.cpp" />
+    <ClCompile Include="src\ui\ui_token.cpp" />
+    <ClCompile Include="src\ui\emoji.cpp" />
     <ClCompile Include="src\ui\ui_moderate.cpp" />
     <ClCompile Include="src\ui\ui_people.cpp" />
     <ClCompile Include="src\ui\ui_sidebar.cpp" />

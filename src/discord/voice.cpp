@@ -1012,16 +1012,30 @@ namespace
 
         // DAVE only negotiates when there is somebody to encrypt to, so the
         // occupant count is the difference between "broken" and "nothing to do".
+        // Taken only if free, and skipped if not.
+        //
+        // This runs on the websocket thread, which is a thread the interface
+        // waits for when a call ends - and the interface draws the whole sidebar
+        // holding the store lock, hang-up button included. Waiting for it here
+        // put the two in a circle: the interface waiting for this thread, this
+        // thread waiting for the interface. It timed out after four seconds,
+        // closed the handle of a thread that was still running, and tore the
+        // socket down underneath it. That is the freeze on leaving a call.
+        //
+        // The count only goes in the log line below, so not having it is a
+        // worse log line and nothing else.
         unsigned int occupants = 0;
+        bool counted = store::try_lock();
+        if (counted)
         {
-            store::guard g;
             const ulist<dvoice_state>& states = store::voice_states();
             for (unsigned int i = 0; i < states.count; i++)
                 if (states[i].channel_id == g_channel_id) occupants++;
+            store::unlock();
         }
 
-        log_line("dave: binary op %u, seq %u, %u bytes (%u in channel)",
-                 opcode, seq, payload_len, occupants);
+        log_line("dave: binary op %u, seq %u, %u bytes (%s%u in channel)",
+                 opcode, seq, payload_len, counted ? "" : "?", occupants);
 
 #ifdef IMD_VOICE_TEST
         // Test-only: keep the raw payloads so the MLS parsers can be developed
@@ -2704,6 +2718,33 @@ namespace
         return code == 1000 || code == 1001 || code == 1006 || code == 4015;
     }
 
+    // Defined below, next to the teardown it has to run: a thread cannot
+    // wait for itself to finish, so the websocket thread hands the job of
+    // rebuilding the session to somebody else.
+    DWORD WINAPI rejoin_thread(LPVOID param);
+
+    struct rejoin_request
+    {
+        snowflake guild;
+        snowflake channel;
+    };
+
+    unsigned long long g_last_rejoin_ms = 0;
+    int g_rejoins = 0;
+
+    // Coming back is worth trying once or twice. A channel that hangs up on
+    // every attempt is refusing us for a reason this client cannot see, and
+    // reconnecting into it forever would be a loop nobody can get out of
+    // except by closing the program.
+    bool rejoin_allowed()
+    {
+        unsigned long long now = GetTickCount64();
+        if (now - g_last_rejoin_ms > 120000ULL) g_rejoins = 0;
+
+        g_last_rejoin_ms = now;
+        return ++g_rejoins <= 3;
+    }
+
     DWORD WINAPI voice_ws_thread(LPVOID)
     {
         CoInitializeEx(0, COINIT_MULTITHREADED);
@@ -2779,7 +2820,15 @@ namespace
             InterlockedExchange(&g_session_ready, 0);
             g_ws.close_handles();
 
-            if (!g_running) break;
+            // Somebody else ended the call while the socket was dying. Said
+            // out loud, because this is the branch that quietly swallowed a
+            // resume that should have happened.
+            if (!g_running)
+            {
+                log_line("voice: сокет закрыт (код %u), но звонок уже остановлен - "
+                         "восстанавливать нечего", close_code);
+                break;
+            }
 
             // Only a session that got as far as existing can be resumed, and
             // discord does not keep a dropped one for long - a handful of
@@ -2807,6 +2856,20 @@ namespace
         // this client dropped it and that is ours to fix.
         g_last_close = close_code;
 
+        // 4014 is discord saying this voice session is finished: the channel
+        // went, or we were removed from it, or - the case that brings people
+        // here - the gateway session behind it dropped. Their own guidance is
+        // not to reconnect the socket, and that is right: what has to be
+        // rebuilt is the session, and only the gateway can hand out a new one.
+        //
+        // Being removed on purpose is told apart by nothing more than this
+        // flag. Whoever removed us reached the client as a voice state with no
+        // channel in it, and that stops the session before the socket even
+        // notices - so a 4014 arriving while the session is still running is
+        // one that nobody here asked for, and the only one worth undoing.
+        bool rejoin = close_code == 4014 && g_running && g_channel_id &&
+                      rejoin_allowed();
+
         // 4006 says the voice session we were handed is dead. Discord's own
         // view of us, though, is that we are still sitting in the channel - so
         // a later join asks it to move us from that channel to that channel,
@@ -2824,8 +2887,9 @@ namespace
         }
 
         // The call is over however it ended, so a connection kept alive purely
-        // to hold it should not outlive it.
-        gateway::release_hold();
+        // to hold it should not outlive it - unless it is the one about to
+        // carry the call back, which is exactly what a rejoin needs it for.
+        if (!rejoin) gateway::release_hold();
         if (!g_stop_reason[0])
             g_stop_reason = close_code == 4006 ? "сервер снёс сессию"
                                                : "сокет закрылся";
@@ -2840,8 +2904,27 @@ namespace
         InterlockedExchange(&g_heartbeat_ms, 0);
         g_ws.destroy();
 
-        if (g_running && g_state != VOICE_FAILED)
+        if (rejoin)
+        {
+            log_line("voice: 4014 - сессия кончилась не по нашей воле, "
+                     "возвращаемся в канал %llu (попытка %d)", g_channel_id, g_rejoins);
+            set_status(VOICE_CONNECTING, tr("Связь потеряна, возвращаюсь в канал..."));
+
+            rejoin_request* r = (rejoin_request*)memalloc(sizeof(rejoin_request));
+            if (r)
+            {
+                r->guild = g_guild_id;
+                r->channel = g_channel_id;
+
+                HANDLE t = CreateThread(0, 0, rejoin_thread, r, 0, 0);
+                if (t) CloseHandle(t);
+                else   memfree(r);
+            }
+        }
+        else if (g_running && g_state != VOICE_FAILED)
+        {
             set_status(VOICE_IDLE, tr("Голосовой канал закрыт"));
+        }
 
         CoUninitialize();
         return 0;
@@ -2884,6 +2967,14 @@ namespace
         // session down at the same time; only the winner of this exchange gets
         // to close the handles.
         if (InterlockedCompareExchange(&g_running, 0, 1) != 1) return;
+
+        // Every caller sets a different reason first, so this one line names
+        // whichever of them it was. Without it a call ending looks the same
+        // from the log whether the person hung up, the gateway pulled the
+        // rug, or the server said we had left - and three rounds of this
+        // were spent guessing between them.
+        log_line("voice: соединение остановлено (%s)",
+                 g_stop_reason && g_stop_reason[0] ? g_stop_reason : "причина не указана");
 
         InterlockedExchange(&g_session_ready, 0);
         SetEvent(g_stop_event);
@@ -2928,6 +3019,51 @@ namespace
         dave::reset_ratchets();
         g_mode = MODE_NONE;
         ccfset(g_secret_key, 0, sizeof(g_secret_key));
+    }
+    // Rebuilds the session after discord ended it on its own.
+    //
+    // On a thread of its own because the one that noticed cannot do this:
+    // stopping the session waits for the websocket thread to finish, and the
+    // websocket thread is the one asking. It would wait for itself.
+    DWORD WINAPI rejoin_thread(LPVOID param)
+    {
+        rejoin_request* r = (rejoin_request*)param;
+
+        // Everything the dead session left behind - the thread handles, the
+        // udp socket, the encoder, the speaker rings - goes here, on a thread
+        // that is allowed to wait for all of it. Skipping this is what used
+        // to leave the client believing it was still in the channel: a join
+        // back into it did nothing at all, and the only way in was to leave
+        // and walk in again by hand.
+        g_stop_reason = "4014, возвращаемся";
+        stop_voice_connection();
+
+        // The gateway is usually down at this exact moment: a voice 4014
+        // almost always means its session went first, and the voice server
+        // noticed. Announcing anything into a socket that is reconnecting is
+        // shouting into a closed door - the log showed both announcements
+        // going out while the gateway was between sessions, and neither of
+        // them arriving anywhere.
+        for (int i = 0; i < 100 && g_running == 0; i++)
+        {
+            if (gateway::state() == GW_READY) break;
+            Sleep(100);
+        }
+
+        // Discord still has us in the channel, so asking to join the channel
+        // we are already in is not a change and brings no new voice server.
+        // Standing up and saying we left first is what makes the next join a
+        // real transition - the same reason the 4006 path does it.
+        ccfset(g_voice_session, 0, sizeof(g_voice_session));
+        gateway::update_voice_state(0, 0, false, false);
+
+        // Long enough for that to be registered on their side. Sent back to
+        // back, the pair reads as no change at all and the join is ignored.
+        Sleep(600);
+
+        voice::join(r->guild, r->channel);
+        memfree(r);
+        return 0;
     }
 }
 

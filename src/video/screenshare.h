@@ -47,4 +47,8 @@ namespace screenshare
     void on_stream_create(const jval* d);
     void on_stream_server_update(const jval* d);
     void on_gateway_disconnected();
+
+    // Starts the share again after the gateway took it down, once the call is
+    // back. Called every frame; does nothing unless something is waiting.
+    void restore_if_pending();
 }

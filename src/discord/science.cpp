@@ -198,6 +198,10 @@ namespace
         res.free_response();
     }
 
+    // Set by a call ending: send what is queued for it, then forget whose it
+    // was. Both on the flush thread, because the sending half is http.
+    volatile long g_flush_and_forget = 0;
+
     DWORD WINAPI flush_thread(LPVOID)
     {
         while (g_running)
@@ -210,6 +214,12 @@ namespace
 
             send_group(false);
             send_group(true);
+
+            // A call ended and asked for its queue to go out under its own
+            // account before that account is forgotten. The send above has
+            // just done it, so forgetting is all that is left.
+            if (InterlockedExchange(&g_flush_and_forget, 0))
+                science::set_voice_identity(0, 0);
         }
         return 0;
     }
@@ -296,10 +306,18 @@ void science::set_voice_identity(const char* auth_token, const char* analytics_t
 
 void science::clear_voice_identity()
 {
-    // Whatever is still queued for the call goes out under its own account
-    // before the identity is forgotten.
-    send_group(true);
-    science::set_voice_identity(0, 0);
+    // Handed to the thread that already does this rather than done here.
+    //
+    // This is called from hanging up, which happens on the thread that draws
+    // the window, and sending a group is a whole request over http - opening
+    // tls to discord and waiting for an answer. On a good day that is a
+    // noticeable pause; on a bad one it is half a minute of a client that
+    // does not repaint, and it was.
+    //
+    // The identity is cleared by that thread too, after the send, or the
+    // events queued under the call would go out signed as somebody else.
+    InterlockedExchange(&g_flush_and_forget, 1);
+    if (g_wake) SetEvent(g_wake);
 }
 
 void science::set_token(const char* token)

@@ -18,6 +18,12 @@ struct saved_account
     // been fetched that could reveal it.
     bool is_bot;
     char name[64];
+
+    // Which group of accounts this one belongs to, empty for none. Free
+    // text rather than an index into a list of groups: twenty accounts want
+    // sorting into a handful of piles, and a pile that exists only because
+    // something is in it is one less thing to keep tidy.
+    char group[32];
     char avatar[64];          // hash, may be empty
     unsigned long long id;
 
@@ -50,6 +56,13 @@ namespace storage
     void accounts_load();
     int accounts_count();
     const saved_account* account_at(int index);
+
+    // Puts an account in a group, or takes it out of one with an empty name.
+    void account_set_group(int index, const char* group);
+
+    // The groups that exist, which is to say the ones somebody is in. Sorted
+    // the way the accounts are, so the buttons do not move about.
+    int account_groups(char out[][32], int cap);
 
     // Matches on user id, or on the token itself while the id is unknown.
     // Returns the index it ended up at, or -1.

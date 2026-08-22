@@ -186,7 +186,7 @@ void ui_view_audit_popup()
 
             for (int i = 0; i < count; i++)
             {
-                ImGui::PushID((int)(rows[i].user_id & 0x7FFFFFFF));
+                ImGui::PushID((const void*)(size_t)rows[i].user_id);
 
                 ImGui::TextUnformatted(rows[i].name);
 

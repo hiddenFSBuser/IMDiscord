@@ -73,7 +73,7 @@ namespace
         bool allowed = (g_allow & p->bit) != 0;
         bool denied = (g_deny & p->bit) != 0;
 
-        ImGui::PushID((int)(p->bit ? (unsigned int)(p->bit % 1000000007ULL) : 0));
+        ImGui::PushID((const void*)(size_t)p->bit);
 
         ImU32 off = col::bg_panel;
 
@@ -158,7 +158,7 @@ void ui_view_channel_perms_popup()
     {
         drole* r = &g->roles[i];
 
-        ImGui::PushID((int)(r->id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)r->id);
 
         // The everyone role is listed here, unlike in the role editor: it is
         // exactly what a channel is usually closed off against.

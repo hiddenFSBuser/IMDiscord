@@ -20,6 +20,11 @@ namespace store
     void lock();
     void unlock();
 
+    // Takes the lock only if it is free. For the one caller that must never
+    // wait for it: a thread the interface waits for cannot in turn wait for a
+    // lock the interface is holding.
+    bool try_lock();
+
     struct guard
     {
         guard() { lock(); }
@@ -177,6 +182,8 @@ namespace store
     // ---- ordered views (rebuilt on demand) ----
     const ulist<snowflake>& guild_order();
     const ulist<snowflake>& dm_order();
+    // The one-to-one conversation with somebody, or 0 if none is open.
+    snowflake dm_with(snowflake user_id);
     void touch_dm_order();
 
     // ---- auth sessions ----

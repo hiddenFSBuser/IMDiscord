@@ -1,6 +1,7 @@
 #include "pch.h"
 #include <d3d11.h>
 #include "ui_state.h"
+#include "emoji.h"
 #include "video/player.h"
 #include "theme.h"
 #include "textures.h"
@@ -609,6 +610,114 @@ namespace
         return id;
     }
 
+    // A server emoji on the wire is <:name:id>, or <a:name:id> when it moves.
+    // Everything about it that matters is the id; the name is only there so a
+    // client that will not draw it has something to show.
+    snowflake emoji_at(const char* p, int* length, bool* animated, char* name, int name_cap)
+    {
+        if (p[0] != '<') return 0;
+
+        int i = 1;
+        bool moves = false;
+        if (p[i] == 'a') { moves = true; i++; }
+        if (p[i] != ':') return 0;
+        i++;
+
+        int name_at = i;
+        while (p[i] && p[i] != ':' && p[i] != '>' && p[i] != ' ') i++;
+        if (p[i] != ':' || i == name_at) return 0;
+
+        int name_len = i - name_at;
+        i++;
+
+        snowflake id = 0;
+        int digits = 0;
+        while (p[i] >= '0' && p[i] <= '9')
+        {
+            id = id * 10 + (snowflake)(p[i] - '0');
+            i++;
+            digits++;
+        }
+
+        if (!digits || p[i] != '>') return 0;
+
+        int copy = name_len < name_cap - 1 ? name_len : name_cap - 1;
+        ccpy(name, p + name_at, (size_t)copy);
+        name[copy] = 0;
+
+        *animated = moves;
+        *length = i + 1;
+        return id;
+    }
+
+    // The same picture-instead-of-text treatment, for the emoji that are just
+    // characters. Told apart from the server ones only by where the picture
+    // comes from; everything after that is identical.
+    void draw_unicode_emoji(const char* url, float side, const char* raw, int raw_len)
+    {
+        const texture* t = tex::get(url);
+
+        // Nothing to draw and nothing coming: the sequence is one this cdn
+        // has no file for. The characters themselves go back on the line -
+        // whatever the font makes of them is more than a blank gap says.
+        if (t->state == TEX_FAILED)
+        {
+            ImGui::TextUnformatted(raw, raw + raw_len);
+            return;
+        }
+
+        ImVec2 at = ImGui::GetCursorScreenPos();
+        ImGui::Dummy(ImVec2(side, side));
+
+        if (t->ready())
+            ImGui::GetWindowDrawList()->AddImage(t->id(), at,
+                                                ImVec2(at.x + side, at.y + side));
+    }
+
+    // Sized to the line it sits on rather than to a fixed number of pixels,
+    // so it still looks like part of the sentence at any font size.
+    float emoji_side()
+    {
+        float h = ImGui::GetTextLineHeight() * 1.35f;
+        return h < 16.0f ? 16.0f : h;
+    }
+
+    // Falls back to the name whenever the picture is not there - still
+    // loading, failed, or the emoji has been deleted from the server it came
+    // from. A blank gap would read as a bug; ":kekw:" reads as an emoji.
+    void draw_emoji(snowflake id, bool animated, const char* name)
+    {
+        char url[160];
+        cdn::custom_emoji(id, animated, 48, url, sizeof(url));
+
+        const texture* t = tex::get(url);
+        float side = emoji_side();
+
+        if (t->ready())
+        {
+            // A plain item of exactly the right size, with the picture painted
+            // over it. Image() would do both at once, but the layout here is
+            // hand rolled - words are placed one at a time and wrapped by this
+            // function - and an item whose size is not what it claims puts
+            // every word after it in the wrong place.
+            ImVec2 at = ImGui::GetCursorScreenPos();
+            ImGui::Dummy(ImVec2(side, side));
+
+            ImGui::GetWindowDrawList()->AddImage(t->id(), at,
+                                                ImVec2(at.x + side, at.y + side));
+
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(":%s:", name);
+            return;
+        }
+
+        char label[96];
+        cnprint(label, sizeof(label), ":%s:", name);
+
+        ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
+        ImGui::TextUnformatted(label);
+        ImGui::PopStyleColor();
+    }
+
     void mention_label(snowflake id, char* out, int cap)
     {
         duser* u = store::find_user(id);
@@ -626,7 +735,7 @@ namespace
         ImVec2 size = ImGui::CalcTextSize(label);
         ImVec2 at = ImGui::GetCursorScreenPos();
 
-        ImGui::PushID((int)(id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)id);
         ImGui::InvisibleButton("##mention", ImVec2(size.x + PAD * 2.0f, size.y));
         bool hovered = ImGui::IsItemHovered();
         bool clicked = ImGui::IsItemClicked();
@@ -658,6 +767,11 @@ namespace
         float wrap_x = start_x + ImGui::GetContentRegionAvail().x - 20.0f;
         float space = ImGui::CalcTextSize(" ").x;
 
+        // Read once for the whole message rather than per token: it is a
+        // settings lookup, and a busy message has a lot of tokens.
+        bool emoji_on = ui_custom_emoji();
+        bool uni_on = ui_unicode_emoji();
+
         bool on_line = false;
         const char* p = text;
 
@@ -681,12 +795,32 @@ namespace
             snowflake who = mention_at(p, &taken);
 
             char label[128];
+            char emoji_name[64];
+            bool emoji_moves = false;
+            snowflake emoji = 0;
             float width = 0.0f;
+
+            char uni_url[256];
+            int uni_taken = 0;
+
+            if (!who && emoji_on)
+                emoji = emoji_at(p, &taken, &emoji_moves, emoji_name, sizeof(emoji_name));
+            if (!who && !emoji && uni_on)
+                uni_taken = uemoji::at(p, uni_url, sizeof(uni_url), ui_font_lacks_glyph);
 
             if (who)
             {
                 mention_label(who, label, sizeof(label));
                 width = ImGui::CalcTextSize(label).x + 8.0f;
+            }
+            else if (emoji)
+            {
+                width = emoji_side();
+            }
+            else if (uni_taken)
+            {
+                taken = uni_taken;
+                width = emoji_side();
             }
             else
             {
@@ -694,7 +828,13 @@ namespace
                 while (*end && *end != ' ' && *end != '\n' && *end != '\r' && *end != '\t')
                 {
                     int skip = 0;
+                    bool moves = false;
+                    char peek[64];
                     if (mention_at(end, &skip)) break;   // a tag starts here
+                    if (emoji_on && end != p &&
+                        emoji_at(end, &skip, &moves, peek, sizeof(peek))) break;
+                    if (uni_on && end != p &&
+                        uemoji::at(end, uni_url, sizeof(uni_url), ui_font_lacks_glyph)) break;
                     end++;
                 }
                 if (end == p) end++;                     // never stall
@@ -721,6 +861,16 @@ namespace
             {
                 draw_mention_tag(who, guild_id, label);
             }
+            else if (emoji)
+            {
+                ImGui::PushID((const void*)(size_t)emoji);
+                draw_emoji(emoji, emoji_moves, emoji_name);
+                ImGui::PopID();
+            }
+            else if (uni_taken)
+            {
+                draw_unicode_emoji(uni_url, emoji_side(), p, uni_taken);
+            }
             else
             {
                 ImGui::PushStyleColor(ImGuiCol_Text, colour);
@@ -735,7 +885,7 @@ namespace
 
     void draw_attachment(const dattachment* a)
     {
-        ImGui::PushID((int)(a->id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)a->id);
 
         // Off by default, and when it is off a video is drawn the way it
         // always was: a still from the proxy with a download button on it.
@@ -888,7 +1038,7 @@ namespace
     {
         duser* author = store::find_user(m->author_id);
 
-        ImGui::PushID((int)(m->id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)m->id);
         ImGui::Dummy(ImVec2(0, 4.0f));
         ImGui::Indent(12.0f);
 
@@ -922,6 +1072,78 @@ namespace
         ImGui::PopID();
     }
 
+    // ---- rewriting one of your own --------------------------------------
+    //
+    // In place, where the message is, rather than in a window of its own. The
+    // thing being changed is a line in a conversation, and lifting it out of
+    // the conversation to change it loses what it was answering and what
+    // answered it.
+    snowflake g_editing = 0;
+    char g_edit_text[3800];
+    bool g_edit_focus = false;
+
+    void begin_edit(const dmessage* m)
+    {
+        g_editing = m->id;
+        g_edit_focus = true;
+
+        ccfset(g_edit_text, 0, sizeof(g_edit_text));
+        if (m->content) ccstrncpy(g_edit_text, m->content, sizeof(g_edit_text) - 1);
+    }
+
+    void end_edit() { g_editing = 0; g_edit_text[0] = 0; }
+
+    // Returns true when the row drew the editor instead of the text.
+    bool draw_editor(const dmessage* m, float indent)
+    {
+        if (g_editing != m->id) return false;
+
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+
+        float width = ImGui::GetContentRegionAvail().x - indent - 20.0f;
+        if (width < 120.0f) width = 120.0f;
+
+        if (g_edit_focus)
+        {
+            ImGui::SetKeyboardFocusHere();
+            g_edit_focus = false;
+        }
+
+        ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue |
+                                    ImGuiInputTextFlags_CtrlEnterForNewLine;
+
+        bool save = ImGui::InputTextMultiline("##edit", g_edit_text, sizeof(g_edit_text),
+                                              ImVec2(width, 60.0f), flags);
+
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+
+        // Discord refuses an empty edit rather than reading it as a delete,
+        // so the button says no before the server has to.
+        bool empty = g_edit_text[0] == 0;
+        if (empty) ImGui::BeginDisabled();
+
+        if (ImGui::SmallButton(tr("Сохранить")) || (save && !empty))
+        {
+            api::edit_message(m->channel_id, m->id, g_edit_text);
+            end_edit();
+        }
+
+        if (empty) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("Отмена"))) end_edit();
+
+        ImGui::SameLine();
+        ui_text_muted(tr("Enter - сохранить, Ctrl+Enter - перенос строки"));
+
+        // Escape leaves it alone. Reached for by reflex, and the reflex should
+        // not be the one thing that discards what was typed - so it only
+        // closes the editor, and the message is left as it was.
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) end_edit();
+
+        return true;
+    }
+
     void draw_message(dmessage* m, bool grouped)
     {
         // Anything with no body of its own is an event, and reads better as
@@ -936,7 +1158,7 @@ namespace
 
         duser* author = store::find_user(m->author_id);
 
-        ImGui::PushID((int)(m->id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)m->id);
         ImGui::Dummy(ImVec2(0, grouped ? 1.0f : 6.0f));
 
         float avatar_size = 38.0f;
@@ -1007,7 +1229,7 @@ namespace
             }
         }
 
-        if (m->content && m->content[0])
+        if (!draw_editor(m, text_indent) && m->content && m->content[0])
         {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + text_indent);
             draw_message_text(m->content, m->guild_id,
@@ -1029,13 +1251,58 @@ namespace
         if (m->reactions.count)
         {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + text_indent);
+            bool emoji_on = ui_custom_emoji();
+
             for (unsigned int i = 0; i < m->reactions.count; i++)
             {
-                char label[96];
-                cnprint(label, sizeof(label), "%s %d", m->reactions[i].emoji_name, m->reactions[i].count);
+                const dreaction* r = &m->reactions[i];
+
+                // A reaction carries no "animated" flag, so the still frame
+                // is asked for. Discord serves one for a moving emoji too,
+                // which is the right thing at this size anyway.
+                const texture* t = 0;
+                if (emoji_on && r->emoji_id)
+                {
+                    char url[160];
+                    cdn::custom_emoji(r->emoji_id, false, 48, url, sizeof(url));
+                    t = tex::get(url);
+                }
+
+                ImGui::PushID((int)i);
                 ImGui::PushStyleColor(ImGuiCol_Button, ImGui::ColorConvertU32ToFloat4(col::bg_panel));
-                ImGui::SmallButton(label);
+
+                if (t && t->ready())
+                {
+                    // Sized by hand and painted into, rather than a button with
+                    // a label: there is no label that would make room for a
+                    // picture, and a picture drawn over a button sized for text
+                    // spills out of it.
+                    char count[16];
+                    cnprint(count, sizeof(count), "%d", r->count);
+
+                    float side = ImGui::GetTextLineHeight();
+                    float text_w = ImGui::CalcTextSize(count).x;
+
+                    ImVec2 at = ImGui::GetCursorScreenPos();
+                    ImGui::Button("##react", ImVec2(side + text_w + 16.0f, side + 6.0f));
+
+                    ImDrawList* dl = ImGui::GetWindowDrawList();
+                    dl->AddImage(t->id(), ImVec2(at.x + 5.0f, at.y + 3.0f),
+                                 ImVec2(at.x + 5.0f + side, at.y + 3.0f + side));
+                    dl->AddText(ImVec2(at.x + 9.0f + side, at.y + 3.0f),
+                                col::text_normal, count);
+
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip(":%s:", r->emoji_name);
+                }
+                else
+                {
+                    char label[96];
+                    cnprint(label, sizeof(label), "%s %d", r->emoji_name, r->count);
+                    ImGui::SmallButton(label);
+                }
+
                 ImGui::PopStyleColor();
+                ImGui::PopID();
                 if (i + 1 < m->reactions.count) ImGui::SameLine();
             }
         }
@@ -1078,9 +1345,19 @@ namespace
                                   & PERM_MANAGE_MESSAGES) != 0;
             }
 
-            if (may_delete)
+            // Only your own, whatever else you are allowed to do here.
+            // Deleting somebody else's message is moderation; rewriting it
+            // would be putting words in their mouth, and discord does not
+            // offer it either.
+            if (mine)
             {
                 ImGui::Separator();
+                if (ImGui::MenuItem(tr("Изменить"))) begin_edit(m);
+            }
+
+            if (may_delete)
+            {
+                if (!mine) ImGui::Separator();
                 if (ImGui::MenuItem(tr("Удалить"))) api::delete_message(m->channel_id, m->id);
             }
 
@@ -1130,11 +1407,83 @@ namespace
         }
     }
 
+    // ---- speaking as a webhook ------------------------------------------
+    //
+    // A webhook is an address that posts into one channel and answers to
+    // nobody: whoever holds the url can put a message there under any name
+    // and any picture they like. If one is already hanging on the channel,
+    // this is a second way to talk in it.
+    //
+    // Off by default and per channel, because a message sent this way does
+    // not look like it came from this account at all - which is the point,
+    // and exactly why it must never happen by accident.
+    bool g_hook_mode = false;
+    snowflake g_hook_channel = 0;     // which channel the bar was opened on
+    snowflake g_hook_chosen = 0;      // which webhook of it, 0 for the first
+    bool g_hook_asked = false;        // the listing has been requested
+    unsigned long long g_hook_recheck_ms = 0;   // re-read the listing at this time
+    char g_hook_name[96];
+    char g_hook_avatar[512];
+
+    // The webhooks of one channel, out of the whole server's listing.
+    int hooks_here(snowflake channel_id, api::webhook_row* out, int cap)
+    {
+        api::webhook_row all[64];
+        int n = api::webhooks(all, 64);
+
+        int kept = 0;
+        for (int i = 0; i < n && kept < cap; i++)
+        {
+            // Without a token there is nothing to post through, so one of
+            // those is not an option here even though it is a webhook.
+            if (all[i].channel_id != channel_id || !all[i].token[0]) continue;
+            out[kept++] = all[i];
+        }
+        return kept;
+    }
+
+    void reset_hook_mode(snowflake channel_id)
+    {
+        g_hook_mode = false;
+        g_hook_channel = channel_id;
+        g_hook_chosen = 0;
+        g_hook_asked = false;
+        g_hook_recheck_ms = 0;
+        ccfset(g_hook_name, 0, sizeof(g_hook_name));
+        ccfset(g_hook_avatar, 0, sizeof(g_hook_avatar));
+    }
+
     void submit_message(dchannel* ch)
     {
         bool has_text = g_ui.message_input[0] != 0;
         bool has_files = g_ui.pending_files.count > 0;
         if (!has_text && !has_files) return;
+
+        // Through the webhook instead, when the bar is up for this channel.
+        // Files are not offered that way: uploading needs a multipart body
+        // this does not build, and half a feature that drops attachments
+        // silently is worse than one that says it only carries text.
+        if (g_hook_mode && g_hook_channel == ch->id && has_text && !has_files)
+        {
+            api::webhook_row hooks[16];
+            int n = hooks_here(ch->id, hooks, 16);
+
+            const api::webhook_row* use = 0;
+            for (int i = 0; i < n; i++)
+                if (!g_hook_chosen || hooks[i].id == g_hook_chosen) { use = &hooks[i]; break; }
+
+            if (use)
+            {
+                api::send_via_webhook(use->id, use->token, g_ui.message_input,
+                                      g_hook_name[0] ? g_hook_name : 0,
+                                      g_hook_avatar[0] ? g_hook_avatar : 0);
+
+                ccfset(g_ui.message_input, 0, sizeof(g_ui.message_input));
+                g_ui.reply_to = 0;
+                g_ui.scroll_to_bottom = true;
+                return;
+            }
+        }
 
         if (has_files)
         {
@@ -1234,7 +1583,7 @@ namespace
                 const char* name = m->nick ? m->nick : u->display_name();
                 if (!name_contains(name, needle)) continue;
 
-                ImGui::PushID((int)(u->id & 0x7FFFFFFF));
+                ImGui::PushID((const void*)(size_t)u->id);
                 if (ImGui::Selectable(name)) insert_mention(at, u->id);
                 ImGui::PopID();
                 shown++;
@@ -1250,7 +1599,7 @@ namespace
                 const char* name = u->display_name();
                 if (!name_contains(name, needle)) continue;
 
-                ImGui::PushID((int)(u->id & 0x7FFFFFFF));
+                ImGui::PushID((const void*)(size_t)u->id);
                 if (ImGui::Selectable(name)) insert_mention(at, u->id);
                 ImGui::PopID();
                 shown++;
@@ -1316,11 +1665,16 @@ void ui_view_chat(float width, float height)
                 // A stream belongs to the call it was opened in, so it cannot
                 // outlive it.
                 screenshare::stop();
-                voice::leave();
+                g_ui.pending_voice_leave = true;
+                g_ui.pending_voice_join = false;
             }
             else
             {
-                voice::join(0, ch->id);
+                {
+                    g_ui.pending_voice_guild = 0;
+                    g_ui.pending_voice_channel = ch->id;
+                    g_ui.pending_voice_join = true;
+                }
                 api::ring_call(ch->id);
             }
         }
@@ -1493,6 +1847,73 @@ void ui_view_chat(float width, float height)
 
     draw_attachment_tray(width);
 
+    // What a message sent through the webhook will look like: the name and
+    // the picture it goes out under. Above the box, next to what is being
+    // typed, because that is what they describe.
+    //
+    // The buttons that turn it on and make one live under the box instead -
+    // those are things done to the channel, not to this message.
+    bool hook_here = ch->guild_id && ch->is_textual();
+
+    api::webhook_row hooks[16];
+    int hook_count = 0;
+
+    if (hook_here)
+    {
+        if (g_hook_channel != ch->id) reset_hook_mode(ch->id);
+
+        // One delayed re-read after a webhook is made: creating and listing
+        // are two jobs on a pool and finish in whatever order they finish,
+        // so asking straight away tends to ask before it exists.
+        if (g_hook_recheck_ms && GetTickCount64() >= g_hook_recheck_ms)
+        {
+            g_hook_recheck_ms = 0;
+            api::fetch_webhooks(ch->guild_id);
+        }
+
+        hook_count = g_hook_asked ? hooks_here(ch->id, hooks, 16) : 0;
+
+        if (g_hook_mode && hook_count)
+        {
+            const api::webhook_row* use = &hooks[0];
+            for (int i = 0; i < hook_count; i++)
+                if (hooks[i].id == g_hook_chosen) { use = &hooks[i]; break; }
+
+            if (hook_count > 1)
+            {
+                ImGui::SetNextItemWidth(180.0f);
+                if (ImGui::BeginCombo("##whichhook", use->name))
+                {
+                    for (int i = 0; i < hook_count; i++)
+                    {
+                        ImGui::PushID(i);
+                        if (ImGui::Selectable(hooks[i].name, hooks[i].id == use->id))
+                            g_hook_chosen = hooks[i].id;
+                        ImGui::PopID();
+                    }
+                    ImGui::EndCombo();
+                }
+                ImGui::SameLine();
+            }
+
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::InputTextWithHint("##hookname", use->name, g_hook_name, sizeof(g_hook_name));
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Имя, под которым уйдёт сообщение"));
+
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(240.0f);
+            ImGui::InputTextWithHint("##hookavatar", tr("ссылка на аватарку"),
+                                     g_hook_avatar, sizeof(g_hook_avatar));
+
+            if (g_ui.pending_files.count)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+                ImGui::TextUnformatted(tr("Файлы вебхуком не уходят - отправятся от вашего имени."));
+                ImGui::PopStyleColor();
+            }
+        }
+    }
+
     if (ui_glyph_button("##attach", ICON_PLUS, false, ImVec2(32, 32), col::bg_panel, col::bg_hover, col::text_normal))
     {
         wchar_t path[1024];
@@ -1517,6 +1938,57 @@ void ui_view_chat(float width, float height)
         // the next thing typed goes nowhere and the box has to be clicked
         // again between every two messages. -1 is the item just submitted.
         ImGui::SetKeyboardFocusHere(-1);
+    }
+
+    // Under the box: turning the webhook on, and making one if the channel
+    // has none. Listing them needs Manage Webhooks, so nothing is asked for
+    // until somebody presses the button - firing that request on every
+    // channel that gets opened would be a stream of 403s for everybody who
+    // does not have it.
+    if (hook_here)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, g_hook_mode ? col::green : col::text_muted);
+        bool toggled = ImGui::SmallButton(g_hook_mode ? tr("вебхук: включён")
+                                                      : tr("писать через вебхук"));
+        ImGui::PopStyleColor();
+
+        if (toggled)
+        {
+            if (!g_hook_asked)
+            {
+                g_hook_asked = true;
+                api::fetch_webhooks(ch->guild_id);
+            }
+            g_hook_mode = !g_hook_mode;
+        }
+
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("создать вебхук здесь")))
+        {
+            // Not "IMDiscord": discord refuses a webhook name containing
+            // "discord" and says only "Invalid Form Body" about it.
+            api::create_webhook(ch->id, "IMD Hook");
+
+            g_hook_asked = true;
+            g_hook_mode = true;
+            g_hook_recheck_ms = GetTickCount64() + 1500;
+        }
+
+        if (g_hook_mode)
+        {
+            if (api::webhooks_loading())
+            {
+                ImGui::SameLine();
+                ui_text_muted(tr("ищу вебхуки..."));
+            }
+            else if (!hook_count)
+            {
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+                ImGui::TextUnformatted(tr("на этом канале вебхуков нет"));
+                ImGui::PopStyleColor();
+            }
+        }
     }
 
     ImGui::EndGroup();

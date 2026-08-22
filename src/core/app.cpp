@@ -281,7 +281,7 @@ static ImFont* load_system_font(const wchar_t* file, float size, const ImWchar* 
     return ImGui::GetIO().Fonts->AddFontFromMemoryTTF(owned, (int)size_bytes, size, &cfg, ranges);
 }
 
-static void build_fonts()
+void app_build_fonts()
 {
     ImGuiIO& io = ImGui::GetIO();
 
@@ -312,6 +312,34 @@ static void build_fonts()
     g_app.font_icon = g_app.font_text;
 
     io.FontDefault = g_app.font_text;
+
+    // A character the font has no glyph for is drawn as a question mark, and
+    // that is imgui doing its best with no way of knowing better. Channel
+    // names on a lot of servers are written in "fancy" text - letters from
+    // blocks nothing here covers, invisible marks wedged between the real
+    // ones - and every one of them came out as a question mark, so a name
+    // read as one long stammer of them.
+    //
+    // There is nothing to draw for those and nothing worth drawing, so
+    // nothing is what they get: with no fallback glyph the renderer skips the
+    // character outright. The advance goes too, or a name would be padded
+    // with the blanks the question marks used to sit in.
+    io.Fonts->Build();
+
+    for (int i = 0; i < io.Fonts->Fonts.Size; i++)
+    {
+        ImFont* f = io.Fonts->Fonts[i];
+
+        f->FallbackGlyph = 0;
+        f->FallbackAdvanceX = 0.0f;
+
+        // Codepoints inside the built table but with no glyph behind them
+        // were given the fallback width when the table was made, and that
+        // number is already in there.
+        for (int c = 0; c < f->IndexLookup.Size && c < f->IndexAdvanceX.Size; c++)
+            if (f->IndexLookup.Data[c] == (ImWchar)-1)
+                f->IndexAdvanceX.Data[c] = 0.0f;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +412,7 @@ int app_main()
     io.IniFilename = 0;  // file functions are disabled in imconfig
     io.LogFilename = 0;
 
-    build_fonts();
+    app_build_fonts();
     log_line("app: fonts built");
     // What the person chose, before the first frame is drawn - otherwise the
     // client flashes discord's colours and then changes to theirs.

@@ -41,7 +41,7 @@ namespace
             dchannel* c = store::find_channel(g->channels[i]);
             if (!c || c->type != CH_CATEGORY) continue;
 
-            ImGui::PushID((int)(c->id & 0x7FFFFFFF));
+            ImGui::PushID((const void*)(size_t)c->id);
             if (ImGui::Selectable(c->name ? c->name : tr("без имени"), c->id == g_parent))
                 g_parent = c->id;
             ImGui::PopID();

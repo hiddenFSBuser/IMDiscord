@@ -1845,6 +1845,21 @@ bool streamview::watch(snowflake guild_id, snowflake channel_id, snowflake user_
     return true;
 }
 
+// What was being watched when the connection went, so it can be picked up
+// again when the call comes back.
+//
+// A gateway session being replaced takes the stream with it, and until now
+// that was the end of it: the call returned a few seconds later and the
+// picture did not. Nobody asked for it to stop, so it should not stay
+// stopped.
+namespace
+{
+    snowflake g_again_guild = 0;
+    snowflake g_again_channel = 0;
+    snowflake g_again_user = 0;
+    unsigned long long g_again_at = 0;
+}
+
 void streamview::stop()
 {
     if (!g_running && g_state == WATCH_IDLE) return;
@@ -1856,7 +1871,16 @@ void streamview::stop()
 
     InterlockedExchange(&g_running, 0);
 
-    if (InterlockedExchange(&g_notify_on_stop, 1)) send_gateway_unwatch();
+    // The flag that decides whether discord is told also says whether this
+    // was somebody closing the picture or the connection being pulled out
+    // from under it. A deliberate close forgets what was open; an
+    // involuntary one leaves it to be reopened.
+    bool deliberate = InterlockedExchange(&g_notify_on_stop, 1) != 0;
+    if (deliberate)
+    {
+        send_gateway_unwatch();
+        g_again_user = 0;
+    }
     g_ws.close();
 
     if (g_pump_thread) { WaitForSingleObject(g_pump_thread, 4000); CloseHandle(g_pump_thread); g_pump_thread = 0; }
@@ -2009,5 +2033,39 @@ void streamview::on_stream_delete(const jval* d)
 
 void streamview::on_gateway_disconnected()
 {
-    if (g_running) stop_later(false);
+    if (!g_running) return;
+
+    g_again_guild = g_guild_id;
+    g_again_channel = g_channel_id;
+    g_again_user = g_user_id;
+    g_again_at = GetTickCount64();
+
+    // Still deferred to a thread of its own. This runs on the gateway thread
+    // and stopping waits for threads that are, at this moment, waiting on
+    // the gateway.
+    stop_later(false);
 }
+
+void streamview::restore_if_pending()
+{
+    if (!g_again_user) return;
+
+    // Only worth doing while it is still the same moment. A minute later the
+    // person has moved on, and a picture opening by itself would be a
+    // surprise rather than a repair.
+    if (GetTickCount64() - g_again_at > 60000ULL) { g_again_user = 0; return; }
+
+    // Nothing to hang it on until the call is back up, and nothing to do if
+    // something is being watched already.
+    if (voice::state() != VOICE_CONNECTED) return;
+    if (g_running) { g_again_user = 0; return; }
+
+    snowflake guild = g_again_guild;
+    snowflake channel = g_again_channel;
+    snowflake user = g_again_user;
+    g_again_user = 0;
+
+    log_line("watch: возвращаемся к трансляции %llu", user);
+    streamview::watch(guild, channel, user);
+}
+

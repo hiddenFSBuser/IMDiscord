@@ -82,7 +82,7 @@ void ui_view_webhooks_popup()
 
         for (int i = 0; i < count; i++)
         {
-            ImGui::PushID((int)(rows[i].id & 0x7FFFFFFF));
+            ImGui::PushID((const void*)(size_t)rows[i].id);
 
             ImGui::TextUnformatted(rows[i].name);
 
@@ -137,7 +137,7 @@ void ui_view_webhooks_popup()
                 char row[160];
                 ui_channel_display_name(c, row, sizeof(row));
 
-                ImGui::PushID((int)(c->id & 0x7FFFFFFF));
+                ImGui::PushID((const void*)(size_t)c->id);
                 if (ImGui::Selectable(row, c->id == g_ui.hooks_channel))
                     g_ui.hooks_channel = c->id;
                 ImGui::PopID();

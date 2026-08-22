@@ -76,6 +76,59 @@ namespace
     }
 }
 
+// "Invite them to..." - the servers this account is in, and an invite to the
+// chosen one dropped into the conversation.
+//
+// Needs somewhere to send it, which is why it takes a channel rather than a
+// person: from a direct message that channel is already open, and from the
+// friends list there may be no conversation at all yet. The caller decides
+// which, because only it knows.
+void ui_invite_to_server_menu(snowflake to_channel)
+{
+    if (!to_channel) return;
+
+    store::guard guard;
+
+    if (!ImGui::BeginMenu(tr("Пригласить на сервер"))) return;
+
+    int offered = 0;
+    const ulist<snowflake>& guilds = store::guild_order();
+
+    for (unsigned int i = 0; i < guilds.count; i++)
+    {
+        dguild* g = store::find_guild(guilds[i]);
+        if (!g) continue;
+
+        // An invite is made against a channel, so a server with none this
+        // account can invite into cannot be offered. Judged per channel
+        // rather than per server: the right is an ordinary channel
+        // permission and a server often grants it in one place only.
+        snowflake from = 0;
+        for (unsigned int k = 0; k < g->channels.count; k++)
+        {
+            dchannel* c = store::find_channel(g->channels[k]);
+            if (!c || !c->is_textual()) continue;
+            if (!(store::member_permissions(g, store::self_id(), c) & PERM_CREATE_INVITE)) continue;
+
+            from = c->id;
+            break;
+        }
+
+        if (!from) continue;
+
+        ImGui::PushID((const void*)(size_t)g->id);
+        if (ImGui::MenuItem(g->name ? g->name : tr("сервер")))
+            api::send_guild_invite(from, to_channel);
+        ImGui::PopID();
+
+        offered++;
+    }
+
+    if (!offered) ui_text_muted(tr("некуда - нет права на приглашения"));
+
+    ImGui::EndMenu();
+}
+
 bool ui_can_move_member(snowflake guild_id, snowflake user_id, snowflake to_channel_id)
 {
     if (!guild_id || !user_id) return false;
@@ -151,7 +204,7 @@ void ui_member_moderation_menu(snowflake guild_id, snowflake user_id)
             char label[160];
             ui_channel_display_name(c, label, sizeof(label));
 
-            ImGui::PushID((int)(c->id & 0x7FFFFFFF));
+            ImGui::PushID((const void*)(size_t)c->id);
             if (ImGui::MenuItem(label)) api::voice_move(guild_id, user_id, c->id);
             ImGui::PopID();
 

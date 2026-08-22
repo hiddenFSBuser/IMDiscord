@@ -115,6 +115,21 @@ void ui_view_roles_popup()
     ImGui::TextUnformatted(tr("Роли"));
     ImGui::SameLine();
     ui_text_muted(g->name ? g->name : "");
+
+    // Open to anybody. What the roles of a server are, what colour they are
+    // and who holds them is not privileged information, and hiding it from
+    // everyone without the right to edit it hides it from almost everyone.
+    // Saying that it is a catalogue is better than an editor that quietly
+    // refuses.
+    bool may_edit = (store::member_permissions(g, store::self_id(), 0) &
+                     (PERM_MANAGE_ROLES | PERM_ADMINISTRATOR)) != 0;
+
+    if (!may_edit)
+    {
+        ImGui::SameLine();
+        ui_text_muted(tr("- только просмотр"));
+    }
+
     ImGui::Separator();
 
     // ---- the list -------------------------------------------------------
@@ -128,13 +143,22 @@ void ui_view_roles_popup()
         // anybody is given or taken away, so it is not offered as one.
         if (r->id == g->id) continue;
 
-        ImGui::PushID((int)(r->id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)r->id);
         ImGui::PushStyleColor(ImGuiCol_Text, role_tint(r));
 
         bool picked = g_ui.roles_selected == r->id;
         if (ImGui::Selectable(r->name ? r->name : tr("без имени"), picked)) load_role(r);
 
         ImGui::PopStyleColor();
+
+        // Popped before the menu, so the menu is drawn in ordinary colours
+        // rather than in the role's own.
+        if (ImGui::BeginPopupContextItem("##rolectx"))
+        {
+            ui_copy_id_item(r->id, tr("Скопировать ID роли"));
+            ImGui::EndPopup();
+        }
+
         ImGui::PopID();
     }
 
@@ -266,7 +290,7 @@ void ui_member_roles_menu(snowflake guild_id, snowflake user_id)
             for (unsigned int k = 0; k < m->roles.count; k++)
                 if (m->roles[k] == r->id) { has = true; break; }
 
-        ImGui::PushID((int)(r->id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)r->id);
         ImGui::PushStyleColor(ImGuiCol_Text, role_tint(r));
 
         if (ImGui::MenuItem(r->name ? r->name : tr("без имени"), 0, has))

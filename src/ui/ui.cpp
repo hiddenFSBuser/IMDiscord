@@ -13,6 +13,9 @@
 #include "discord/rest.h"
 #include "discord/science.h"
 #include "discord/gateway.h"
+#include "discord/dmscan.h"
+#include "discord/people.h"
+#include "discord/warmup.h"
 #include "discord/voice.h"
 #include "video/screenshare.h"
 #include "video/streamview.h"
@@ -113,6 +116,11 @@ namespace
             // The new socket owns the media again from here.
             gateway::hold_media(false);
             gateway::start();
+
+            // A bot is told about none of its direct conversations, so it
+            // goes looking for them itself. Does nothing on a person's
+            // account, which is handed the whole list in READY.
+            dmscan::start();
         }
         else
         {
@@ -200,6 +208,12 @@ namespace
 
         // Set before the socket goes, so its closing does not take the voice
         // connection with it.
+        // Told before the socket goes, so the minute it keeps working for is
+        // a minute that starts now rather than whenever it next looks.
+        // Both of these belong to the account being left.
+        warmup::stop();
+        dmscan::wind_down();
+
         gateway::hold_media(keep_media);
 
         // With a call up, the socket is not closed at all: it steps aside and
@@ -416,6 +430,42 @@ void ui_set_video_player(bool on)
 
     // Turning it off with something playing should stop it there and then.
     if (!on) player::stop();
+}
+
+// Server emoji, drawn as the little pictures they are instead of left as
+// the <:name:id> they arrive as.
+//
+// Off by default, and deliberately: a busy channel is full of them, every
+// one is its own download and its own texture, and on a server that leans on
+// them a single screen can ask for dozens at once. That is a real cost and
+// it should be somebody's choice, not a surprise.
+bool ui_custom_emoji()
+{
+    return storage::settings_get_int("custom_emoji", 0) != 0;
+}
+
+void ui_set_custom_emoji(bool on)
+{
+    storage::settings_set_int("custom_emoji", on ? 1 : 0);
+    storage::settings_save();
+}
+
+// The ordinary emoji, the ones that are just characters.
+//
+// Off by default and for a reason worth stating plainly: the pictures come
+// from a public cdn that has nothing to do with discord, so turning this on
+// means one more host sees that this machine is reading a message. Nothing
+// about the account goes with the request - it asks for a file named after a
+// codepoint - but the request happens, and that is the trade.
+bool ui_unicode_emoji()
+{
+    return storage::settings_get_int("unicode_emoji", 0) != 0;
+}
+
+void ui_set_unicode_emoji(bool on)
+{
+    storage::settings_set_int("unicode_emoji", on ? 1 : 0);
+    storage::settings_save();
 }
 
 bool ui_embed_direct_gifs()
@@ -1271,7 +1321,7 @@ void ui_view_accounts_popup()
         ccfset(g_ui.token_input, 0, sizeof(g_ui.token_input));
     }
 
-    ImGui::SetNextWindowSize(ImVec2(340, 0));
+    ImGui::SetNextWindowSize(ImVec2(360, 0));
     if (!ImGui::BeginPopup("##accounts")) return;
 
     bool busy = g_ui.login_busy != 0;
@@ -1333,6 +1383,66 @@ void ui_view_accounts_popup()
     int switch_to = -1;
     int forget = -1;
 
+    // Groups, as a row of buttons rather than as sections that fold open.
+    //
+    // With twenty accounts a list is a list whatever is done to it: folding
+    // it up only means the one being looked for is behind a heading instead
+    // of below one. A button picks a pile and shows that pile, so what is on
+    // screen is only ever the handful being chosen between.
+    static char picked_group[32] = "";
+
+    {
+        char groups[16][32];
+        int group_count = storage::account_groups(groups, 16);
+
+        // A group that stopped existing - its last account left or was
+        // forgotten - must not go on filtering everything away.
+        if (picked_group[0])
+        {
+            bool still = false;
+            for (int i = 0; i < group_count; i++)
+                if (ccscmp(groups[i], picked_group) == 0) still = true;
+            if (!still) picked_group[0] = 0;
+        }
+
+        if (group_count)
+        {
+            float wide = ImGui::GetContentRegionAvail().x;
+            float used = 0.0f;
+
+            for (int i = -1; i < group_count; i++)
+            {
+                const char* name = i < 0 ? tr("все") : groups[i];
+                bool on = i < 0 ? picked_group[0] == 0
+                                : ccscmp(picked_group, groups[i]) == 0;
+
+                float w = ImGui::CalcTextSize(name).x + 16.0f;
+
+                // Wrapped by hand: a row of these is as wide as the names
+                // somebody chose, and imgui will happily run it off the edge.
+                if (used > 0.0f && used + w > wide) used = 0.0f;
+                else if (used > 0.0f) ImGui::SameLine(0, 4);
+
+                used += w + 4.0f;
+
+                ImGui::PushID(i);
+                ImGui::PushStyleColor(ImGuiCol_Button, on ? col::accent : col::bg_panel);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on ? col::accent : col::bg_hover);
+
+                if (ImGui::SmallButton(name))
+                {
+                    ccfset(picked_group, 0, sizeof(picked_group));
+                    if (i >= 0) ccstrncpy(picked_group, groups[i], sizeof(picked_group) - 1);
+                }
+
+                ImGui::PopStyleColor(2);
+                ImGui::PopID();
+            }
+
+            ImGui::Separator();
+        }
+    }
+
     // The route everything takes unless an account asks for its own. First,
     // because it is the one most people will ever touch.
     {
@@ -1374,6 +1484,12 @@ void ui_view_accounts_popup()
         const saved_account* entry = storage::account_at(i);
         if (!entry) continue;
 
+        // The one signed in is always shown, whichever pile is chosen. Losing
+        // sight of where you are because of a filter is disorienting in a way
+        // that saving one row is not worth.
+        if (picked_group[0] && i != active && ccscmp(entry->group, picked_group) != 0)
+            continue;
+
         ImGui::PushID(i);
 
         // The stored hash is enough to ask the cdn for the picture; a stack
@@ -1402,12 +1518,66 @@ void ui_view_accounts_popup()
         if (!current && ImGui::IsItemHovered())
             ImGui::SetTooltip(tr("Переключиться на этот аккаунт"));
 
+        // Right click on the account itself, because that is the thing being
+        // sorted. A field per row would be twenty text boxes on screen for a
+        // decision each account needs once.
+        if (ImGui::BeginPopupContextItem("##acctgroup"))
+        {
+            ui_text_muted(tr("Категория"));
+
+            char groups[16][32];
+            int group_count = storage::account_groups(groups, 16);
+
+            for (int k = 0; k < group_count; k++)
+            {
+                bool on = ccscmp(entry->group, groups[k]) == 0;
+
+                ImGui::PushID(k);
+                if (ImGui::MenuItem(groups[k], 0, on))
+                    storage::account_set_group(i, on ? "" : groups[k]);
+                ImGui::PopID();
+            }
+
+            if (group_count) ImGui::Separator();
+
+            static char fresh[32] = "";
+            ImGui::SetNextItemWidth(150.0f);
+            bool entered = ImGui::InputTextWithHint("##newgroup", tr("новая категория"),
+                                                    fresh, sizeof(fresh),
+                                                    ImGuiInputTextFlags_EnterReturnsTrue);
+
+            if (entered && fresh[0])
+            {
+                storage::account_set_group(i, fresh);
+                ccfset(fresh, 0, sizeof(fresh));
+                ImGui::CloseCurrentPopup();
+            }
+
+            if (entry->group[0])
+            {
+                ImGui::Separator();
+                if (ImGui::MenuItem(tr("Убрать из категории")))
+                    storage::account_set_group(i, "");
+            }
+
+            ImGui::EndPopup();
+        }
+
+        // Said on the row, so a filter showing everything still tells you
+        // which pile each account is in.
+        if (entry->group[0])
+        {
+            ImGui::SameLine(0, 6);
+            ui_text_muted(entry->group);
+        }
+
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, col::bg_panel);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col::red);
         if (ImGui::SmallButton("x")) forget = i;
         ImGui::PopStyleColor(2);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Забыть этот аккаунт"));
+
 
         // One line per account saying where its traffic goes, and a way in.
         {
@@ -1429,6 +1599,19 @@ void ui_view_accounts_popup()
                 if (g_ui.proxy_editing == i) g_ui.proxy_editing = -1;
                 else ui_proxy_editor_open(i, &entry->proxy, own);
             }
+            // On this line rather than beside the name: the top line is the
+            // account itself - picture, name, the group it is in and the way to
+            // forget it - and a fifth thing on it pushed the last one off the
+            // edge of the window.
+            //
+            // Before the summary, not after. The summary is as long as whatever
+            // proxy somebody typed in, and a button behind it would be pushed
+            // off the same edge again.
+            ImGui::SameLine();
+            if (ImGui::SmallButton(tr("токен"))) ui_open_token(i);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(tr("Показать токен - после небольшой проверки"));
+
             ImGui::SameLine();
             ui_text_muted(summary);
             ImGui::Unindent(30.0f);
@@ -1827,6 +2010,10 @@ void ui_init()
     jobs::init(6);
     tex::init();
     store::init();
+
+    // Cross-account and long lived: it is loaded once and outlives every sign
+    // in, sign out and switch that happens while the client is open.
+    people::init();
     offline::init();
     api::init();
     voice::init();
@@ -2018,6 +2205,26 @@ void ui_frame()
     float chat_w = total_w - RAIL_WIDTH - LIST_WIDTH - members_w;
     if (chat_w < 200.0f) chat_w = 200.0f;
 
+    // Before the lock, not after it.
+    //
+    // The guard below is held for the whole of the rest of this function -
+    // the sidebar, the chat, every popup - and joining or leaving a call stops
+    // threads and waits for them to finish. Those threads take that same lock.
+    // Putting this after the guard was putting it inside the lock: it read as
+    // deferred and was not deferred at all, which is why the freeze survived
+    // being "fixed" once already.
+    if (g_ui.pending_voice_leave)
+    {
+        g_ui.pending_voice_leave = false;
+        g_ui.pending_voice_join = false;
+        voice::leave();
+    }
+    else if (g_ui.pending_voice_join)
+    {
+        g_ui.pending_voice_join = false;
+        voice::join(g_ui.pending_voice_guild, g_ui.pending_voice_channel);
+    }
+
     store::guard guard;
 
     ImGui::BeginChild("##rail", ImVec2(RAIL_WIDTH, total_h), false,
@@ -2084,11 +2291,39 @@ void ui_frame()
     ui_view_music_popup();
     ui_view_ownership_popup();
     ui_view_delete_guild_popup();
+    ui_view_rename_popup();
+    ui_view_onboarding_popup();
+    ui_view_token_popup();
     ui_view_guild_edit_popup();
     ui_view_channel_info_popup();
     ui_view_share_popup();
 
-    // Lets the player notice a video nobody is looking at any more.
+    // The panel a server shows on the way in, opened by itself.
+    //
+    // Two ways in, because there are two ways to arrive at a server that is
+    // still asking: having just joined it, and opening one joined earlier
+    // without ever answering. Only the first was handled, which is why a
+    // server with onboarding could be sat in for days without being asked.
+    {
+        snowflake joined = api::take_joined_guild();
+        if (joined) api::probe_onboarding(joined);
+
+        snowflake ask = api::take_onboarding_prompt();
+        if (ask) ui_open_onboarding(ask);
+    }
+
+    // A call that came back after being cut off should bring back what was
+    // on it. Both of these do nothing unless there is something waiting, and
+    // both wait for the call itself to be up first.
+    streamview::restore_if_pending();
+    screenshare::restore_if_pending();
+
+    // Everybody the store has ended up holding, written down under the account
+    // that saw them. Both of these are on timers of their own and cost nothing
+    // on the frames in between.
+    people::sweep_store();
+    people::save_if_due();
+
     if (ui_video_player()) player::tick();
     ui_view_settings_popup();
     ui_view_image_viewer();
@@ -2107,6 +2342,12 @@ void ui_shutdown()
     gateway::stop();
     streamview::shutdown();
     screenshare::shutdown();
+    // The walk gets its minute on a switch; on the way out there is no
+    // minute to give it.
+    warmup::stop();
+    people::shutdown();
+    dmscan::stop();
+
     voice::shutdown();
 
     storage::settings_set_int("input_gain", (int)(audio::input_gain() * 100.0f));

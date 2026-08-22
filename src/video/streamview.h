@@ -107,6 +107,10 @@ namespace streamview
     void on_stream_delete(const jval* d);
     void on_gateway_disconnected();
 
+    // Reopens whatever the gateway going away closed, once the call is back.
+    // Called every frame; does nothing unless there is something waiting.
+    void restore_if_pending();
+
     // The key this viewer is waiting on, so the sending side can tell the two
     // apart. Empty while idle.
     const char* stream_key();

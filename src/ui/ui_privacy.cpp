@@ -69,7 +69,7 @@ void ui_view_privacy_popup()
 
             bool allowed = privacy::dms_allowed_from(g->id);
 
-            ImGui::PushID((int)(g->id & 0x7FFFFFFF));
+            ImGui::PushID((const void*)(size_t)g->id);
             if (ImGui::Checkbox(g->name ? g->name : tr("без имени"), &allowed))
                 privacy::set_dms_allowed_from(g->id, allowed);
             ImGui::PopID();

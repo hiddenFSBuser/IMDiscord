@@ -95,7 +95,7 @@ namespace
             char row[160];
             ui_channel_display_name(c, row, sizeof(row));
 
-            ImGui::PushID((int)(c->id & 0x7FFFFFFF));
+            ImGui::PushID((const void*)(size_t)c->id);
             if (ImGui::Selectable(row, c->id == g_ui.invite_channel))
                 g_ui.invite_channel = c->id;
             ImGui::PopID();

@@ -1,5 +1,8 @@
 #include "pch.h"
 #include "ui_state.h"
+#include "discord/people.h"
+#include "emoji.h"
+#include "textures.h"
 #include "ufile.h"
 #include "video/capture.h"
 #include "video/censor.h"
@@ -47,7 +50,7 @@ namespace
         duser* u = store::find_user(rel->user_id);
         if (!u) return;
 
-        ImGui::PushID((int)(rel->user_id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)rel->user_id);
 
         ImVec2 start = ImGui::GetCursorScreenPos();
         float row_h = 52.0f;
@@ -64,8 +67,17 @@ namespace
         if (ImGui::BeginPopupContextItem("##relctx"))
         {
             if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, 0);
+
+            // Only into a conversation that already exists. Making one just
+            // to drop a link into it would open a window this person never
+            // asked for, and the invite is the thing being sent, not the
+            // conversation.
+            snowflake dm = store::dm_with(u->id);
+            if (dm) ui_invite_to_server_menu(dm);
+
             ImGui::Separator();
             ui_copy_id_item(u->id, tr("Скопировать ID пользователя"));
+            if (dm) ui_copy_id_item(dm, tr("Скопировать ID чата"));
             ImGui::EndPopup();
         }
 
@@ -347,6 +359,77 @@ void ui_draw_muted_marks(ImDrawList* dl, ImVec2 at, float size,
     }
 }
 
+// Whether the font atlas has nothing for a character.
+//
+// Everything past the basic plane is out of reach of a 16-bit glyph index,
+// so that half needs no asking.
+bool ui_font_lacks_glyph(unsigned int c)
+{
+    if (c > 0xFFFF) return true;
+
+    ImFont* f = ImGui::GetFont();
+    return !f || !f->FindGlyphNoFallback((ImWchar)c);
+}
+
+// Text with its emoji drawn as pictures, for the places that paint straight
+// into a draw list rather than laying out items - channel names, category
+// headings, anywhere a name is one string at one position.
+//
+// Runs of ordinary text go out whole; only the emoji are handled one at a
+// time. Returns the width, so a caller can lay out around it, and does the
+// same walk with `dl` null when only a width is wanted.
+static float text_emoji(ImDrawList* dl, ImVec2 at, ImU32 colour, const char* text)
+{
+    if (!text || !text[0]) return 0.0f;
+
+    bool on = ui_unicode_emoji();
+    float line = ImGui::GetTextLineHeight();
+    float x = at.x;
+
+    const char* run = text;
+    const char* p = text;
+
+    while (*p)
+    {
+        char url[256];
+        int taken = on ? uemoji::at(p, url, sizeof(url), ui_font_lacks_glyph) : 0;
+
+        if (!taken) { p++; continue; }
+
+        const texture* t = tex::get(url);
+
+        // Not here yet, or never coming: leave the characters in the run and
+        // let the font make of them what it can. Taking them out would put a
+        // hole in the name.
+        if (!t->ready()) { p += taken; continue; }
+
+        if (p > run)
+        {
+            if (dl) dl->AddText(ImVec2(x, at.y), colour, run, p);
+            x += ImGui::CalcTextSize(run, p).x;
+        }
+
+        if (dl) dl->AddImage(t->id(), ImVec2(x, at.y), ImVec2(x + line, at.y + line));
+        x += line;
+
+        p += taken;
+        run = p;
+    }
+
+    if (p > run)
+    {
+        if (dl) dl->AddText(ImVec2(x, at.y), colour, run, p);
+        x += ImGui::CalcTextSize(run, p).x;
+    }
+
+    return x - at.x;
+}
+
+float ui_draw_text_emoji(ImDrawList* dl, ImVec2 at, ImU32 colour, const char* text)
+{
+    return text_emoji(dl, at, colour, text);
+}
+
 // The owner's crown. Three peaks over a band, which is the shape everybody
 // already reads as "this one owns the place" - a word would have to be
 // translated and would still be longer than the name it follows.
@@ -437,7 +520,7 @@ static void draw_group_members(dchannel* c, float width)
             for (unsigned int k = 0; k < in_call.count && !talking; k++)
                 talking = in_call[k] == u->id;
 
-            ImGui::PushID((int)(u->id & 0x7FFFFFFF));
+            ImGui::PushID((const void*)(size_t)u->id);
 
             float row_w = width - 20.0f;
             ImVec2 start = ImGui::GetCursorScreenPos();
@@ -455,8 +538,10 @@ static void draw_group_members(dchannel* c, float width)
             if (ImGui::BeginPopupContextItem("##gmctx"))
             {
                 if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, 0);
+                ui_invite_to_server_menu(c->id);
                 ImGui::Separator();
                 ui_copy_id_item(u->id, tr("Скопировать ID пользователя"));
+                ui_copy_id_item(c->id, tr("Скопировать ID чата"));
                 ImGui::EndPopup();
             }
 
@@ -637,7 +722,7 @@ void ui_view_members(float width, float height)
             ImGui::Dummy(ImVec2(0, 2));
         }
 
-        ImGui::PushID((int)(u->id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)u->id);
         ImVec2 start = ImGui::GetCursorScreenPos();
         float row_w = width - 24.0f;
 
@@ -720,6 +805,222 @@ void ui_view_members(float width, float height)
 // ---------------------------------------------------------------------------
 // profile
 // ---------------------------------------------------------------------------
+
+namespace
+{
+    // The two lists a profile knows that nothing else does: which servers
+    // this person and one of our accounts are both in, and who they and one
+    // of our accounts both know.
+    //
+    // Both are read out of the cross-account file rather than out of the
+    // answer that arrived a moment ago. That answer is one account's view;
+    // the file holds every account's, and holds them when there is nothing
+    // to ask.
+    //
+    // Which is why each row says where it came from - and why a row appears
+    // once with several accounts named rather than once per account. The same
+    // server seen from three of them is one server, not three.
+    const float MUTUAL_WIDTH = 380.0f;
+
+    // "первый, второй, третий", however many there are.
+    void join_accounts(const snowflake* ids, int count, char* out, int cap)
+    {
+        out[0] = 0;
+        int at = 0;
+
+        for (int i = 0; i < count; i++)
+        {
+            const char* who = people::account_name(ids[i]);
+            if (!who || !who[0]) continue;
+
+            if (at && at < cap - 3) { out[at++] = ','; out[at++] = ' '; }
+
+            for (int k = 0; who[k] && at < cap - 1; k++) out[at++] = who[k];
+            out[at] = 0;
+        }
+    }
+
+    // On the right when it fits, on the line below when it does not. Three or
+    // four account names are wider than the window, and pushed to the right
+    // regardless they would run over the name they belong to.
+    void draw_source(const char* accounts, float name_width)
+    {
+        if (!accounts || !accounts[0]) return;
+
+        float w = ImGui::CalcTextSize(accounts).x;
+
+        ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
+
+        if (name_width + w + 12.0f < MUTUAL_WIDTH)
+        {
+            ImGui::SameLine(MUTUAL_WIDTH - w);
+            ImGui::TextUnformatted(accounts);
+        }
+        else
+        {
+            ImGui::Indent(14.0f);
+            ImGui::PushTextWrapPos(MUTUAL_WIDTH);
+            ImGui::TextUnformatted(accounts);
+            ImGui::PopTextWrapPos();
+            ImGui::Unindent(14.0f);
+        }
+
+        ImGui::PopStyleColor();
+    }
+
+    void draw_mutual_guilds(snowflake user_id)
+    {
+        people::sighting rows[128];
+        int n = people::guilds_of(user_id, rows, 128);
+        if (!n) return;
+
+        // One entry per server, and the accounts that see it gathered onto it.
+        snowflake shown[128];
+        int shown_count = 0;
+
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Separator();
+
+        // Counted first, because the heading is drawn before the rows and the
+        // number it wants is the number of servers, not of sightings.
+        for (int i = 0; i < n; i++)
+        {
+            bool had = false;
+            for (int k = 0; k < shown_count; k++)
+                if (shown[k] == rows[i].guild_id) { had = true; break; }
+
+            if (!had && shown_count < 128) shown[shown_count++] = rows[i].guild_id;
+        }
+
+        char head[64];
+        cnprint(head, sizeof(head), tr("ОБЩИЕ СЕРВЕРА - %d"), shown_count);
+        ui_text_muted(head);
+        ImGui::Dummy(ImVec2(0, 2));
+
+        for (int i = 0; i < shown_count; i++)
+        {
+            snowflake gid = shown[i];
+
+            snowflake from[16];
+            int from_count = 0;
+            for (int k = 0; k < n && from_count < 16; k++)
+                if (rows[k].guild_id == gid) from[from_count++] = rows[k].account_id;
+
+            // The store first, because it has the name as it is right now;
+            // the file has it as it was when somebody last looked.
+            dguild* g = store::find_guild(gid);
+            const char* name = (g && g->name) ? g->name : people::guild_name(gid);
+
+            char label[128];
+            if (name && name[0]) cnprint(label, sizeof(label), "%s", name);
+            else                 cnprint(label, sizeof(label), "%llu", gid);
+
+            char accounts[256];
+            join_accounts(from, from_count, accounts, sizeof(accounts));
+
+            ImGui::PushID(i);
+            ImGui::TextUnformatted(label);
+            draw_source(accounts, ImGui::CalcTextSize(label).x);
+            ImGui::PopID();
+        }
+    }
+
+    void draw_mutual_friends(snowflake user_id)
+    {
+        people::mutual rows[256];
+        int n = people::friends_of(user_id, rows, 256);
+        if (!n) return;
+
+        snowflake shown[256];
+        int shown_count = 0;
+
+        for (int i = 0; i < n; i++)
+        {
+            bool had = false;
+            for (int k = 0; k < shown_count; k++)
+                if (shown[k] == rows[i].user_id) { had = true; break; }
+
+            if (!had && shown_count < 256) shown[shown_count++] = rows[i].user_id;
+        }
+
+        // Still a friend if any account still sees them as one. Gone only
+        // when every account that knew about them has stopped seeing them.
+        int here = 0;
+        for (int i = 0; i < shown_count; i++)
+        {
+            bool any = false;
+            for (int k = 0; k < n; k++)
+                if (rows[k].user_id == shown[i] && !rows[k].gone) { any = true; break; }
+            if (any) here++;
+        }
+
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Separator();
+
+        char head[80];
+        if (here == shown_count)
+            cnprint(head, sizeof(head), tr("ОБЩИЕ ДРУЗЬЯ - %d"), here);
+        else
+            cnprint(head, sizeof(head), tr("ОБЩИЕ ДРУЗЬЯ - %d, было %d"), here, shown_count);
+
+        ui_text_muted(head);
+        ImGui::Dummy(ImVec2(0, 2));
+
+        // The ones who still are, then the ones who were. The interesting
+        // half is the second one, and it belongs at the bottom where it does
+        // not push the current list around as it grows.
+        for (int pass = 0; pass < 2; pass++)
+        {
+            for (int i = 0; i < shown_count; i++)
+            {
+                snowflake fid = shown[i];
+
+                bool any_here = false;
+                snowflake from[16];
+                int from_count = 0;
+
+                for (int k = 0; k < n; k++)
+                {
+                    if (rows[k].user_id != fid) continue;
+                    if (!rows[k].gone) any_here = true;
+                    if (from_count < 16) from[from_count++] = rows[k].account_id;
+                }
+
+                bool gone = !any_here;
+                if (gone != (pass == 1)) continue;
+
+                duser* fu = store::find_user(fid);
+                const char* name = fu ? fu->display_name() : people::user_name(fid);
+
+                char label[160];
+                if (name && name[0]) cnprint(label, sizeof(label), "%s", name);
+                else                 cnprint(label, sizeof(label), "%llu", fid);
+
+                char accounts[256];
+                join_accounts(from, from_count, accounts, sizeof(accounts));
+
+                ImGui::PushID(1000 + i);
+
+                if (gone)
+                {
+                    ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
+                    ImGui::TextUnformatted(label);
+                    ImGui::PopStyleColor();
+
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(tr("Больше не в общих друзьях"));
+                }
+                else
+                {
+                    ImGui::TextUnformatted(label);
+                }
+
+                draw_source(accounts, ImGui::CalcTextSize(label).x);
+                ImGui::PopID();
+            }
+        }
+    }
+}
 
 void ui_view_profile_popup()
 {
@@ -1026,6 +1327,9 @@ void ui_view_profile_popup()
                 api::block_user(u->id);
         }
     }
+
+    draw_mutual_guilds(u->id);
+    draw_mutual_friends(u->id);
 
     if (api::last_error()[0])
     {

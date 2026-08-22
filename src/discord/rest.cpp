@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "rest.h"
 #include "store.h"
+#include "people.h"
 #include "archive.h"
 #include "core/offline.h"
 #include "core/log.h"
@@ -336,12 +337,59 @@ namespace
     }
 }
 
+namespace
+{
+    // ---- onboarding and the rules gate -----------------------------------
+
+    ulist<api::onboard_prompt> g_prompts;
+    ulist<api::onboard_option> g_options;
+
+    ulist<char*> g_rules;          // one line each, owned here
+    char g_rules_desc[512];
+    char g_rules_version[64];
+
+    // The form exactly as it arrived. Agreeing means sending it back with an
+    // answer added to every field, and rebuilding it from parsed pieces would
+    // mean guessing at fields this client has never seen.
+    ubuffer g_rules_raw;
+    bool g_rules_raw_ready = false;
+
+    volatile long g_onboard_busy = 0;
+
+    // The server a join by invite landed in, until somebody asks for it.
+    volatile snowflake g_joined_guild = 0;
+
+    // A server whose panel ought to be shown, found by looking rather than by
+    // having just joined. Same idea: read once, then cleared.
+    volatile snowflake g_onboard_show = 0;
+
+    // Whether the last fetch found the panel already answered. A server keeps
+    // its prompts forever, so "has prompts" is not "wants an answer" - what
+    // separates them is whether this account has ever given one.
+    bool g_onboard_answered = false;
+
+    void free_rules()
+    {
+        for (unsigned int i = 0; i < g_rules.count; i++)
+            if (g_rules[i]) memfree(g_rules[i]);
+        g_rules.clear_fast();
+    }
+
+}
+
 void api::init()
 {
     if (g_ready) return;
     InitializeCriticalSection(&g_err_lock);
     ccfset(g_token, 0, sizeof(g_token));
     ccfset(g_last_error, 0, sizeof(g_last_error));
+    // The onboarding lists and the raw rules form live for the whole run, so
+    // they are set up once here rather than on first use from a worker thread.
+    g_prompts = ulist<api::onboard_prompt>();
+    g_options = ulist<api::onboard_option>();
+    g_rules = ulist<char*>();
+    g_rules_raw.init();
+
     build_installation_id();
     build_super_properties();
     g_ready = true;
@@ -772,11 +820,19 @@ namespace
     {
         job_ids* j = (job_ids*)user;
 
+        // Both lists asked for. They are the two things a profile knows that
+        // nothing else does, and they are what the servers-in-common and
+        // friends-in-common sections are built out of - here and, once they are
+        // written down, on every other account and with no connection at all.
         char path[256];
         if (j->b)
-            cnprint(path, sizeof(path), "/users/%llu/profile?with_mutual_guilds=false&guild_id=%llu", j->a, j->b);
+            cnprint(path, sizeof(path),
+                    "/users/%llu/profile?with_mutual_guilds=true&with_mutual_friends=true"
+                    "&with_mutual_friends_count=true&guild_id=%llu", j->a, j->b);
         else
-            cnprint(path, sizeof(path), "/users/%llu/profile?with_mutual_guilds=false", j->a);
+            cnprint(path, sizeof(path),
+                    "/users/%llu/profile?with_mutual_guilds=true&with_mutual_friends=true"
+                    "&with_mutual_friends_count=true", j->a);
 
         http_response res;
         res.init();
@@ -805,6 +861,39 @@ namespace
                     u->profile_loaded = true;
                     const char* bio = doc.root->str("bio", uobj->str("bio", 0));
                     if (bio) u->bio = store::intern(bio);
+                    people::note_user(u);
+                }
+
+                // Servers in common, as this account sees them. Written down
+                // rather than only shown: another account of ours shares a
+                // different set, and together they say more than either.
+                const jval* mg = doc.root->arr("mutual_guilds");
+                for (unsigned int i = 0; i < mg->count; i++)
+                {
+                    snowflake gid = mg->at(i)->sf("id");
+                    if (gid) people::note_member(gid, j->a);
+                }
+
+                // Friends in common. The whole list at once, because what makes
+                // it worth keeping is the comparison with last time - somebody
+                // missing from it now was unfriended since, and no single answer
+                // from discord ever says that.
+                const jval* mf = doc.root->arr("mutual_friends");
+                if (mf->type == JTYPE_ARR)
+                {
+                    ulist<snowflake> ids;
+                    for (unsigned int i = 0; i < mf->count; i++)
+                    {
+                        const jval* f = mf->at(i);
+                        duser* fu = store::upsert_user(f);
+                        if (fu) people::note_user(fu);
+
+                        snowflake fid = f->sf("id");
+                        if (fid) ids.push(fid);
+                    }
+
+                    people::note_mutual_friends(j->a, ids.count ? &ids[0] : 0, (int)ids.count);
+                    ids.dispose();
                 }
                 store::bump_revision();
             }
@@ -853,6 +942,37 @@ namespace
         else
         {
             record_api_error(tr("Каналы сервера недоступны"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_fetch_channel(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[64];
+        cnprint(path, sizeof(path), "/channels/%llu", j->a);
+
+        http_response res;
+        res.init();
+
+        // Quietly: this is asked for on the strength of a message arriving in a
+        // channel nothing had described yet, and a refusal is not something
+        // anybody did wrong.
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                store::guard g;
+                store::upsert_channel(doc.root, doc.root->sf("guild_id"));
+                store::touch_dm_order();
+                store::bump_revision();
+            }
+            doc.free_doc();
         }
 
         res.free_response();
@@ -1191,6 +1311,12 @@ namespace
             if (doc.parse(res.text(), (int)res.body.size))
             {
                 const jval* guild = doc.root->obj("guild");
+
+                // Remembered for the interface to notice: a server that asks
+                // for roles and rules on the way in should ask now.
+                InterlockedExchange64((volatile long long*)&g_joined_guild,
+                                      (long long)guild->sf("id"));
+
                 const char* name = guild->str("name", tr("сервер"));
                 char msg[192];
                 cnprint(msg, sizeof(msg), tr("Вы присоединились: %s"), name);
@@ -1223,6 +1349,74 @@ namespace
         bool temporary;
         char name[96];
     };
+
+    struct job_two_ids
+    {
+        snowflake from_channel;
+        snowflake to_channel;
+    };
+
+    // Makes an invite to a server and puts it in somebody's messages.
+    //
+    // Two requests, and they have to be in this order and in one job: the
+    // link does not exist until the first one answers, and firing both as
+    // separate jobs would race - the message would go out with whatever link
+    // happened to be in the shared slot at that moment, which after a second
+    // invite anywhere in the client is the wrong one.
+    void job_send_invite(void* user)
+    {
+        job_two_ids* j = (job_two_ids*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        // A day, and no limit on how many people use it. An invite handed to
+        // one person could be single use, but the person it is handed to is
+        // not always the person who opens it - a phone reads the link, the
+        // desktop uses it, and a one-use link is spent by then.
+        w.kv_i64("max_age", 86400);
+        w.kv_i64("max_uses", 0);
+        w.kv_bool("temporary", false);
+        w.kv_bool("unique", true);
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/channels/%llu/invites", j->from_channel);
+
+        http_response res;
+        res.init();
+
+        char code[32];
+        code[0] = 0;
+
+        if (api::call("POST", path, w.buf.c_str(), &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                const char* got = doc.root->str("code", 0);
+                if (got) ccstrncpy(code, got, sizeof(code) - 1);
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            record_api_error(tr("Не удалось создать приглашение"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+
+        if (!code[0]) { memfree(j); return; }
+
+        char link[96];
+        cnprint(link, sizeof(link), "https://discord.gg/%s", code);
+
+        api::send_message(j->to_channel, link, 0);
+        memfree(j);
+    }
 
     void job_create_invite(void* user)
     {
@@ -1795,6 +1989,351 @@ namespace
     ulist<api::webhook_row> g_webhooks;
     volatile long g_webhooks_busy = 0;
 
+    // ---- onboarding and the rules gate -----------------------------------
+
+    void read_emoji(api::onboard_option* o, const jval* v)
+    {
+        const jval* e = v->obj("emoji");
+        if (e->type != JTYPE_OBJ) return;
+
+        o->emoji_id = e->sf("id");
+        o->emoji_animated = e->boolean("animated", false);
+
+        const char* name = e->str("name", 0);
+        if (name) ccstrncpy(o->emoji_name, name, sizeof(o->emoji_name) - 1);
+    }
+
+    // `b` non-zero means this is a look rather than a load: nobody has opened
+    // the window, and the point is to find out whether it should be opened.
+    void job_fetch_onboarding(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/onboarding", j->a);
+
+        http_response res;
+        res.init();
+
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                EnterCriticalSection(&g_err_lock);
+
+                g_prompts.clear_fast();
+                g_options.clear_fast();
+
+                // Answered already if either of these has anything in it. The
+                // first is what was chosen, the second what was put in front
+                // of them - and a panel that was seen and skipped should not
+                // reappear every time the server is opened.
+                g_onboard_answered = doc.root->arr("responses")->count > 0 ||
+                                     doc.root->obj("onboarding_prompts_seen")->size() > 0;
+
+                // A server can have the feature switched off and still answer
+                // with the prompts it once set up. Nothing is shown then.
+                if (doc.root->boolean("enabled", false))
+                {
+                    const jval* prompts = doc.root->arr("prompts");
+                    for (unsigned int i = 0; i < prompts->count; i++)
+                    {
+                        const jval* pv = prompts->at(i);
+
+                        api::onboard_prompt p;
+                        ccfset(&p, 0, sizeof(p));
+                        p.id = pv->sf("id");
+                        p.single_select = pv->boolean("single_select", false);
+                        p.required = pv->boolean("required", false);
+                        p.in_onboarding = pv->boolean("in_onboarding", false);
+
+                        const char* title = pv->str("title", 0);
+                        if (title) ccstrncpy(p.title, title, sizeof(p.title) - 1);
+
+                        p.first_option = (int)g_options.count;
+
+                        const jval* opts = pv->arr("options");
+                        for (unsigned int k = 0; k < opts->count; k++)
+                        {
+                            const jval* ov = opts->at(k);
+
+                            api::onboard_option o;
+                            ccfset(&o, 0, sizeof(o));
+                            o.id = ov->sf("id");
+
+                            const char* t = ov->str("title", 0);
+                            if (t) ccstrncpy(o.title, t, sizeof(o.title) - 1);
+
+                            const char* d = ov->str("description", 0);
+                            if (d) ccstrncpy(o.description, d, sizeof(o.description) - 1);
+
+                            read_emoji(&o, ov);
+
+                            const jval* roles = ov->arr("role_ids");
+                            for (unsigned int r = 0; r < roles->count && o.role_count < 8; r++)
+                                o.roles[o.role_count++] = roles->at(r)->as_snowflake();
+
+                            if (o.id) g_options.push(o);
+                        }
+
+                        p.option_count = (int)g_options.count - p.first_option;
+                        if (p.id) g_prompts.push(p);
+                    }
+                }
+
+                int shown = 0;
+                for (unsigned int i = 0; i < g_prompts.count; i++)
+                    if (g_prompts[i].in_onboarding && g_prompts[i].option_count) shown++;
+
+                bool worth = shown > 0 && !g_onboard_answered;
+
+                LeaveCriticalSection(&g_err_lock);
+
+                // Said out loud, because "the panel did not appear" has
+                // exactly four possible reasons and this line names which.
+                log_line("onboarding: %llu - включено %d, блоков на входе %d, "
+                         "уже отвечено %d", j->a,
+                         doc.root->boolean("enabled", false) ? 1 : 0, shown,
+                         g_onboard_answered ? 1 : 0);
+
+                if (j->b && worth)
+                    InterlockedExchange64((volatile long long*)&g_onboard_show,
+                                          (long long)j->a);
+            }
+
+            doc.free_doc();
+        }
+
+        res.free_response();
+        InterlockedDecrement(&g_onboard_busy);
+        memfree(j);
+    }
+
+    void job_fetch_rules(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/member-verification?with_guild=false", j->a);
+
+        http_response res;
+        res.init();
+
+        // A server without a rules gate answers 404, and that is an answer
+        // rather than a fault - most servers do not have one.
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            EnterCriticalSection(&g_err_lock);
+
+            free_rules();
+            g_rules_desc[0] = 0;
+            g_rules_version[0] = 0;
+
+            g_rules_raw.clear();
+            g_rules_raw.append(res.body.data, res.body.size);
+            g_rules_raw_ready = true;
+
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                const char* ver = doc.root->str("version", 0);
+                if (ver) ccstrncpy(g_rules_version, ver, sizeof(g_rules_version) - 1);
+
+                const char* desc = doc.root->str("description", 0);
+                if (desc) ccstrncpy(g_rules_desc, desc, sizeof(g_rules_desc) - 1);
+
+                const jval* fields = doc.root->arr("form_fields");
+                for (unsigned int i = 0; i < fields->count; i++)
+                {
+                    const jval* vals = fields->at(i)->arr("values");
+                    for (unsigned int k = 0; k < vals->count; k++)
+                    {
+                        const char* line = vals->at(k)->as_str(0);
+                        if (!line || !line[0]) continue;
+
+                        int len = (int)ccslenf(line);
+                        char* copy = (char*)memalloc(len + 1);
+                        if (!copy) continue;
+
+                        ccpy(copy, line, (size_t)len);
+                        copy[len] = 0;
+                        g_rules.push(copy);
+                    }
+                }
+            }
+
+            doc.free_doc();
+            LeaveCriticalSection(&g_err_lock);
+        }
+
+        res.free_response();
+        InterlockedDecrement(&g_onboard_busy);
+        memfree(j);
+    }
+
+    struct job_onboard_submit
+    {
+        snowflake guild_id;
+        snowflake chosen[64];
+        int count;
+    };
+
+    void job_submit_onboarding(void* user)
+    {
+        job_onboard_submit* j = (job_onboard_submit*)user;
+
+        // The same stamp on everything, which is what the real client sends:
+        // it is the moment the panel was answered, not a time per option.
+        unsigned long long now = unix_now_ms();
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        w.key("onboarding_responses");
+        w.begin_arr();
+        for (int i = 0; i < j->count; i++)
+        {
+            char id[24];
+            cnprint(id, sizeof(id), "%llu", j->chosen[i]);
+            w.val_str(id);
+        }
+        w.end_arr();
+
+        EnterCriticalSection(&g_err_lock);
+
+        // Everything that was on the screen, said to have been on the screen.
+        // Only the prompts marked as part of the way in: the others live in
+        // the channel list and were never shown here.
+        w.key("onboarding_prompts_seen");
+        w.begin_obj();
+        for (unsigned int i = 0; i < g_prompts.count; i++)
+        {
+            if (!g_prompts[i].in_onboarding) continue;
+
+            char id[24];
+            cnprint(id, sizeof(id), "%llu", g_prompts[i].id);
+            w.kv_i64(id, (long long)now);
+        }
+        w.end_obj();
+
+        w.key("onboarding_responses_seen");
+        w.begin_obj();
+        for (unsigned int i = 0; i < g_prompts.count; i++)
+        {
+            if (!g_prompts[i].in_onboarding) continue;
+
+            int from = g_prompts[i].first_option;
+            for (int k = 0; k < g_prompts[i].option_count; k++)
+            {
+                char id[24];
+                cnprint(id, sizeof(id), "%llu", g_options[(unsigned int)(from + k)].id);
+                w.kv_i64(id, (long long)now);
+            }
+        }
+        w.end_obj();
+
+        LeaveCriticalSection(&g_err_lock);
+
+        w.end_obj();
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/onboarding-responses", j->guild_id);
+
+        http_response res;
+        res.init();
+
+        if (!api::call("POST", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Не удалось сохранить выбор ролей"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_accept_rules(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        EnterCriticalSection(&g_err_lock);
+
+        bool have = g_rules_raw_ready && g_rules_raw.size > 0;
+
+        jdoc doc;
+        doc.init();
+
+        if (have && doc.parse((const char*)g_rules_raw.data, (int)g_rules_raw.size))
+        {
+            const char* ver = doc.root->str("version", 0);
+            w.kv_str("version", ver ? ver : "");
+
+            // The fields as they came, each with an answer added. Copied
+            // rather than rebuilt: discord matches this against what it sent,
+            // and a field left out is a form it will not accept.
+            w.key("form_fields");
+            w.begin_arr();
+
+            const jval* fields = doc.root->arr("form_fields");
+            for (unsigned int i = 0; i < fields->count; i++)
+            {
+                const jval* f = fields->at(i);
+
+                w.begin_obj();
+                w.kv_str("field_type", f->str("field_type", "TERMS"));
+                w.kv_str("label", f->str("label", ""));
+                w.kv_null("description");
+                w.kv_null("automations");
+                w.kv_bool("required", f->boolean("required", true));
+
+                w.key("values");
+                w.begin_arr();
+                const jval* vals = f->arr("values");
+                for (unsigned int k = 0; k < vals->count; k++)
+                {
+                    const char* line = vals->at(k)->as_str(0);
+                    if (line) w.val_str(line);
+                }
+                w.end_arr();
+
+                w.kv_bool("response", true);
+                w.end_obj();
+            }
+
+            w.end_arr();
+        }
+
+        doc.free_doc();
+        LeaveCriticalSection(&g_err_lock);
+
+        w.end_obj();
+
+        if (!have) { w.free_writer(); memfree(j); return; }
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/requests/@me", j->a);
+
+        http_response res;
+        res.init();
+
+        if (api::call("PUT", path, w.buf.c_str(), &res) && res.ok())
+            api::set_last_error(tr("Правила приняты"));
+        else
+            record_api_error(tr("Не удалось принять правила"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
     void job_fetch_webhooks(void* user)
     {
         job_ids* j = (job_ids*)user;
@@ -1827,6 +2366,12 @@ namespace
                     const char* name = h->str("name", 0);
                     ccstrncpy(row.name, name ? name : tr("без имени"), sizeof(row.name) - 1);
 
+                    // Only incoming webhooks carry one. The others are
+                    // follower and application hooks, which cannot be
+                    // posted through and come back without it.
+                    const char* token = h->str("token", 0);
+                    if (token) ccstrncpy(row.token, token, sizeof(row.token) - 1);
+
                     if (row.id) g_webhooks.push(row);
                 }
                 LeaveCriticalSection(&g_err_lock);
@@ -1840,6 +2385,48 @@ namespace
 
         res.free_response();
         InterlockedExchange(&g_webhooks_busy, 0);
+        memfree(j);
+    }
+
+    struct hook_post
+    {
+        snowflake id;
+        char token[128];
+        char username[96];
+        char avatar[512];
+        char content[3900];
+    };
+
+    void job_webhook_post(void* user)
+    {
+        hook_post* j = (hook_post*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("content", j->content);
+        if (j->username[0]) w.kv_str("username", j->username);
+        if (j->avatar[0]) w.kv_str("avatar_url", j->avatar);
+        w.end_obj();
+
+        char url[256];
+        cnprint(url, sizeof(url), "%s/webhooks/%llu/%s", API_BASE, j->id, j->token);
+
+        // Sent bare, without any of the headers the rest of this file
+        // builds. The url is the credential - a webhook answers to whoever
+        // holds it and to nobody else - and attaching this account's token
+        // to it would say who is really typing, which is the one thing the
+        // feature exists to avoid.
+        const char* headers = "Content-Type: application/json\r\n";
+
+        http_response res;
+        res.init();
+
+        if (!http::request("POST", url, headers, w.buf.c_str(), w.buf.size, &res) || !res.ok())
+            record_api_error(tr("Вебхук не принял сообщение"), &res);
+
+        res.free_response();
+        w.free_writer();
         memfree(j);
     }
 
@@ -2261,6 +2848,40 @@ namespace
         memfree(j);
     }
 
+    struct job_edit
+    {
+        snowflake channel_id;
+        snowflake message_id;
+        char content[3900];
+    };
+
+    void job_edit_message(void* user)
+    {
+        job_edit* j = (job_edit*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("content", j->content);
+        w.end_obj();
+
+        char path[192];
+        cnprint(path, sizeof(path), "/channels/%llu/messages/%llu",
+                j->channel_id, j->message_id);
+
+        http_response res;
+        res.init();
+
+        // MESSAGE_UPDATE comes back on the gateway with the new text and the
+        // edited stamp, so nothing is written here - the same as sending one.
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Сообщение не изменено"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
     void job_delete_message(void* user)
     {
         job_ids* j = (job_ids*)user;
@@ -2406,6 +3027,12 @@ void api::fetch_guild_channels(snowflake guild_id)
 {
     job_ids* j = make_ids(guild_id, 0);
     if (j) jobs::post(job_fetch_guild_channels, j);
+}
+
+void api::fetch_channel(snowflake channel_id)
+{
+    job_ids* j = make_ids(channel_id, 0);
+    if (j) jobs::post(job_fetch_channel, j);
 }
 
 void api::open_dm(snowflake user_id)
@@ -2579,6 +3206,32 @@ namespace
         // GUILD_UPDATE arrives on the gateway, so nothing is written here.
         if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
             record_api_error(tr("Не удалось переименовать сервер"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_channel_name(void* user)
+    {
+        job_name_id* j = (job_name_id*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->text);
+        w.end_obj();
+
+        char path[64];
+        cnprint(path, sizeof(path), "/channels/%llu", j->id);
+
+        http_response res;
+        res.init();
+
+        // CHANNEL_UPDATE arrives on the gateway, so the store is left alone
+        // here - the same as renaming a server.
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Не удалось переименовать канал"), &res);
 
         res.free_response();
         w.free_writer();
@@ -2864,6 +3517,21 @@ void api::trigger_typing(snowflake channel_id)
 {
     job_ids* j = make_ids(channel_id, 0);
     if (j) jobs::post(job_typing, j);
+}
+
+void api::edit_message(snowflake channel_id, snowflake message_id, const char* content)
+{
+    if (!content) return;
+
+    job_edit* j = (job_edit*)memalloc(sizeof(job_edit));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel_id = channel_id;
+    j->message_id = message_id;
+    ccstrncpy(j->content, content, sizeof(j->content) - 1);
+
+    jobs::post(job_edit_message, j);
 }
 
 void api::delete_message(snowflake channel_id, snowflake message_id)
@@ -3182,6 +3850,121 @@ int api::invites(invite_row* out, int cap)
 bool api::invites_loading() { return g_invites_busy != 0; }
 bool api::invites_forbidden() { return g_invites_denied != 0; }
 
+void api::fetch_onboarding(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (!j) return;
+
+    InterlockedIncrement(&g_onboard_busy);
+    jobs::post(job_fetch_onboarding, j);
+}
+
+void api::probe_onboarding(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 1);
+    if (!j) return;
+
+    InterlockedIncrement(&g_onboard_busy);
+    jobs::post(job_fetch_onboarding, j);
+}
+
+snowflake api::take_onboarding_prompt()
+{
+    return (snowflake)InterlockedExchange64((volatile long long*)&g_onboard_show, 0);
+}
+
+bool api::onboarding_answered() { return g_onboard_answered; }
+
+void api::fetch_rules(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (!j) return;
+
+    EnterCriticalSection(&g_err_lock);
+    free_rules();
+    g_rules_raw_ready = false;
+    LeaveCriticalSection(&g_err_lock);
+
+    InterlockedIncrement(&g_onboard_busy);
+    jobs::post(job_fetch_rules, j);
+}
+
+// Read once and cleared, because the thing it triggers must happen once.
+snowflake api::take_joined_guild()
+{
+    return (snowflake)InterlockedExchange64((volatile long long*)&g_joined_guild, 0);
+}
+
+bool api::onboarding_loading() { return g_onboard_busy != 0; }
+bool api::onboarding_ready() { return g_prompts.count > 0; }
+bool api::rules_ready() { return g_rules.count > 0; }
+
+int api::onboarding_prompts(onboard_prompt* out, int cap)
+{
+    if (!out || cap <= 0) return 0;
+
+    EnterCriticalSection(&g_err_lock);
+    int n = (int)g_prompts.count < cap ? (int)g_prompts.count : cap;
+    for (int i = 0; i < n; i++) out[i] = g_prompts[(unsigned int)i];
+    LeaveCriticalSection(&g_err_lock);
+
+    return n;
+}
+
+int api::onboarding_options(onboard_option* out, int cap)
+{
+    if (!out || cap <= 0) return 0;
+
+    EnterCriticalSection(&g_err_lock);
+    int n = (int)g_options.count < cap ? (int)g_options.count : cap;
+    for (int i = 0; i < n; i++) out[i] = g_options[(unsigned int)i];
+    LeaveCriticalSection(&g_err_lock);
+
+    return n;
+}
+
+int api::rules_count() { return (int)g_rules.count; }
+
+void api::rules_line(int index, char* out, int cap)
+{
+    if (!out || cap <= 0) return;
+    out[0] = 0;
+
+    EnterCriticalSection(&g_err_lock);
+    if (index >= 0 && index < (int)g_rules.count && g_rules[(unsigned int)index])
+        ccstrncpy(out, g_rules[(unsigned int)index], (size_t)cap - 1);
+    LeaveCriticalSection(&g_err_lock);
+}
+
+void api::rules_description(char* out, int cap)
+{
+    if (!out || cap <= 0) return;
+
+    EnterCriticalSection(&g_err_lock);
+    ccstrncpy(out, g_rules_desc, (size_t)cap - 1);
+    out[cap - 1] = 0;
+    LeaveCriticalSection(&g_err_lock);
+}
+
+void api::submit_onboarding(snowflake guild_id, const snowflake* chosen, int count)
+{
+    job_onboard_submit* j = (job_onboard_submit*)memalloc(sizeof(job_onboard_submit));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->guild_id = guild_id;
+
+    for (int i = 0; i < count && j->count < 64; i++) j->chosen[j->count++] = chosen[i];
+
+    jobs::post(job_submit_onboarding, j);
+}
+
+void api::accept_rules(snowflake guild_id)
+{
+    job_ids* j = make_ids(guild_id, 0);
+    if (j) jobs::post(job_accept_rules, j);
+}
+
 void api::fetch_webhooks(snowflake guild_id)
 {
     if (InterlockedCompareExchange(&g_webhooks_busy, 1, 0) != 0) return;
@@ -3189,6 +3972,24 @@ void api::fetch_webhooks(snowflake guild_id)
     job_ids* j = make_ids(guild_id, 0);
     if (j) jobs::post(job_fetch_webhooks, j);
     else InterlockedExchange(&g_webhooks_busy, 0);
+}
+
+void api::send_via_webhook(snowflake webhook_id, const char* token, const char* content,
+                           const char* username, const char* avatar_url)
+{
+    if (!webhook_id || !token || !token[0] || !content || !content[0]) return;
+
+    hook_post* j = (hook_post*)memalloc(sizeof(hook_post));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->id = webhook_id;
+    ccstrncpy(j->token, token, sizeof(j->token) - 1);
+    ccstrncpy(j->content, content, sizeof(j->content) - 1);
+    if (username) ccstrncpy(j->username, username, sizeof(j->username) - 1);
+    if (avatar_url) ccstrncpy(j->avatar, avatar_url, sizeof(j->avatar) - 1);
+
+    jobs::post(job_webhook_post, j);
 }
 
 void api::delete_webhook(snowflake webhook_id, snowflake guild_id)
@@ -3261,6 +4062,20 @@ void api::update_guild_name(snowflake guild_id, const char* name)
     jobs::post(job_guild_name, j);
 }
 
+void api::rename_channel(snowflake channel_id, const char* name)
+{
+    if (!name || !name[0]) return;
+
+    job_name_id* j = (job_name_id*)memalloc(sizeof(job_name_id));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->id = channel_id;
+    ccstrncpy(j->text, name, sizeof(j->text) - 1);
+
+    jobs::post(job_channel_name, j);
+}
+
 void api::update_guild_icon(snowflake guild_id, const wchar_t* path)
 {
     job_guild_image* j = (job_guild_image*)memalloc(sizeof(job_guild_image));
@@ -3326,6 +4141,18 @@ void api::clear_channel_overwrite(snowflake channel_id, snowflake target_id)
 
     j->clearing = true;
     jobs::post(job_channel_overwrite, j);
+}
+
+void api::send_guild_invite(snowflake from_channel, snowflake to_channel)
+{
+    if (!from_channel || !to_channel) return;
+
+    job_two_ids* j = (job_two_ids*)memalloc(sizeof(job_two_ids));
+    if (!j) return;
+
+    j->from_channel = from_channel;
+    j->to_channel = to_channel;
+    jobs::post(job_send_invite, j);
 }
 
 void api::create_invite(snowflake channel_id, int max_age, int max_uses, bool temporary)

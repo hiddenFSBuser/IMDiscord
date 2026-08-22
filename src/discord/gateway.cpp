@@ -555,6 +555,11 @@ namespace
         // except what the call itself is made of.
         if (!c->dispatching && !call_dispatch(type)) return;
 
+        // Rare and worth seeing: everything else from a held connection is
+        // dropped, so these are the only lines that say it is still doing
+        // anything at all.
+        if (!c->dispatching) log_line("gateway: с удержанного соединения %s", type);
+
         if (ccscmp(type, "READY") == 0) { handle_ready(c, d); return; }
 
         if (ccscmp(type, "READY_SUPPLEMENTAL") == 0)
@@ -603,8 +608,14 @@ namespace
 
         if (ccscmp(type, "MESSAGE_CREATE") == 0 || ccscmp(type, "MESSAGE_UPDATE") == 0)
         {
+            bool unknown_channel = false;
             {
                 store::guard g;
+
+                // Read before the message is folded in, because folding it in is
+                // what invents the channel.
+                unknown_channel = store::find_channel(d->sf("channel_id")) == 0;
+
                 store::upsert_message(d);
 
                 // Something arriving in the channel already open is read the
@@ -614,6 +625,12 @@ namespace
 
                 store::bump_revision();
             }
+
+            // The stub that was just invented knows only who wrote. Asking
+            // discord what the channel actually is fills in the rest, and tells
+            // a conversation with one person apart from a group - which the
+            // message on its own cannot.
+            if (unknown_channel) api::fetch_channel(d->sf("channel_id"));
 
             // Direct messages only, and not our own coming back. A chime for
             // every message on every server would be unusable, and a server is
@@ -884,7 +901,18 @@ namespace
                 }
             }
 
-            if (uid == store::self_id()) voice::on_gateway_voice_state(d);
+            // Only from the session the call is on.
+            //
+            // After an account switch and back there are two connections
+            // signed in as the same person: the one holding the call, and a
+            // fresh one that is not in the channel and whose view of our
+            // voice state is its own. Handing that view to the voice code
+            // lets it act on a state belonging to somebody else's session -
+            // and a state with no channel in it means "we were disconnected",
+            // which ends a call that is running perfectly well on the other
+            // socket.
+            if (uid == store::self_id() && c == voice_conn())
+                voice::on_gateway_voice_state(d);
             return;
         }
 
@@ -933,7 +961,9 @@ namespace
 
         if (ccscmp(type, "VOICE_SERVER_UPDATE") == 0)
         {
-            voice::on_gateway_voice_server(d);
+            // Same rule: the endpoint and token belong to a session, and the
+            // one that matters is the session the call is on.
+            if (c == voice_conn()) voice::on_gateway_voice_server(d);
             return;
         }
 
@@ -1409,6 +1439,62 @@ void gateway::set_status(const char* status)
         else me->status = STATUS_OFFLINE;
         store::bump_revision();
     }
+}
+
+// One window of a server's member list.
+//
+// Discord streams the list the way its own client shows it: not all of it,
+// but the slice being looked at, named by position. Subscribing without
+// naming a channel and a range - which is what asking for a whole server
+// used to do here - asks for no slice at all, and nothing comes back. That
+// is exactly why warming every server collected nobody.
+//
+// Three ranges of a hundred per request, which is what the real client sends
+// when somebody scrolls quickly.
+void gateway::request_member_window(snowflake guild_id, snowflake channel_id, int from)
+{
+    if (api::is_bot() || !channel_id) return;
+    if (from < 0) from = 0;
+
+    // Windows start on a hundred. Asking for one that does not is answered
+    // with nothing at all rather than with the nearest thing.
+    from -= from % 100;
+
+    jwriter w;
+    w.init();
+    w.begin_obj();
+    w.kv_i64("op", OP_LAZY_REQUEST);
+    w.key("d");
+    w.begin_obj();
+    w.kv_snowflake("guild_id", guild_id);
+    w.kv_bool("typing", true);
+    w.kv_bool("threads", false);
+    w.kv_bool("activities", true);
+
+    w.key("channels");
+    w.begin_obj();
+
+    char key[32];
+    cnprint(key, sizeof(key), "%llu", channel_id);
+    w.key(key);
+    w.begin_arr();
+
+    for (int i = 0; i < 3; i++)
+    {
+        int lo = from + i * 100;
+        w.begin_arr();
+        w.val_i64(lo);
+        w.val_i64(lo + 99);
+        w.end_arr();
+    }
+
+    w.end_arr();
+    w.end_obj();
+    w.end_obj();
+    w.end_obj();
+
+    send_json(active(), &w);
+    w.free_writer();
 }
 
 void gateway::subscribe_guild(snowflake guild_id, snowflake channel_id)

@@ -33,3 +33,7 @@ extern app_state g_app;
 
 int app_main();
 void app_request_close();
+
+// Builds the font atlas into the current imgui context. Called during
+// start-up, and by --fonttest, which needs the atlas but no window.
+void app_build_fonts();

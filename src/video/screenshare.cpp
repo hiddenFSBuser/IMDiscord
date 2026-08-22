@@ -2023,6 +2023,15 @@ void screenshare::set_audio(bool on)
 bool screenshare::audio_running() { return loopback::running(); }
 const char* screenshare::audio_error() { return loopback::last_error(); }
 
+// What was being shared when the connection went.
+//
+// Same story as watching somebody else: a replaced gateway session takes the
+// share with it, and the call comes back a few seconds later without it. The
+// settings are all still in the globals the share was started with, so there
+// is nothing to remember except that it was running and when.
+static bool g_again = false;
+static unsigned long long g_again_at = 0;
+
 bool screenshare::start(int monitor_index, int max_width, int max_height, int fps,
                         int bitrate_kbps, bool with_audio, int method)
 {
@@ -2129,6 +2138,11 @@ bool screenshare::start(int monitor_index, int max_width, int max_height, int fp
 
 void screenshare::stop()
 {
+    // Whoever calls this wants it off. on_gateway_disconnected sets the flag
+    // again straight after, so its own teardown does not wipe what it is
+    // about to remember.
+    g_again = false;
+
     if (!g_running && g_state == SHARE_IDLE) return;
 
     // Our own share. The voice state dispatch that announces it names us, and
@@ -2221,5 +2235,30 @@ void screenshare::on_stream_server_update(const jval* d)
 // has its own socket and its own accepted token.
 void screenshare::on_gateway_disconnected()
 {
-    if (g_running) stop();
+    if (!g_running) return;
+
+    stop();
+
+    // After the stop, which clears this for a share somebody ended on
+    // purpose. Nobody ended this one.
+    g_again = true;
+    g_again_at = GetTickCount64();
+}
+
+void screenshare::restore_if_pending()
+{
+    if (!g_again) return;
+
+    // Only while it is still the same moment - a share starting again by
+    // itself a minute later is a camera nobody expected to be on.
+    if (GetTickCount64() - g_again_at > 60000ULL) { g_again = false; return; }
+
+    if (voice::state() != VOICE_CONNECTED) return;
+    if (g_running) { g_again = false; return; }
+
+    g_again = false;
+
+    log_line("share: возвращаем демонстрацию после разрыва");
+    screenshare::start(g_monitor, g_max_w, g_max_h, g_fps, g_bitrate,
+                       g_want_audio, g_capture_method);
 }

@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "ui_state.h"
+#include "discord/warmup.h"
 #include "theme.h"
 #include "textures.h"
 
@@ -256,6 +257,19 @@ void ui_view_guild_rail(float width, float height)
             if (!g->loaded) api::fetch_guild_channels(g->id);
             gateway::subscribe_guild(g->id, 0);
 
+            // Asked about once per server per run. There is no dispatch that
+            // says "this one still wants an answer" - the only way to know is
+            // to ask, so it is asked the first time the server is opened and
+            // never again in this session.
+            {
+                static uset<snowflake> probed;
+                if (!probed.contains(g->id))
+                {
+                    probed.push(g->id);
+                    api::probe_onboarding(g->id);
+                }
+            }
+
             // Jump to the first readable text channel.
             g_ui.active_channel = 0;
             for (unsigned int k = 0; k < g->channels.count; k++)
@@ -307,6 +321,7 @@ void ui_view_guild_rail(float width, float height)
                     ui_open_image_viewer(big, g->name ? g->name : tr("Сервер"));
             }
             ImGui::Separator();
+            if (ImGui::MenuItem(tr("Роли и правила при входе"))) ui_open_onboarding(g->id);
             if (ImGui::MenuItem(tr("Настройки сервера"))) ui_open_guild_edit(g->id);
             if (ImGui::MenuItem(tr("Управление ролями"))) ui_open_roles(g->id);
             if (ImGui::MenuItem(tr("Аудит и баны"))) ui_open_audit(g->id);
@@ -541,6 +556,71 @@ namespace
         api::reorder_channels(g->id, order, count, moved_id, parent);
     }
 
+    // A category heading, and now a thing in its own right rather than a
+    // line of grey text.
+    //
+    // It had no item behind it at all, which meant it could not be dragged,
+    // could not be right clicked, and a category with nothing in it did not
+    // appear anywhere - there was no first child to print it before. All
+    // three follow from the same omission.
+    void category_row(dchannel* cat, dguild* g, float width, bool hidden)
+    {
+        float row_w = width - 16.0f;
+
+        ImGui::Dummy(ImVec2(0, 6));
+
+        ImVec2 start = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##cat", ImVec2(row_w, 20.0f));
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        if (ImGui::IsItemHovered())
+            dl->AddRectFilled(start, ImVec2(start.x + row_w, start.y + 20.0f),
+                              col::bg_hover, 4.0f);
+
+        const char* name = cat->name ? cat->name : tr("КАНАЛЫ");
+        ui_draw_text_emoji(dl, ImVec2(start.x + 2.0f, start.y + 3.0f), col::text_muted, name);
+
+        // A category nobody here can see is marked the way a hidden channel
+        // is, rather than being told apart by a shade of grey nobody would
+        // notice.
+        if (hidden)
+            draw_lock(dl, ImVec2(start.x + row_w - 14.0f, start.y + 10.0f), 13.0f, col::text_muted);
+
+        // Same payload as a channel: dropped_on already knows a category
+        // only sorts against other categories and never lands inside one.
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoDisableHover))
+        {
+            ImGui::SetDragDropPayload("IMD_CHANNEL", &cat->id, sizeof(snowflake));
+            ImGui::TextUnformatted(name);
+            ImGui::EndDragDropSource();
+        }
+
+        // Dropping a channel on the heading puts it in that category, which
+        // is the only way to reach an empty one.
+        if (ImGui::BeginDragDropTarget())
+        {
+            const ImGuiPayload* p = ImGui::AcceptDragDropPayload("IMD_CHANNEL");
+            if (p && p->DataSize == sizeof(snowflake))
+            {
+                snowflake moved = *(const snowflake*)p->Data;
+                if (moved != cat->id) dropped_on(g, moved, cat->id);
+            }
+            ImGui::EndDragDropTarget();
+        }
+
+        if (ImGui::BeginPopupContextItem("##catctx"))
+        {
+            if (ImGui::MenuItem(tr("Переименовать категорию"))) ui_open_rename_channel(cat->id);
+            if (ImGui::MenuItem(tr("Права категории"))) ui_open_channel_perms(cat->id);
+            if (ImGui::MenuItem(tr("Удалить категорию"))) api::delete_channel(cat->id);
+            ImGui::Separator();
+            ui_copy_id_item(cat->id, tr("Скопировать ID категории"));
+            ImGui::EndPopup();
+        }
+
+        ImGui::Dummy(ImVec2(0, 2));
+    }
+
     bool channel_row(dchannel* c, bool active, float width, bool hidden)
     {
         char label[256];
@@ -568,7 +648,8 @@ namespace
                      ImVec2(start.x + 13.0f, start.y + row_h * 0.5f), 15.0f, tint);
 
         ImVec2 text_size = ImGui::CalcTextSize(label);
-        dl->AddText(ImVec2(start.x + 28.0f, start.y + (row_h - text_size.y) * 0.5f), tint, label);
+        ui_draw_text_emoji(dl, ImVec2(start.x + 28.0f, start.y + (row_h - text_size.y) * 0.5f),
+                           tint, label);
 
         if (hidden)
             draw_lock(dl, ImVec2(start.x + row_w - 14.0f, start.y + row_h * 0.5f), 14.0f, tint);
@@ -662,7 +743,7 @@ namespace
 
     void dm_row(dchannel* c, bool active, float width)
     {
-        ImGui::PushID((int)(c->id & 0x7FFFFFFF));
+        ImGui::PushID((const void*)(size_t)c->id);
 
         ImVec2 start = ImGui::GetCursorScreenPos();
         bool clicked = ImGui::InvisibleButton("##dm", ImVec2(width - 16.0f, 42.0f));
@@ -674,6 +755,39 @@ namespace
                               active ? col::bg_active : col::bg_hover, 4.0f);
 
         duser* peer = (c->type == CH_DM && c->recipients.count > 0) ? store::find_user(c->recipients[0]) : 0;
+
+        // Right click. A conversation had none at all, so the person on the
+        // other side of it could not be looked up from the one place in the
+        // client that is entirely about them.
+        if (ImGui::BeginPopupContextItem("##dmctx"))
+        {
+            if (peer)
+            {
+                if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(peer->id, 0);
+            }
+            else if (c->recipients.count && ImGui::BeginMenu(tr("Открыть профиль")))
+            {
+                // A group has several, so it asks which.
+                for (unsigned int k = 0; k < c->recipients.count; k++)
+                {
+                    duser* m = store::find_user(c->recipients[k]);
+                    if (!m) continue;
+
+                    ImGui::PushID((const void*)(size_t)m->id);
+                    if (ImGui::MenuItem(m->display_name())) ui_open_profile(m->id, 0);
+                    ImGui::PopID();
+                }
+                ImGui::EndMenu();
+            }
+
+            ui_invite_to_server_menu(c->id);
+
+            ImGui::Separator();
+            ui_copy_id_item(c->id, tr("Скопировать ID чата"));
+            if (peer) ui_copy_id_item(peer->id, tr("Скопировать ID пользователя"));
+
+            ImGui::EndPopup();
+        }
 
         ImGui::SetCursorScreenPos(ImVec2(start.x + 6.0f, start.y + 5.0f));
         if (peer)
@@ -726,7 +840,7 @@ namespace
                 duser* u = store::find_user(in_call[k]);
                 if (!u) continue;
 
-                ImGui::PushID((int)(u->id & 0x7FFFFFFF));
+                ImGui::PushID((const void*)(size_t)u->id);
                 ImGui::Indent(18.0f);
 
                 ImVec2 p = ImGui::GetCursorScreenPos();
@@ -798,18 +912,6 @@ namespace
             if (!c->history_loaded) api::fetch_messages(c->id, 0);
         }
 
-        // No longer gated on there being a single peer: a group conversation
-        // has no one person behind it, but it still has an id worth copying.
-        if (ImGui::BeginPopupContextItem("##dmctx"))
-        {
-            if (peer && ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(peer->id, 0);
-
-            ImGui::Separator();
-            ui_copy_id_item(c->id, tr("Скопировать ID чата"));
-            if (peer) ui_copy_id_item(peer->id, tr("Скопировать ID пользователя"));
-            ImGui::EndPopup();
-        }
-
         ImGui::PopID();
     }
 }
@@ -860,39 +962,61 @@ void ui_view_channel_list(float width, float height)
                 ui_text_muted(tr("Загрузка каналов..."));
             }
 
-            // Categories first, then their children; loose channels go on top.
-            for (unsigned int pass = 0; pass < 2; pass++)
-            {
-                for (unsigned int i = 0; i < g->channels.count; i++)
-                {
-                    dchannel* c = store::find_channel(g->channels[i]);
-                    if (!c) continue;
-                    if (c->type == CH_CATEGORY) continue;
-                    if ((pass == 0) != (c->parent_id == 0)) continue;
-                    if (!c->is_textual() && c->type != CH_GUILD_VOICE && c->type != CH_STAGE) continue;
+            // What to draw, in the order to draw it: the channels that
+            // belong to no category first, then each category followed by
+            // its own.
+            //
+            // Worked out up front rather than by walking the list twice and
+            // printing a heading before whichever child came first. That way
+            // round, a category with nothing in it had nowhere to be printed
+            // and simply did not exist - which is also why one could never be
+            // dragged anywhere or renamed.
+            static ulist<snowflake> rows;      // a category id means a heading
+            rows.clear_fast();
 
-                    if (pass == 1 && c->parent_id)
+            for (unsigned int i = 0; i < g->channels.count; i++)
+            {
+                dchannel* c = store::find_channel(g->channels[i]);
+                if (!c || c->type == CH_CATEGORY || c->parent_id) continue;
+                rows.push(c->id);
+            }
+
+            for (unsigned int i = 0; i < g->channels.count; i++)
+            {
+                dchannel* cat = store::find_channel(g->channels[i]);
+                if (!cat || cat->type != CH_CATEGORY) continue;
+
+                rows.push(cat->id);
+
+                for (unsigned int k = 0; k < g->channels.count; k++)
+                {
+                    dchannel* c = store::find_channel(g->channels[k]);
+                    if (!c || c->type == CH_CATEGORY) continue;
+                    if (c->parent_id != cat->id) continue;
+                    rows.push(c->id);
+                }
+            }
+
+            {
+                for (unsigned int i = 0; i < rows.count; i++)
+                {
+                    dchannel* c = store::find_channel(rows[i]);
+                    if (!c) continue;
+
+                    if (c->type == CH_CATEGORY)
                     {
-                        // Print the category header once, before its first child.
-                        bool first_child = true;
-                        for (unsigned int k = 0; k < i; k++)
-                        {
-                            dchannel* prev = store::find_channel(g->channels[k]);
-                            if (prev && prev->parent_id == c->parent_id && prev->type != CH_CATEGORY)
-                            {
-                                first_child = false;
-                                break;
-                            }
-                        }
-                        if (first_child)
-                        {
-                            dchannel* cat = store::find_channel(c->parent_id);
-                            ImGui::Dummy(ImVec2(0, 6));
-                            ui_text_muted(cat && cat->name ? cat->name : tr("КАНАЛЫ"));
-                        }
+                        bool cat_hidden = !store::can_view_channel(g, store::self_id(), c);
+                        if (cat_hidden && !g_ui.show_hidden_channels) continue;
+
+                        ImGui::PushID((const void*)(size_t)c->id);
+                        category_row(c, g, width, cat_hidden);
+                        ImGui::PopID();
+                        continue;
                     }
 
-                    ImGui::PushID((int)(c->id & 0x7FFFFFFF));
+                    if (!c->is_textual() && c->type != CH_GUILD_VOICE && c->type != CH_STAGE) continue;
+
+                    ImGui::PushID((const void*)(size_t)c->id);
                     bool active = (g_ui.active_channel == c->id);
 
                     bool hidden = !store::can_view_channel(g, store::self_id(), c);
@@ -960,6 +1084,7 @@ void ui_view_channel_list(float width, float height)
                             g_ui.channel_info_id = c->id;
                             g_ui.open_channel_info_popup = true;
                         }
+                        if (ImGui::MenuItem(tr("Переименовать"))) ui_open_rename_channel(c->id);
                         if (ImGui::MenuItem(tr("Права канала"))) ui_open_channel_perms(c->id);
                         if (ImGui::MenuItem(tr("Удалить канал"))) api::delete_channel(c->id);
                         ImGui::Separator();
@@ -974,14 +1099,20 @@ void ui_view_channel_list(float width, float height)
 
                         if (voice::current_channel() == c->id)
                         {
-                            if (ImGui::MenuItem(tr("Выйти из канала"))) voice::leave();
+                            if (ImGui::MenuItem(tr("Выйти из канала")))
+                                { g_ui.pending_voice_leave = true; g_ui.pending_voice_join = false; }
                         }
                         else if (ImGui::MenuItem(tr("Зайти в канал")))
                         {
-                            voice::join(g->id, c->id);
+                            {
+                                g_ui.pending_voice_guild = g->id;
+                                g_ui.pending_voice_channel = c->id;
+                                g_ui.pending_voice_join = true;
+                            }
                             open_chat = true;
                         }
                         ImGui::Separator();
+                        if (ImGui::MenuItem(tr("Переименовать"))) ui_open_rename_channel(c->id);
                         if (ImGui::MenuItem(tr("Права канала"))) ui_open_channel_perms(c->id);
                         if (ImGui::MenuItem(tr("Удалить канал"))) api::delete_channel(c->id);
                         ImGui::Separator();
@@ -994,7 +1125,11 @@ void ui_view_channel_list(float width, float height)
                     {
                         // Joining and opening its chat are one action, the
                         // way every other client does it.
-                        voice::join(g->id, c->id);
+                        {
+                            g_ui.pending_voice_guild = g->id;
+                            g_ui.pending_voice_channel = c->id;
+                            g_ui.pending_voice_join = true;
+                        }
                     }
 
                     if (open_chat)
@@ -1021,7 +1156,7 @@ void ui_view_channel_list(float width, float height)
                             bool self = u->id == store::self_id();
                             bool quieted = !self && voice::user_muted(u->id);
 
-                            ImGui::PushID((int)(u->id & 0x7FFFFFFF));
+                            ImGui::PushID((const void*)(size_t)u->id);
                             ImGui::Indent(18.0f);
                             ImVec2 p = ImGui::GetCursorScreenPos();
                             ui_avatar(u, 18.0f, false);
@@ -1343,7 +1478,8 @@ void ui_view_voice_panel(float width)
                             col::red, col::red, col::text_normal))
         {
             if (sharing) screenshare::stop();
-            voice::leave();
+            g_ui.pending_voice_leave = true;
+            g_ui.pending_voice_join = false;
         }
         if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Отключиться"));
 
@@ -1642,7 +1778,7 @@ void ui_view_settings_popup()
                 dguild* g = store::find_guild(guilds[i]);
                 if (!g) continue;
 
-                ImGui::PushID((int)(g->id & 0x7FFFFFFF));
+                ImGui::PushID((const void*)(size_t)g->id);
 
                 bool whole = exporter::warm_guild_fully_selected(g->id);
                 if (ImGui::Checkbox(g->name ? g->name : tr("сервер"), &whole))
@@ -1654,7 +1790,7 @@ void ui_view_settings_popup()
                     dchannel* c = store::find_channel(g->channels[k]);
                     if (!c || !c->is_textual()) continue;
 
-                    ImGui::PushID((int)(c->id & 0x7FFFFFFF));
+                    ImGui::PushID((const void*)(size_t)c->id);
 
                     char label[160];
                     ui_channel_display_name(c, label, sizeof(label));
@@ -1681,7 +1817,7 @@ void ui_view_settings_popup()
                 dchannel* c = store::find_channel(dms[i]);
                 if (!c) continue;
 
-                ImGui::PushID((int)(c->id & 0x7FFFFFFF));
+                ImGui::PushID((const void*)(size_t)c->id);
 
                 char label[160];
                 ui_channel_display_name(c, label, sizeof(label));
@@ -2003,6 +2139,25 @@ void ui_view_settings_popup()
 
     ImGui::Dummy(ImVec2(0, 6));
 
+    bool emoji = ui_custom_emoji();
+    if (ImGui::Checkbox(tr("Показывать серверные смайлики картинками"), &emoji))
+        ui_set_custom_emoji(emoji);
+    ui_text_muted(emoji ? tr("Каждый смайлик - отдельная картинка из сети")
+                        : tr("Выключено - смайлик остаётся текстом вида <:имя:id>"));
+
+    bool uni = ui_unicode_emoji();
+    if (ImGui::Checkbox(tr("Показывать обычные смайлики картинками"), &uni))
+        ui_set_unicode_emoji(uni);
+
+    ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
+    ImGui::TextWrapped(tr("Обычные смайлики (те, что просто символы) шрифт этого клиента "
+                       "нарисовать не может, поэтому они берутся картинками с постороннего "
+                       "сайта - не discord. Об аккаунте он ничего не узнает, запрос идёт за "
+                       "файлом с именем из кода символа, но сам запрос он видит."));
+    ImGui::PopStyleColor();
+
+    ImGui::Dummy(ImVec2(0, 6));
+
     bool direct_gifs = ui_embed_direct_gifs();
     if (ImGui::Checkbox(tr("Подгружать гифки с ссылок"), &direct_gifs))
         ui_set_embed_direct_gifs(direct_gifs);
@@ -2019,6 +2174,39 @@ void ui_view_settings_popup()
                        "прямо с сайта и играет целиком; сайт при этом видит запрос от тебя, "
                        "а не от discord. Картинок и вложений самого discord это не касается."));
     ImGui::PopStyleColor();
+
+    ImGui::Dummy(ImVec2(0, 10));
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 6));
+
+    // Channels and members arrive when a server is looked at, and only then.
+    // Everything built out of who is where knows about the servers that have
+    // been opened and no others, which for somebody in thirty of them means
+    // opening thirty of them by hand.
+    if (warmup::running())
+    {
+        char line[160];
+        cnprint(line, sizeof(line), tr("Прогреваю: %d из %d"),
+                warmup::done(), warmup::total());
+        ui_text_muted(line);
+
+        const char* now = warmup::current();
+        if (now && now[0]) ui_text_muted(now);
+
+        if (ImGui::Button(tr("Остановить"), ImVec2(200, 30))) warmup::stop();
+    }
+    else
+    {
+        if (ImGui::Button(tr("Прогреть сервера"), ImVec2(200, 30))) warmup::start();
+
+        ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
+        ImGui::TextWrapped(tr("Пройдёт по всем серверам и загрузит каналы и участников, "
+                           "как если бы каждый был открыт руками. Полторы секунды на "
+                           "сервер - медленно нарочно, иначе discord ограничит скорость "
+                           "и всему остальному тоже. Нужно для \"общих серверов\" в "
+                           "профиле: они знают только те сервера, которые уже открывали."));
+        ImGui::PopStyleColor();
+    }
 
     ImGui::Dummy(ImVec2(0, 6));
 

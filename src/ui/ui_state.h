@@ -72,6 +72,32 @@ struct ui_state
     bool open_ownership_popup;
     char ownership_code[32];
 
+    // Joining and leaving a call, put off to the top of the next frame.
+    //
+    // Both of them stop threads and wait for them to finish, and the whole
+    // sidebar - the hang-up button included - is drawn holding the store lock.
+    // Those threads take that same lock, so waiting for them while holding it
+    // is a circle: four seconds of frozen window, then a thread handle closed
+    // while the thread is still inside the socket it is about to lose. Done
+    // from the tick instead, where nothing is held.
+    snowflake pending_voice_guild;
+    snowflake pending_voice_channel;
+    bool pending_voice_join;
+    bool pending_voice_leave;
+
+    // The panel a server shows on the way in: roles to pick, rules to agree
+    // to. Which server it is asking about.
+    snowflake onboard_guild;
+    bool open_onboard_popup;
+
+    // Showing an account's token, and which one.
+    int token_account;
+    bool open_token_popup;
+
+    // Renaming a channel or a category.
+    snowflake rename_channel_id;
+    bool open_rename_popup;
+
     // Deleting a server: which one, and what the person has typed so far into
     // the box that asks for its name back.
     snowflake delete_guild_id;
@@ -194,6 +220,18 @@ void ui_set_image_format(int pref);
 // reaches that site directly.
 bool ui_embed_direct_gifs();
 
+// Whether a server emoji in a message is drawn as a picture. Off by default:
+// each one is a download and a texture of its own, and a channel that leans
+// on them asks for dozens at a time.
+bool ui_custom_emoji();
+void ui_set_custom_emoji(bool on);
+
+// Whether the ordinary emoji are drawn as pictures. Off by default: they
+// come from a cdn that is not discord's, so this is one more host seeing a
+// request, and that should be asked for rather than assumed.
+bool ui_unicode_emoji();
+void ui_set_unicode_emoji(bool on);
+
 // Playing mp4 attachments in place. Off by default: it works, but not well
 // enough to be what everybody gets - the sound drifts, scrubbing is coarse
 // and it costs more than watching the file in a real player would.
@@ -286,6 +324,12 @@ void ui_open_music();
 void ui_view_ownership_popup();
 void ui_open_ownership(snowflake guild_id, snowflake user_id);
 void ui_view_delete_guild_popup();
+void ui_view_rename_popup();
+void ui_view_onboarding_popup();
+void ui_view_token_popup();
+void ui_open_token(int account_index);
+void ui_open_onboarding(snowflake guild_id);
+void ui_open_rename_channel(snowflake channel_id);
 void ui_open_delete_guild(snowflake guild_id);
 void ui_open_audit(snowflake guild_id);
 void ui_view_guild_edit_popup();
@@ -300,6 +344,10 @@ void ui_member_roles_menu(snowflake guild_id, snowflake user_id);
 // whether they can be moved at all, which is what a drag has to know before
 // it is allowed to start.
 bool ui_can_move_member(snowflake guild_id, snowflake user_id, snowflake to_channel_id);
+
+// A submenu of this account's servers; picking one sends an invite to it
+// into `to_channel`.
+void ui_invite_to_server_menu(snowflake to_channel);
 
 // Disconnecting, silencing, timing out and banning, for the same places. Each
 // item only appears when the account holds the permission for it and the
@@ -330,6 +378,14 @@ void ui_set_share_audio(bool on);
 // Crossed-out microphone and headset, drawn at `at` in a box `size` across.
 void ui_draw_muted_marks(ImDrawList* dl, ImVec2 at, float size,
                          bool mic_off, bool ears_off);
+// Whether the font atlas has no glyph for a character at all.
+bool ui_font_lacks_glyph(unsigned int c);
+
+// Text painted straight into a draw list with its emoji as pictures. Returns
+// the width drawn. For names, which are one string at one position rather
+// than a row of laid-out items.
+float ui_draw_text_emoji(ImDrawList* dl, ImVec2 at, ImU32 colour, const char* text);
+
 // The owner's crown, drawn at `at` in a box `size` across.
 void ui_draw_crown(ImDrawList* dl, ImVec2 at, float size);
 // The bottom panel grows by a row while a voice session is up.

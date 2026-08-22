@@ -104,6 +104,11 @@ void store::shutdown()
 void store::lock() { if (g_ready) EnterCriticalSection(&g_lock); }
 void store::unlock() { if (g_ready) LeaveCriticalSection(&g_lock); }
 
+bool store::try_lock()
+{
+    return g_ready && TryEnterCriticalSection(&g_lock) != 0;
+}
+
 unsigned int store::revision() { return g_revision; }
 void store::bump_revision() { g_revision++; }
 
@@ -937,6 +942,17 @@ dmessage* store::upsert_message(const jval* v)
 
     duser* author = upsert_user(v->obj("author"));
 
+    // A direct message whose channel object never arrived has nobody in it,
+    // and a conversation with nobody in it is drawn as "без названия". The
+    // person who wrote is right here in the message, so there is no need to
+    // wait for the channel object or ask for it.
+    //
+    // This is the ordinary case for a bot: discord sends a bot no private
+    // channels in READY and offers no way to list them, so every direct
+    // conversation a bot has is one that arrived exactly like this.
+    if (ch->is_dm() && !ch->recipients.count && author && author->id != g_self_id)
+        ch->recipients.push(author->id);
+
     // Everybody the message points at, remembered here rather than looked up
     // later. On the wire a mention is only an id, and the person behind it may
     // never have said anything in this channel - without this the chat has
@@ -1339,6 +1355,19 @@ void store::touch_dm_order()
 }
 
 const ulist<snowflake>& store::dm_order() { return g_dm_order; }
+
+// The one-to-one conversation with somebody, if there is one. Groups are not
+// it: a message meant for one person does not belong in a room.
+snowflake store::dm_with(snowflake user_id)
+{
+    for (unsigned int i = 0; i < g_dm_order.count; i++)
+    {
+        dchannel* c = find_channel(g_dm_order[i]);
+        if (!c || c->type != CH_DM || c->recipients.count != 1) continue;
+        if (c->recipients[0] == user_id) return c->id;
+    }
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 // read state

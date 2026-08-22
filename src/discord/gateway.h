@@ -36,6 +36,12 @@ namespace gateway
     // Lazy guild subscription; without it discord withholds member/presence data.
     void subscribe_guild(snowflake guild_id, snowflake channel_id);
 
+    // Asks for the member list from position `from` onward - three hundred
+    // at a time, the way the real client asks while somebody scrolls. A
+    // subscription with no channel and no range asks for no members at all,
+    // which is what the plain call above does when given none.
+    void request_member_window(snowflake guild_id, snowflake channel_id, int from);
+
     // Sets our own presence. "online", "idle", "dnd" or "invisible". Sent over
     // the socket for immediate effect and written to the account settings so
     // it survives a restart and reaches the other clients.

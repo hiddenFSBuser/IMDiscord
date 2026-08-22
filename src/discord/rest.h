@@ -75,6 +75,10 @@ namespace api
     // and asked for only when something is about to show them.
     void fetch_guild_counts(snowflake guild_id);
     void open_dm(snowflake user_id);
+    // One channel by id, for when something arrives in a channel this client
+    // has never been told about. A bot is told about none of its direct
+    // conversations, so for one this is the only way to learn what they are.
+    void fetch_channel(snowflake channel_id);
     void ack_message(snowflake channel_id, snowflake message_id);
     // Writes the presence into the account settings, so it survives a restart
     // and reaches the user's other clients. The socket handles the immediate
@@ -89,6 +93,9 @@ namespace api
     // works out the format from the prefix. Passing an empty path clears it.
     void update_self_image(bool banner, const wchar_t* path);
     void trigger_typing(snowflake channel_id);
+    // Rewrites one of our own. Discord takes only the text; an empty one is
+    // refused rather than treated as a delete.
+    void edit_message(snowflake channel_id, snowflake message_id, const char* content);
     void delete_message(snowflake channel_id, snowflake message_id);
     // Rings the other side of a direct-message call. Joining the voice channel
     // alone connects us but never makes their client notify them.
@@ -136,6 +143,11 @@ namespace api
     // means unlimited. temporary throws the newcomer out again when they
     // disconnect unless somebody gives them a role in the meantime.
     void create_invite(snowflake channel_id, int max_age, int max_uses, bool temporary);
+
+    // Makes an invite to the server `from_channel` belongs to and sends it as
+    // a message into `to_channel`. One job rather than two, because the link
+    // does not exist until the first request answers.
+    void send_guild_invite(snowflake from_channel, snowflake to_channel);
     void create_webhook(snowflake channel_id, const char* name);
 
     const char* last_link();
@@ -150,6 +162,11 @@ namespace api
         snowflake id;
         snowflake channel_id;
         char name[96];
+        // What lets anything post through it, and the reason a webhook url
+        // is worth guarding: it needs no account behind it. Discord only
+        // hands it over to somebody who could read it from the settings
+        // page anyway, so it arrives with the listing or not at all.
+        char token[128];
     };
 
     // The invites that already exist. Same story as webhooks: nothing on the
@@ -255,11 +272,100 @@ namespace api
     // who and when is still worth reading.
     const char* audit_action_name(int action, char* scratch, int cap);
 
+    // ---- the screen a big server shows on the way in ----------------------
+    //
+    // Two separate things that arrive together and read as one panel: the
+    // roles a server offers to pick from, and the rules it asks to be agreed
+    // to. Discord calls the first onboarding and the second member
+    // verification, and a server can have either, both or neither.
+
+    struct onboard_option
+    {
+        snowflake id;
+        char title[128];
+        char description[256];
+
+        // A custom emoji has an id and is fetched as a picture; a plain one
+        // is the characters themselves.
+        snowflake emoji_id;
+        bool emoji_animated;
+        char emoji_name[64];
+
+        snowflake roles[8];
+        int role_count;
+    };
+
+    struct onboard_prompt
+    {
+        snowflake id;
+        char title[128];
+
+        bool single_select;
+        bool required;
+        // Shown on the way in. The others are the ones a server keeps in its
+        // channel list for later, and they are not part of this panel.
+        bool in_onboarding;
+
+        // Where this prompt's options begin in the flat option list, and how
+        // many there are. Flat because the two are fetched together and are
+        // only ever read together.
+        int first_option;
+        int option_count;
+    };
+
+    // The server the last join by invite landed in, once. Cleared by the
+    // read, so the panel it opens opens once.
+    snowflake take_joined_guild();
+
+    void fetch_onboarding(snowflake guild_id);
+
+    // The same request, but only to find out whether the panel is worth
+    // showing. Answers through take_onboarding_prompt rather than by filling
+    // the window, so it can be fired at a server nobody has asked about.
+    void probe_onboarding(snowflake guild_id);
+    snowflake take_onboarding_prompt();
+
+    // Whether this account has already answered the panel. A server keeps its
+    // prompts forever; only this says whether it is still asking.
+    bool onboarding_answered();
+    void fetch_rules(snowflake guild_id);
+
+    bool onboarding_loading();
+    // Whether the last fetch found anything worth showing.
+    bool onboarding_ready();
+    bool rules_ready();
+
+    int onboarding_prompts(onboard_prompt* out, int cap);
+    int onboarding_options(onboard_option* out, int cap);
+
+    // The rules themselves, copied out one line at a time: the list behind
+    // them is refilled by a worker thread and a pointer into it would not
+    // survive the next fetch.
+    int rules_count();
+    void rules_line(int index, char* out, int cap);
+    void rules_description(char* out, int cap);
+
+    // The chosen options, by id. Everything else the request needs - which
+    // prompts were shown, which options were on screen - is worked out from
+    // what was fetched.
+    void submit_onboarding(snowflake guild_id, const snowflake* chosen, int count);
+
+    // Sends the rules form back with every field answered yes. There is only
+    // one kind of field discord puts in it, and agreeing is the only answer
+    // it takes.
+    void accept_rules(snowflake guild_id);
+
     void fetch_webhooks(snowflake guild_id);
     void delete_webhook(snowflake webhook_id, snowflake guild_id);
 
     // Copies at most cap rows out under the lock; returns how many there were.
     int webhooks(webhook_row* out, int cap);
+
+    // Posts as the webhook rather than as this account. The name and the
+    // picture are whatever is passed - that is the whole of what a webhook
+    // is - and both may be null to use the ones it was made with.
+    void send_via_webhook(snowflake webhook_id, const char* token, const char* content,
+                          const char* username, const char* avatar_url);
     bool webhooks_loading();
 
     // ---- channels ---------------------------------------------------------
@@ -269,6 +375,8 @@ namespace api
     // making a category, which cannot sit inside another.
     void create_channel(snowflake guild_id, const char* name, int type, snowflake parent_id);
     void delete_channel(snowflake channel_id);
+    // Categories are channels too, so this renames one of those as well.
+    void rename_channel(snowflake channel_id, const char* name);
 
     // The channels of one server in the order they should appear. Sent whole
     // rather than as one moved entry: a position only means anything next to
