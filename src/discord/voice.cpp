@@ -12,6 +12,9 @@
 #include "core/storage.h"
 #include "net/proxy.h"
 #include "core/log.h"
+#include "discord/sdp.h"
+#include "discord/webrtc.h"
+#include "discord/rtcp.h"
 #include "core/wavdump.h"
 #include "video/decoder.h"
 #include "video/rtp_video.h"
@@ -198,6 +201,31 @@ namespace
     // new one. Read by the hello handler, which is the only place the two
     // differ: everything after that is identical.
     volatile long g_resuming = 0;
+
+    // Starting a session and stopping one may never overlap.
+    //
+    // They run on different threads and always have: stopping comes from the
+    // interface or from a rejoin, starting comes from the gateway handing over
+    // a voice server. Nothing kept them apart, and the two halves of a call
+    // being built and taken apart at once is a websocket being initialised by
+    // one thread while the other deletes the lock inside it. That is the crash
+    // on rejoining after a 4014: the gateway has a voice server ready for the
+    // new session before the old one has finished being dismantled.
+    //
+    // The threads a stop waits for never take this, so waiting while holding
+    // it cannot deadlock.
+    CRITICAL_SECTION g_life_lock;
+    bool g_life_ready = false;
+
+    // Bumped every time a session starts or stops. A rejoin begun before a
+    // change and finishing after it is a rejoin nobody wants any more.
+    volatile long g_generation = 0;
+
+    struct life_guard
+    {
+        life_guard() { if (g_life_ready) EnterCriticalSection(&g_life_lock); }
+        ~life_guard() { if (g_life_ready) LeaveCriticalSection(&g_life_lock); }
+    };
 
     char g_status[192];
     char g_endpoint[256];
@@ -548,6 +576,18 @@ namespace
     // Discord's own numbering, taken from the stream viewer where it is already
     // proven on the wire. Getting these wrong is silent: the server relays a
     // codec nothing here can read.
+    // ---- transport -------------------------------------------------------
+
+    int g_transport = TRANSPORT_OWN;
+
+    // What the offer advertises. All three come out of the transport: it
+    // generates the certificate and holds the ice password that incoming stun
+    // is checked against, so an offer promising anything else would be
+    // answered and then quietly ignored.
+    const char* g_ice_ufrag = "";
+    const char* g_ice_pwd = "";
+    const char* g_ice_fingerprint = "";
+
     const int PAYLOAD_OPUS = 120;
     const int PAYLOAD_H264 = 105;
     const int PAYLOAD_H264_RTX = 106;
@@ -604,6 +644,81 @@ namespace
 
         send_json(&w);
         w.free_writer();
+    }
+
+    // The same message with a session description instead of an address.
+    // Discord answers this one with transport lines and nothing else; the
+    // codecs are settled by the list below exactly as they are for the udp
+    // protocol, which is why the description does not have to be negotiated.
+    void send_select_protocol_webrtc()
+    {
+        if (!webrtc::begin(&g_ice_ufrag, &g_ice_pwd, &g_ice_fingerprint))
+        {
+            set_status(VOICE_FAILED, tr("Не удалось создать сертификат для WebRTC"));
+            return;
+        }
+
+        sdp::offer o;
+        ccfset(&o, 0, sizeof(o));
+        o.ufrag = g_ice_ufrag;
+        o.pwd = g_ice_pwd;
+        o.fingerprint = g_ice_fingerprint;
+        o.cname = "imdiscord";
+        o.audio_ssrc = g_ssrc;
+        o.video_ssrc = g_ssrc + 1;
+        o.rtx_ssrc = g_ssrc + 2;
+        o.opus_payload = PAYLOAD_OPUS;
+        o.h264_payload = PAYLOAD_H264;
+        o.h264_rtx_payload = PAYLOAD_H264_RTX;
+
+        char text[4096];
+        if (!sdp::build_offer(text, sizeof(text), &o))
+        {
+            set_status(VOICE_FAILED, tr("Не удалось собрать SDP"));
+            return;
+        }
+
+        // Discord calls this the connection id and wants a fresh uuid for it.
+        unsigned char raw[16];
+        crypto::random_bytes(raw, sizeof(raw));
+        raw[6] = (unsigned char)((raw[6] & 0x0F) | 0x40);
+        raw[8] = (unsigned char)((raw[8] & 0x3F) | 0x80);
+
+        char uuid[40];
+        cnprint(uuid, sizeof(uuid),
+                "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+                raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]);
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_i64("op", VOP_SELECT_PROTOCOL);
+        w.key("d");
+        w.begin_obj();
+        w.kv_str("protocol", "webrtc");
+
+        w.key("codecs");
+        w.begin_arr();
+        add_codec(&w, "opus", "audio", PAYLOAD_OPUS, -1, 1000, true);
+        add_codec(&w, "H264", "video", PAYLOAD_H264, PAYLOAD_H264_RTX, 1000, false);
+        w.end_arr();
+
+        // Both spellings, as the reference sends them. Which one the server
+        // reads is not documented anywhere, and sending one of the two is not
+        // worth finding out the hard way.
+        w.kv_str("data", text);
+        w.kv_str("sdp", text);
+        w.kv_str("rtc_connection_id", uuid);
+
+        w.end_obj();
+        w.end_obj();
+
+        send_json(&w);
+        w.free_writer();
+
+        log_line("voice: webrtc, предложение отправлено (%u байт), ufrag=%s",
+                 (unsigned int)ccslenf(text), g_ice_ufrag);
     }
 
     // ---- DAVE / MLS ----------------------------------------------------
@@ -1243,6 +1358,11 @@ namespace
 
     // ---- udp -----------------------------------------------------------
 
+    // Read from the ui thread while the media thread writes it. A bool that
+    // is wrong for one frame costs a stale line on screen and nothing else,
+    // which is not worth a lock on the media path.
+    volatile bool g_media_direct = false;
+
     bool udp_connect()
     {
         g_udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1282,6 +1402,12 @@ namespace
             g_udp = INVALID_SOCKET;
             return false;
         }
+
+        g_media_direct = g_udp_route.direct;
+
+        if (g_media_direct)
+            log_line("voice: медиа идёт мимо прокси - адрес этой машины виден "
+                     "голосовому серверу discord");
 
         // Generous while waiting for the discovery reply; the media loop
         // switches the socket to non-blocking right after.
@@ -1329,11 +1455,26 @@ namespace
         return false;
     }
 
+    // What the media path is actually carrying, counted rather than guessed.
+    // "It sounds wrong" and "almost nothing arrives" are different faults and
+    // they need different work, and neither can be told from the other by ear.
+    unsigned int g_stat_sent = 0;
+    unsigned int g_stat_encoded = 0;
+    unsigned int g_stat_tried = 0;
+    unsigned int g_stat_failed = 0;
+    unsigned int g_stat_recv = 0;
+    unsigned int g_stat_bad = 0;
+    unsigned long long g_stat_at = 0;
+
     // ---- rtp -----------------------------------------------------------
 
     int send_audio(const unsigned char* opus_data, int opus_len)
     {
-        if (g_udp == INVALID_SOCKET || g_mode == MODE_NONE) return 0;
+        if (g_udp == INVALID_SOCKET) return 0;
+
+        // The webrtc transport has no mode to pick: srtp is the mode, and it
+        // is keyed by the handshake rather than by a key in a json message.
+        if (g_transport != TRANSPORT_WEBRTC && g_mode == MODE_NONE) return 0;
 
         unsigned char packet[MAX_PACKET];
         packet[0] = 0x80;
@@ -1348,6 +1489,22 @@ namespace
         packet[9] = (unsigned char)(g_ssrc >> 16);
         packet[10] = (unsigned char)(g_ssrc >> 8);
         packet[11] = (unsigned char)(g_ssrc);
+
+        if (g_transport == TRANSPORT_WEBRTC)
+        {
+            g_stat_tried++;
+
+            unsigned char wrapped[MAX_PACKET];
+            int n = webrtc::protect(packet, 12, opus_data, opus_len,
+                                    wrapped, (int)sizeof(wrapped));
+            if (!n) { g_stat_failed++; return 0; }
+
+            g_sequence++;
+            g_timestamp += AUDIO_FRAME_SAMPLES;
+            g_stat_sent++;
+
+            return proxy::udp_send(&g_udp_route, wrapped, n);
+        }
 
         unsigned int counter = ++g_nonce_counter;
         unsigned char counter_bytes[4] = {
@@ -1394,7 +1551,12 @@ namespace
     int decrypt_packet(const unsigned char* packet, int len, unsigned char* out, int out_cap,
                        unsigned int* out_ssrc, unsigned short* out_seq)
     {
-        if (len < 12 + 16 + 4) return 0;
+        // Srtp carries a ten byte tag where discord's own scheme carries a
+        // sixteen byte one and a four byte counter, so the shortest packet
+        // worth looking at differs between them.
+        int least = g_transport == TRANSPORT_WEBRTC ? 12 + 10 : 12 + 16 + 4;
+        if (len < least) return 0;
+
         if ((packet[0] & 0xC0) != 0x80) return 0;
         // RTCP shares the port, so the payload type is what separates media
         // from control. The top bit of byte 1 is the marker flag and has to be
@@ -1412,7 +1574,36 @@ namespace
         bool has_extension = (packet[0] & 0x10) != 0;
 
         int header_len = 12 + csrc_count * 4;
-        if (has_extension) header_len += 4;    // profile + length words, body is encrypted
+
+        if (g_transport == TRANSPORT_WEBRTC)
+        {
+            // Srtp leaves the whole header in the clear, extension and all,
+            // and starts the cipher after it. Counting only the four byte
+            // extension preamble as header hands the rest of the extension to
+            // the cipher as if it were payload: the tag still checks out,
+            // because it covers the same bytes either way, and the plaintext
+            // comes out shifted. That is audible rather than diagnosable - it
+            // decodes into noise, and packets that happen to carry no
+            // extension come through perfectly.
+            if (has_extension)
+            {
+                if (header_len + 4 > len) return 0;
+
+                int words = ((int)packet[header_len + 2] << 8) | packet[header_len + 3];
+                header_len += 4 + words * 4;
+            }
+
+            if (header_len + 10 > len) return 0;
+
+            return webrtc::unprotect(packet, header_len,
+                                     packet + header_len, len - header_len,
+                                     out, out_cap);
+        }
+
+        // Discord's own scheme is the other way round: the extension body is
+        // inside the encrypted part, so only its two header words are skipped.
+        if (has_extension) header_len += 4;
+
         if (header_len + 16 + 4 > len) return 0;
 
         const unsigned char* counter_bytes = packet + len - 4;
@@ -1987,10 +2178,161 @@ namespace
 
     // ---- receive pump ----------------------------------------------------
 
+    void media_stats_tick()
+    {
+        unsigned long long now = GetTickCount64();
+        if (!g_stat_at) { g_stat_at = now; return; }
+        if (now - g_stat_at < 30000) return;
+
+        unsigned long long span = now - g_stat_at;
+        g_stat_at = now;
+
+        log_line("voice: за %u мс: закодировано %u, в шифр %u, отказ шифра %u, "
+                 "отправлено %u, принято %u, не расшифровано %u",
+                 (unsigned int)span, g_stat_encoded, g_stat_tried, g_stat_failed,
+                 g_stat_sent, g_stat_recv, g_stat_bad);
+
+        g_stat_sent = 0;
+        g_stat_recv = 0;
+        g_stat_bad = 0;
+        g_stat_encoded = 0;
+        g_stat_tried = 0;
+        g_stat_failed = 0;
+    }
+
+    // ---- rtcp ----------------------------------------------------------
+    //
+    // Only on discord's own transport. The webrtc one would need srtcp, and
+    // the srtp in the vendored library treats a control packet as if it were
+    // media: rtp sequence semantics for the counter and no srtcp index behind
+    // the payload. Sending that produces packets a conforming peer discards,
+    // so on that transport the back channel stays shut rather than sending
+    // something wrong.
+
+    int g_bitrate_set = 0;
+
+    bool send_control(const unsigned char* data, int len)
+    {
+        if (g_udp == INVALID_SOCKET || g_mode == MODE_NONE) return false;
+        if (len < 8) return false;
+
+        // The first eight bytes travel in the clear and are what the tag is
+        // computed over, exactly as the media header does.
+        unsigned char packet[768];
+        if (len + 16 + 4 > (int)sizeof(packet)) return false;
+
+        ccpy(packet, data, 8);
+
+        unsigned int counter = ++g_nonce_counter;
+        unsigned char counter_bytes[4] = {
+            (unsigned char)(counter >> 24), (unsigned char)(counter >> 16),
+            (unsigned char)(counter >> 8), (unsigned char)(counter)
+        };
+
+        unsigned char* cipher = packet + 8;
+        unsigned char tag[16];
+        bool ok = false;
+
+        if (g_mode == MODE_XCHACHA20)
+        {
+            unsigned char nonce[24];
+            ccfset(nonce, 0, sizeof(nonce));
+            ccpy(nonce, counter_bytes, 4);
+            crypto::xchacha20poly1305_encrypt(g_secret_key, nonce, packet, 8,
+                                              data + 8, (unsigned int)(len - 8), cipher, tag);
+            ok = true;
+        }
+        else
+        {
+            unsigned char nonce[12];
+            ccfset(nonce, 0, sizeof(nonce));
+            ccpy(nonce, counter_bytes, 4);
+            ok = crypto::aes256gcm_encrypt(g_secret_key, nonce, packet, 8,
+                                           data + 8, (unsigned int)(len - 8), cipher, tag);
+        }
+
+        if (!ok) return false;
+
+        int at = len;
+        ccpy(packet + at, tag, 16);
+        at += 16;
+        ccpy(packet + at, counter_bytes, 4);
+        at += 4;
+
+        return proxy::udp_send(&g_udp_route, packet, at) != SOCKET_ERROR;
+    }
+
+    void receive_control(const unsigned char* packet, int len)
+    {
+        if (g_transport == TRANSPORT_WEBRTC || g_mode == MODE_NONE) return;
+        if (len < 8 + 16 + 4) return;
+
+        int cipher_len = len - 8 - 16 - 4;
+        if (cipher_len <= 0) return;
+
+        const unsigned char* counter_bytes = packet + len - 4;
+        const unsigned char* cipher = packet + 8;
+        const unsigned char* tag = packet + 8 + cipher_len;
+
+        unsigned char plain[1024];
+        if (cipher_len > (int)sizeof(plain)) return;
+
+        bool ok = false;
+
+        if (g_mode == MODE_XCHACHA20)
+        {
+            unsigned char nonce[24];
+            ccfset(nonce, 0, sizeof(nonce));
+            ccpy(nonce, counter_bytes, 4);
+            ok = crypto::xchacha20poly1305_decrypt(g_secret_key, nonce, packet, 8,
+                                                   cipher, (unsigned int)cipher_len, tag, plain);
+        }
+        else if (g_mode == MODE_AES256_GCM)
+        {
+            unsigned char nonce[12];
+            ccfset(nonce, 0, sizeof(nonce));
+            ccpy(nonce, counter_bytes, 4);
+            ok = crypto::aes256gcm_decrypt(g_secret_key, nonce, packet, 8,
+                                           cipher, (unsigned int)cipher_len, tag, plain);
+        }
+
+        if (!ok) return;
+
+        // Put the clear header back in front of what came out, because the
+        // parser walks whole packets and the header carries the length.
+        unsigned char whole[1024 + 8];
+        ccpy(whole, packet, 8);
+        ccpy(whole + 8, plain, (size_t)cipher_len);
+
+        rtcp::on_control(whole, 8 + cipher_len, g_ssrc);
+    }
+
+    void control_tick()
+    {
+        if (g_transport == TRANSPORT_WEBRTC || g_mode == MODE_NONE) return;
+
+        unsigned char report[768];
+        int n = rtcp::build(g_ssrc, report, (int)sizeof(report));
+        if (n > 0) send_control(report, n);
+
+        // And what the far side asked for, applied. Opus takes a new bitrate
+        // between frames without any fuss, so this is simply set when it
+        // moves rather than at any particular moment.
+        int want = rtcp::audio_bitrate();
+        if (g_encoder && want != g_bitrate_set)
+        {
+            g_bitrate_set = want;
+            opus_encoder_ctl(g_encoder, OPUS_SET_BITRATE(want));
+        }
+    }
+
     void pump_incoming()
     {
         unsigned char packet[MAX_PACKET];
         unsigned char payload[1400];
+
+        media_stats_tick();
+        control_tick();
 
         for (int i = 0; i < 32; i++)
         {
@@ -2002,9 +2344,35 @@ namespace
             // list does not know about must not be mistaken for a voice.
             unsigned int packet_pt = packet[1] & 0x7F;
 
+            // Rtcp shares this port - that is what rtcp-mux means - and the
+            // way to tell it apart is the payload type: 64 through 95 belong
+            // to rtcp and never to media. Counting these as failures to
+            // decrypt put a steady ten or so in every report and invited
+            // exactly the wrong investigation.
+            if (packet_pt >= 64 && packet_pt <= 95)
+            {
+                receive_control(packet, got);
+                continue;
+            }
+
             unsigned int ssrc = 0;
             unsigned short seq = 0;
             int len = decrypt_packet(packet, got, payload, sizeof(payload), &ssrc, &seq);
+
+            if (len > 0)
+            {
+                g_stat_recv++;
+
+                // The timestamp is needed for jitter and it is not something
+                // decryption hands back, so it is read off the header here.
+                unsigned int rtp_ts = ((unsigned int)packet[4] << 24) |
+                                      ((unsigned int)packet[5] << 16) |
+                                      ((unsigned int)packet[6] << 8) | packet[7];
+
+                rtcp::on_media(ssrc, seq, rtp_ts, packet_pt != (unsigned int)PAYLOAD_OPUS);
+            }
+            else g_stat_bad++;
+
             if (len <= 0)
             {
                 if (!g_logged_decrypt_fail)
@@ -2288,7 +2656,7 @@ namespace
 
         unsigned char encoded[1400];
         int len = opus_encode(g_encoder, mono, AUDIO_FRAME_SAMPLES, encoded, sizeof(encoded));
-        if (len > 1) send_media(encoded, len);
+        if (len > 1) { g_stat_encoded++; send_media(encoded, len); }
     }
 
     void report_stats()
@@ -2415,6 +2783,16 @@ namespace
         }
 
         log_line("voice: ready ssrc=%u %s:%u mode=%s", g_ssrc, g_udp_host, g_udp_port, chosen);
+
+        if (g_transport == TRANSPORT_WEBRTC)
+        {
+            // No ip discovery on this path: the address to send from is
+            // settled by ice, not by asking the server what it sees.
+            set_status(VOICE_CONNECTING, tr("Согласование WebRTC..."));
+            send_select_protocol_webrtc();
+            return;
+        }
+
         set_status(VOICE_CONNECTING, tr("Согласование UDP..."));
 
         if (!udp_connect())
@@ -2441,34 +2819,18 @@ namespace
         send_select_protocol(external_ip, external_port, chosen);
     }
 
-    void handle_session_description(const jval* d)
+    // What came back for a webrtc offer. Parsed and written down in full,
+    // and then the call is stopped: the description is only half of what a
+    // webrtc connection needs, and the other half - ice, dtls, srtp - is not
+    // wired up yet. Stopping loudly here is the honest version of that;
+    // carrying on would produce a call that is connected and silent.
+    // Everything that has to happen once the keys exist, whichever way
+    // they were arrived at. The two transports negotiate completely
+    // differently and then need exactly the same encoder, the same audio
+    // devices and the same counters, so this stopped being part of the
+    // session description handler when a second caller appeared.
+    void start_media()
     {
-        const jval* key = d->arr("secret_key");
-        if (key->count < 32)
-        {
-            set_status(VOICE_FAILED, tr("Некорректный ключ сессии"));
-            return;
-        }
-        for (int i = 0; i < 32; i++)
-            g_secret_key[i] = (unsigned char)key->at((unsigned int)i)->as_i64(0);
-
-        const char* mode = d->str("mode", "");
-        if (ccscmp(mode, "aead_aes256_gcm_rtpsize") == 0) g_mode = MODE_AES256_GCM;
-        else if (ccscmp(mode, "aead_xchacha20_poly1305_rtpsize") == 0) g_mode = MODE_XCHACHA20;
-
-        // The server decides per session whether E2EE is switched on. Transport
-        // encryption still works either way, so the session is kept alive; what
-        // cannot be done is unwrapping individual E2E frames.
-        int dave_version = d->i32("dave_protocol_version", 0);
-        g_dave_active = dave_version > 0;
-        g_dave_version = dave_version;
-        g_dave_version_next = dave_version;
-        g_dave_downgraded = false;
-        if (g_dave_active)
-            log_line("voice: server enabled DAVE v%d - E2EE frames cannot be decoded", dave_version);
-        else
-            log_line("voice: transport encryption %s, DAVE off", mode);
-
         int err = 0;
         if (!g_encoder)
         {
@@ -2502,6 +2864,8 @@ namespace
         g_own_commit_ready = false;
         g_own_commit_won = false;
         vad::reset();
+        rtcp::reset();
+        g_bitrate_set = 0;
         g_logged_first_rx = false;
         g_logged_first_tx = false;
         g_logged_decrypt_fail = false;
@@ -2511,6 +2875,144 @@ namespace
         InterlockedExchange(&g_session_ready, 1);
         set_status(VOICE_CONNECTED, g_dave_active ? tr("В канале, согласование E2EE...") : tr("В голосовом канале"));
         log_line("voice: session established");
+    }
+
+    void handle_webrtc_description(const jval* d)
+    {
+        const char* text = d->str("sdp", 0);
+        if (!text || !text[0]) text = d->str("data", 0);
+
+        if (!text || !text[0])
+        {
+            log_line("voice: webrtc, в ответе нет sdp");
+            set_status(VOICE_FAILED, tr("WebRTC: сервер не прислал SDP"));
+            return;
+        }
+
+        log_line("voice: webrtc, ответ сервера:");
+        log_line("%s", text);
+
+        // And the same thing as a file of its own. A log can go missing - one
+        // already did, and the run it belonged to could not be looked at
+        // afterwards at all. This answer is the whole point of the probe, so
+        // it is written where nothing rotates it away.
+        {
+            wchar_t path[MAX_PATH];
+            if (ufile::app_path(L"webrtc_answer.txt", path, MAX_PATH))
+                ufile::write_all(path, text, (unsigned int)ccslenf(text));
+        }
+
+        sdp::answer a;
+        if (!sdp::parse_answer(text, &a))
+        {
+            set_status(VOICE_FAILED, tr("WebRTC: SDP не разобрался"));
+            return;
+        }
+
+        log_line("voice: webrtc, %s:%u ufrag=%s кандидат=%s (%s)",
+                 a.ip, a.port, a.ufrag, a.candidate,
+                 a.candidate_is_udp ? "udp" : "не udp");
+        log_line("voice: webrtc, отпечаток %s", a.fingerprint);
+
+        if (!a.candidate_is_udp)
+        {
+            // Worth saying out loud rather than failing further down. Every
+            // capture so far has one udp host candidate and nothing else;
+            // anything different is news.
+            log_line("voice: webrtc, кандидат не udp - такого ещё не было");
+        }
+
+        // The answer is what says where to send. It has matched the address
+        // from READY every time so far, but the answer is the authority on
+        // this path and READY is not.
+        ccstrncpy(g_udp_host, a.ip, sizeof(g_udp_host) - 1);
+        g_udp_port = a.port;
+
+        set_status(VOICE_CONNECTING, tr("WebRTC: рукопожатие..."));
+
+        unsigned long long began = GetTickCount64();
+
+        if (!udp_connect())
+        {
+            set_status(VOICE_FAILED, tr("WebRTC: UDP-сокет не открылся"));
+            return;
+        }
+
+        // Five seconds. A handshake against one server that answers or does
+        // not is a matter of a few round trips; waiting longer only delays
+        // the report of a failure nobody can do anything about.
+        const char* why = "";
+        if (!webrtc::handshake(&g_udp_route, &a, 5000, &why))
+        {
+            log_line("voice: webrtc, рукопожатие не вышло (%s)", why);
+            g_stop_reason = why[0] ? why : "рукопожатие не вышло";
+
+            set_status(VOICE_FAILED, tr("WebRTC: рукопожатие не прошло"));
+            return;
+        }
+
+        log_line("voice: webrtc, srtp готов за %d мс", (int)(GetTickCount64() - began));
+
+        // From here the socket is polled from the 20 ms tick, so it must stop
+        // blocking. The other transport does this after ip discovery; this
+        // path returns before that line, and leaving the socket blocking with
+        // a 250 ms timeout starves the tick down to about two hertz. Media
+        // still arrives - it piles up and is drained in batches - while the
+        // microphone is only sampled twice a second, which sounds to everyone
+        // else like a few scattered fragments of speech.
+        unsigned long nonblocking = 1;
+        ioctlsocket(g_udp, FIONBIO, &nonblocking);
+
+        // No secret key on this path and no transport mode to choose: srtp
+        // keys came out of the handshake, and every packet from here on is
+        // wrapped with them instead of with discord's own scheme.
+        int dave_version = d->i32("dave_protocol_version", 0);
+        g_dave_active = dave_version > 0;
+        g_dave_version = dave_version;
+        g_dave_version_next = dave_version;
+        g_dave_downgraded = false;
+
+        if (g_dave_active)
+            log_line("voice: webrtc, сервер включил DAVE v%d", dave_version);
+
+        start_media();
+    }
+
+    void handle_session_description(const jval* d)
+    {
+        if (g_transport == TRANSPORT_WEBRTC)
+        {
+            handle_webrtc_description(d);
+            return;
+        }
+
+        const jval* key = d->arr("secret_key");
+        if (key->count < 32)
+        {
+            set_status(VOICE_FAILED, tr("Некорректный ключ сессии"));
+            return;
+        }
+        for (int i = 0; i < 32; i++)
+            g_secret_key[i] = (unsigned char)key->at((unsigned int)i)->as_i64(0);
+
+        const char* mode = d->str("mode", "");
+        if (ccscmp(mode, "aead_aes256_gcm_rtpsize") == 0) g_mode = MODE_AES256_GCM;
+        else if (ccscmp(mode, "aead_xchacha20_poly1305_rtpsize") == 0) g_mode = MODE_XCHACHA20;
+
+        // The server decides per session whether E2EE is switched on. Transport
+        // encryption still works either way, so the session is kept alive; what
+        // cannot be done is unwrapping individual E2E frames.
+        int dave_version = d->i32("dave_protocol_version", 0);
+        g_dave_active = dave_version > 0;
+        g_dave_version = dave_version;
+        g_dave_version_next = dave_version;
+        g_dave_downgraded = false;
+        if (g_dave_active)
+            log_line("voice: server enabled DAVE v%d - E2EE frames cannot be decoded", dave_version);
+        else
+            log_line("voice: transport encryption %s, DAVE off", mode);
+
+        start_media();
     }
 
     void handle_voice_payload(const char* text, unsigned int len)
@@ -2932,6 +3434,8 @@ namespace
 
     void start_voice_connection()
     {
+        life_guard life;
+
         // Cleared here, so what the panel shows always belongs to the most
         // recent teardown rather than to whatever happened before it. A field
         // that is only ever written is a field that eventually lies.
@@ -2953,6 +3457,8 @@ namespace
 
         ResetEvent(g_stop_event);
 
+        InterlockedIncrement(&g_generation);
+
         g_ws_thread = CreateThread(0, 0, voice_ws_thread, 0, 0, 0);
         g_beat_thread = CreateThread(0, 0, voice_heartbeat_thread, 0, 0, 0);
         g_tick_thread = CreateThread(0, 0, tick_thread, 0, 0, 0);
@@ -2963,10 +3469,14 @@ namespace
     // put them back if they are thrown away here.
     void stop_voice_connection(bool keep_server = false)
     {
+        life_guard life;
+
         // join() runs on the UI thread while the gateway thread can tear the
         // session down at the same time; only the winner of this exchange gets
         // to close the handles.
         if (InterlockedCompareExchange(&g_running, 0, 1) != 1) return;
+
+        InterlockedIncrement(&g_generation);
 
         // Every caller sets a different reason first, so this one line names
         // whichever of them it was. Without it a call ending looks the same
@@ -3036,6 +3546,8 @@ namespace
         // back into it did nothing at all, and the only way in was to leave
         // and walk in again by hand.
         g_stop_reason = "4014, возвращаемся";
+
+        long era = g_generation;
         stop_voice_connection();
 
         // The gateway is usually down at this exact moment: a voice 4014
@@ -3061,6 +3573,17 @@ namespace
         // back, the pair reads as no change at all and the join is ignored.
         Sleep(600);
 
+        // Somebody hung up, joined somewhere else, or the session was rebuilt
+        // by another path while this was waiting. Any of those makes coming
+        // back the wrong thing to do - and walking back into a call the person
+        // has just left is worse than not coming back at all.
+        if (g_generation != era + 1 || g_channel_id != r->channel)
+        {
+            log_line("voice: возврат отменён - за это время всё изменилось");
+            memfree(r);
+            return 0;
+        }
+
         voice::join(r->guild, r->channel);
         memfree(r);
         return 0;
@@ -3075,11 +3598,18 @@ void voice::init()
 {
     if (g_locks_ready) return;
     InitializeCriticalSection(&g_speakers_lock);
+    InitializeCriticalSection(&g_life_lock);
+    g_life_ready = true;
     g_speakers = ulist<speaker>();
     g_pending_commit.init(2048);
     g_own_commit.init(2048);
     g_stop_event = CreateEventW(0, TRUE, FALSE, 0);
     g_locks_ready = true;
+
+    g_transport = storage::settings_get_int("voice_transport", TRANSPORT_OWN);
+    if (g_transport < TRANSPORT_OWN || g_transport > TRANSPORT_WEBRTC)
+        g_transport = TRANSPORT_OWN;
+
     load_user_audio();
     set_status(VOICE_IDLE, "");
     audio::init();
@@ -3095,6 +3625,11 @@ void voice::shutdown()
     audio::set_voice_mixer(0);
     audio::shutdown();
     g_speakers.dispose();
+
+    // After the last stop, which takes it.
+    g_life_ready = false;
+    DeleteCriticalSection(&g_life_lock);
+
     DeleteCriticalSection(&g_speakers_lock);
     if (g_stop_event) { CloseHandle(g_stop_event); g_stop_event = 0; }
     g_locks_ready = false;
@@ -3180,6 +3715,24 @@ void voice::set_muted(bool m)
 }
 
 bool voice::muted() { return g_muted; }
+
+bool voice::media_unproxied() { return g_media_direct; }
+
+int voice::transport() { return g_transport; }
+
+void voice::set_transport(int t)
+{
+    if (t < TRANSPORT_OWN || t > TRANSPORT_WEBRTC) t = TRANSPORT_OWN;
+
+    g_transport = t;
+    storage::settings_set_int("voice_transport", t);
+
+    // Deliberately not applied to a call already running. Tearing down a
+    // conversation somebody is in the middle of, because a setting was
+    // touched, is worse than the setting taking effect on the next call.
+    log_line("voice: транспорт переключён на %s (со следующего звонка)",
+             t == TRANSPORT_WEBRTC ? "webrtc" : "свой udp");
+}
 
 void voice::set_deafened(bool d)
 {
@@ -3428,6 +3981,20 @@ void voice::on_gateway_voice_state(const jval* d)
                      was_in, channel);
             g_stop_reason = "перенос в другой канал";
             stop_voice_connection(true);
+
+            // Put back what the stop just took away.
+            //
+            // Stopping clears "we have a session id". That is right when a
+            // call ends and wrong here: the session id is the one that came
+            // a moment ago, and it is the whole reason we are reconnecting.
+            //
+            // Without this the start below found only half of what it needs,
+            // logged that it was waiting for the other half, and returned.
+            // Being moved left the panel saying we were in voice while there
+            // was no voice at all - and the second move, finding nothing
+            // running, took the ordinary path and reconnected against a
+            // session that had been replaced: close code 4006.
+            g_have_state = true;
         }
         else
         {

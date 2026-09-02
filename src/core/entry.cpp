@@ -16,6 +16,12 @@
 #include "video/player.h"
 #include "video/capture.h"
 #include "net/http.h"
+#include "net/netdump.h"
+#include "discord/sdp.h"
+#include "net/selfcert.h"
+#include "discord/webrtc.h"
+#include "discord/rtcp.h"
+#include "discord/cdnfix.h"
 
 // The image is linked with /NODEFAULTLIB, so nothing runs dynamic initializers
 // for us. Walking the .CRT$XC* section by hand is the whole of "C++ runtime
@@ -202,6 +208,70 @@ extern "C" void __stdcall im_entry()
             WSACleanup();
             log_shutdown();
             ExitProcess(ok ? 0 : 1);
+        }
+    }
+
+    // "--netdump [процесс] [секунд]" watches which process sends what,
+    // for the one question that cannot be answered from inside an
+    // application: whether its media really goes through the proxy it was
+    // told to use, or straight out past it.
+    {
+        const wchar_t* found = 0;
+        for (const wchar_t* p = cmdline; *p; p++)
+        {
+            if (p[0] == L'-' && p[1] == L'-' && p[2] == L'n' && p[3] == L'e' &&
+                p[4] == L't' && p[5] == L'd' && p[6] == L'u' && p[7] == L'm' &&
+                p[8] == L'p')
+            {
+                found = p + 9;
+                break;
+            }
+        }
+
+        if (found)
+        {
+            // Two optional words in either order, told apart by shape: a
+            // number is how long to record, anything else is the name of
+            // the application being asked about.
+            char app[64];
+            int  seconds = 90;
+            app[0] = 0;
+
+            const wchar_t* at = found;
+            for (int word = 0; word < 2; word++)
+            {
+                while (*at == L' ' || *at == L'"') at++;
+                if (!*at) break;
+
+                wchar_t buf[64];
+                int n = 0;
+                while (at[n] && at[n] != L' ' && at[n] != L'"' && n < 63)
+                { buf[n] = at[n]; n++; }
+                buf[n] = 0;
+                at += n;
+
+                bool numeric = n > 0;
+                for (int i = 0; i < n; i++)
+                    if (buf[i] < L'0' || buf[i] > L'9') numeric = false;
+
+                if (numeric)
+                {
+                    int v = 0;
+                    for (int i = 0; i < n; i++) v = v * 10 + (buf[i] - L'0');
+                    if (v > 0) seconds = v;
+                }
+                else
+                {
+                    int m = utf16to8(buf, n, app, (int)sizeof(app) - 1);
+                    if (m < 0) m = 0;
+                    app[m] = 0;
+                }
+            }
+
+            int rc = netdump::run(seconds, app);
+            WSACleanup();
+            log_shutdown();
+            ExitProcess(rc);
         }
     }
 
@@ -459,6 +529,12 @@ extern "C" void __stdcall im_entry()
         bool ok = crypto::self_test();
         ok = dave_self_test() && ok;
         ok = noise::self_test() && ok;
+        ok = netdump::self_test() && ok;
+        ok = sdp::self_test() && ok;
+        ok = selfcert::self_test() && ok;
+        ok = webrtc::self_test() && ok;
+        ok = rtcp::self_test() && ok;
+        ok = cdnfix::self_test() && ok;
         WSACleanup();
         log_shutdown();
         ExitProcess(ok ? 0 : 1);

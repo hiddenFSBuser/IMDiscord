@@ -33,6 +33,12 @@ namespace tex
     void init();
     void shutdown();
 
+    // Asks for one more go at something that failed. The automatic retries
+    // give up after a few attempts on purpose - a link that is simply dead
+    // should not be hammered - so a person who wants to insist has to be able
+    // to say so.
+    void retry(const char* url);
+
     // Never null. Returns an entry in TEX_LOADING state on the first call.
     const texture* get(const char* url);
 

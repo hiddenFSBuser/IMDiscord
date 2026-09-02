@@ -184,8 +184,9 @@ void ui_member_moderation_menu(snowflake guild_id, snowflake user_id)
     bool can_mute = voice && (here & PERM_MUTE_MEMBERS);
     bool can_timeout = (anywhere & PERM_MODERATE_MEMBERS) != 0;
     bool can_ban = (anywhere & PERM_BAN_MEMBERS) != 0;
+    bool can_kick = (anywhere & PERM_KICK_MEMBERS) != 0;
 
-    if (!can_move && !can_mute && !can_timeout && !can_ban) return;
+    if (!can_move && !can_mute && !can_timeout && !can_ban && !can_kick) return;
 
     ImGui::Separator();
 
@@ -264,6 +265,19 @@ void ui_member_moderation_menu(snowflake guild_id, snowflake user_id)
         ImGui::PopStyleColor();
 
         if (go) ui_open_ownership(guild_id, user_id);
+    }
+
+    // Above the ban, and worded as the milder thing it is: a kick is undone by
+    // the person walking back in, a ban is not.
+    if (can_kick)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+        bool go = ImGui::MenuItem(tr("Выгнать с сервера"));
+        ImGui::PopStyleColor();
+
+        if (go) api::kick_member(guild_id, user_id);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(tr("Сможет вернуться по новому приглашению"));
     }
 
     if (can_ban)

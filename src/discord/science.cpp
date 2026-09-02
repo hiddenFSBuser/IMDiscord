@@ -680,6 +680,96 @@ void science::invite_opened(const char* code)
     emit("invite_opened", TIER_ESSENTIAL, &p);
 }
 
+// "<message id>:<code>". Discord's own name for one particular panel, as
+// opposed to the invite it shows: the same code posted twice is two of these
+// and one of those.
+static void instance_id(char* out, int cap, const char* code, snowflake message_id)
+{
+    cnprint(out, cap, "%llu:%s", message_id, code ? code : "");
+}
+
+void science::invite_opened_in_message(const char* code, snowflake message_id)
+{
+    if ((int)science::mode() < (int)TIER_ESSENTIAL) return;
+
+    char instance[64];
+    instance_id(instance, sizeof(instance), code, message_id);
+
+    jwriter p;
+    p.init();
+    common(&p);
+    p.kv_str("invite_code", code ? code : "");
+    p.kv_str("invite_instance_id", instance);
+    emit("invite_opened", TIER_ESSENTIAL, &p);
+}
+
+void science::invite_embed_shown(const invite_embed_where* w)
+{
+    if ((int)science::mode() < (int)TIER_ESSENTIAL || !w) return;
+
+    char instance[64];
+    instance_id(instance, sizeof(instance), w->code, w->message_id);
+
+    jwriter p;
+    p.init();
+    common(&p);
+
+    p.kv_bool("channel_hidden", false);
+    p.kv_snowflake("channel_id", w->channel_id);
+    p.kv_str("channel_member_perms", "0");
+    p.kv_i64("channel_size_total", w->channel_size_total);
+    p.kv_i64("channel_type", w->channel_type);
+
+    p.kv_str("embed_type", "guild_invite_v2");
+    p.kv_str("impression_type", "view");
+
+    p.kv_snowflake("invite_channel_id", w->invite_channel_id);
+    p.kv_i64("invite_channel_type", w->invite_channel_type);
+    p.kv_str("invite_code", w->code ? w->code : "");
+    p.kv_snowflake("invite_guild_id", w->invite_guild_id);
+    p.kv_str("invite_instance_id", instance);
+
+    p.kv_str("location_section", "impression_invite_embed");
+    p.key("location_stack");
+    p.begin_arr();
+    p.val_str("invite embed");
+    p.end_arr();
+
+    emit("impression_invite_embed", TIER_ESSENTIAL, &p);
+}
+
+void science::invite_embed_actioned(const invite_embed_where* w, const char* action)
+{
+    if ((int)science::mode() < (int)TIER_ESSENTIAL || !w) return;
+
+    char instance[64];
+    instance_id(instance, sizeof(instance), w->code, w->message_id);
+
+    jwriter p;
+    p.init();
+    common(&p);
+
+    p.kv_str("action", action ? action : "accept");
+    p.kv_null("application_id");
+    p.kv_str("invite_code", w->code ? w->code : "");
+    p.kv_str("invite_instance_id", instance);
+    p.kv_snowflake("invite_message_id", w->message_id);
+
+    // A string here rather than a number, which is how the capture has it.
+    p.kv_str("invite_type", "0");
+    p.kv_snowflake("inviter_id", w->inviter_id);
+
+    p.key("location_stack");
+    p.begin_arr();
+    p.val_str("invite embed");
+    p.end_arr();
+
+    p.kv_null("number_of_users_in_channel");
+    p.kv_null("stream_key");
+
+    emit("invite_embed_actioned", TIER_ESSENTIAL, &p);
+}
+
 void science::invite_resolved(const invite_result* r)
 {
     if ((int)science::mode() < (int)TIER_ESSENTIAL || !r) return;

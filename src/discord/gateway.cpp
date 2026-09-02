@@ -492,6 +492,8 @@ namespace
         }
 
         const jval* rels = d->arr("relationships");
+        unsigned int rels_dated = 0;
+
         for (unsigned int i = 0; i < rels->count; i++)
         {
             const jval* r = rels->at(i);
@@ -505,7 +507,10 @@ namespace
             {
                 store::upsert_user(r->obj("user"));
             }
-            if (uid) store::set_relationship(uid, r->i32("type", 0), r->str("nickname", 0));
+            const char* since = r->str("since", 0);
+            if (since && since[0]) rels_dated++;
+
+            if (uid) store::set_relationship(uid, r->i32("type", 0), r->str("nickname", 0), since);
         }
 
         // Initial online states. Without this everyone stays grey until their
@@ -517,8 +522,11 @@ namespace
         store::touch_dm_order();
         store::bump_revision();
 
-        log_line("gateway: READY, %u guilds, %u dms, %u relationships",
-                 guilds->count, privates->count, rels->count);
+        // The count with a date says whether discord sends it at all. Without
+        // it a missing "friends since" is equally explained by a parsing fault
+        // here and by the field simply not being there.
+        log_line("gateway: READY, %u guilds, %u dms, %u relationships (с датой: %u)",
+                 guilds->count, privates->count, rels->count, rels_dated);
 
         char text[192];
         cnprint(text, sizeof(text), tr("В сети как %s"),
@@ -643,6 +651,34 @@ namespace
 
                 if (c && c->is_dm() && author && author != store::self_id())
                     sounds::play(SOUND_NOTIFY);
+            }
+
+            // Two messages that both arrived while this client was connected
+            // have nothing missing between them: the gateway delivers every
+            // one, in order, and a resume replays whatever a hiccup skipped.
+            // Writing that down is what stops the view from claiming a hole
+            // between them later, when they have been read back off disk and
+            // nobody remembers how they got there.
+            //
+            // Only between two live ones. The first message of a session says
+            // nothing about the stretch before it, and pretending otherwise
+            // would paper over exactly the holes this exists to find.
+            if (ccscmp(type, "MESSAGE_CREATE") == 0)
+            {
+                static snowflake last_live_channel = 0;
+                static snowflake last_live_id = 0;
+
+                snowflake channel = d->sf("channel_id");
+                snowflake id = d->sf("id");
+
+                if (channel && id)
+                {
+                    if (channel == last_live_channel && last_live_id && last_live_id < id)
+                        archive::note_range(channel, last_live_id, id);
+
+                    last_live_channel = channel;
+                    last_live_id = id;
+                }
             }
 
             // Everything that passes through is kept, so a channel opens from
@@ -843,7 +879,8 @@ namespace
             duser* u = store::upsert_user(d->obj("user"));
             snowflake uid = d->sf("id");
             if (!uid && u) uid = u->id;
-            if (uid) store::set_relationship(uid, d->i32("type", 0), d->str("nickname", 0));
+            if (uid) store::set_relationship(uid, d->i32("type", 0), d->str("nickname", 0),
+                                             d->str("since", 0));
             return;
         }
 

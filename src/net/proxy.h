@@ -32,6 +32,29 @@ enum proxy_kind
     PROXY_HTTPS,
 };
 
+// Where a call's media goes when a proxy is set.
+//
+// Media is udp, and socks5 carries udp only through UDP ASSOCIATE. Plenty of
+// proxies do not implement it, and some do not refuse cleanly either:
+// wireproxy - a userspace wireguard with socks5 on top - accepts the
+// association and answers with a relay address that cannot be reached, so the
+// failure arrives as a dead socket rather than as a refusal.
+//
+// Every browser based client sidesteps this by not asking. Chromium sends
+// media straight out of the process and lets the proxy carry only the
+// signalling, which is why voice works in such a client behind a proxy that
+// cannot carry it: the media is not tunnelled, it is simply not proxied.
+//
+// The same choice belongs here, made openly rather than by accident. Media
+// that leaves directly shows this machine's address to discord's voice
+// server, and hiding that address is most of why a per account proxy exists.
+enum voice_route
+{
+    VOICE_AUTO = 0,   // through the proxy when it can, directly when it cannot
+    VOICE_STRICT,     // only through the proxy: no call rather than a bare one
+    VOICE_DIRECT,     // never through the proxy
+};
+
 struct proxy_config
 {
     int kind;
@@ -40,11 +63,19 @@ struct proxy_config
     char user[64];
     char pass[64];
 
+    // What to do about media. Zero is VOICE_AUTO, which is also what an
+    // account saved before this existed loads as.
+    int voice;
+
     bool in_use() const { return kind != PROXY_NONE && host[0] && port; }
 
     // Whether a voice call can run over it. Media is UDP, and only socks5 has
     // any way to carry that.
     bool carries_udp() const { return kind == PROXY_SOCKS5; }
+
+    // Whether media is allowed out without the proxy when the proxy cannot
+    // carry it.
+    bool voice_may_go_direct() const { return voice != VOICE_STRICT; }
 };
 
 namespace proxy
@@ -101,6 +132,11 @@ namespace proxy
         SOCKET data;             // what the caller sends and receives on
         sockaddr_in relay;       // where datagrams are handed to the proxy
         bool active;             // false means `data` is an ordinary socket
+
+        // True when a proxy is configured and the media is going out without
+        // it anyway. Not an error - it is what VOICE_AUTO asks for - but the
+        // person in the call deserves to be told.
+        bool direct;
 
         // The peer the caller thinks it is connected to. Datagrams carry it in
         // the socks header, since one relay serves every destination.

@@ -44,6 +44,15 @@ namespace
         unsigned char* anim_data;      // the bytes the WebP decoder reads from
         int anim_prev_ts;              // WebP timestamps are cumulative
 
+        // A failed download is not a verdict. Discord's cdn answers a page
+        // full of pictures with rate limits, and the state that came out of
+        // that used to be permanent: the entry sat at TEX_FAILED for the rest
+        // of the session and the picture never appeared, however long you sat
+        // looking at it. So the moment is written down and a few more attempts
+        // are allowed, spaced out.
+        unsigned long long failed_at;
+        int attempts;
+
         unsigned long long next_frame_ms;
         unsigned long long used_frame;
         unsigned long long used_ms;    // wall clock, for unloading
@@ -581,6 +590,8 @@ namespace
         }
         blob.free_buffer();
 
+        if (!ok) e->failed_at = GetTickCount64();
+
         InterlockedExchange(&e->tex.state, ok ? TEX_READY : TEX_FAILED);
         InterlockedDecrement(&g_pending);
     }
@@ -617,6 +628,64 @@ void tex::shutdown()
     g_ready = false;
 }
 
+namespace
+{
+    // How many downloads may be in flight at once.
+    //
+    // Opening a busy channel asks for every picture on the screen in one
+    // frame. Posting all of them means dozens of parallel requests to one
+    // host, which discord answers with rate limits - and every one of those
+    // used to become a permanently broken picture. A handful at a time
+    // finishes the visible ones sooner anyway.
+    const int MAX_IN_FLIGHT = 6;
+
+    // Between attempts on something that failed, and how many to allow.
+    const unsigned long long RETRY_AFTER_MS = 8000;
+    const int MAX_ATTEMPTS = 4;
+
+    // Called with the lock held. Starts the load when there is room, and
+    // leaves the entry alone when there is not: it stays TEX_EMPTY and the
+    // next frame asks again.
+    void start_if_room(entry* e)
+    {
+        if (g_pending >= MAX_IN_FLIGHT) return;
+
+        e->attempts++;
+        InterlockedExchange(&e->tex.state, TEX_LOADING);
+        InterlockedIncrement(&g_pending);
+        jobs::post(job_load, e);
+    }
+}
+
+void tex::retry(const char* url)
+{
+    if (!g_ready || !url || !url[0]) return;
+
+    unsigned __int64 key = ccscrc64(url);
+
+    EnterCriticalSection(&g_lock);
+
+    for (unsigned int i = 0; i < g_entries.count; i++)
+        if (g_entries[i]->key == key)
+        {
+            entry* e = g_entries[i];
+
+            if (e->tex.state == TEX_FAILED)
+            {
+                // The count goes back to zero: this is a fresh decision by
+                // somebody who is looking at the picture, not the tail of the
+                // automatic attempts.
+                e->attempts = 0;
+                e->failed_at = 0;
+                InterlockedExchange(&e->tex.state, TEX_EMPTY);
+            }
+
+            break;
+        }
+
+    LeaveCriticalSection(&g_lock);
+}
+
 const texture* tex::get(const char* url)
 {
     static texture empty = { 0, 0, 0, TEX_EMPTY };
@@ -646,9 +715,12 @@ const texture* tex::get(const char* url)
             // normally still on disk, so this does not go out to the network.
             if (e->tex.state == TEX_EMPTY)
             {
-                InterlockedExchange(&e->tex.state, TEX_LOADING);
-                InterlockedIncrement(&g_pending);
-                jobs::post(job_load, e);
+                start_if_room(e);
+            }
+            else if (e->tex.state == TEX_FAILED && e->attempts < MAX_ATTEMPTS &&
+                     GetTickCount64() - e->failed_at >= RETRY_AFTER_MS)
+            {
+                start_if_room(e);
             }
 
             texture* t = &e->tex;
@@ -665,16 +737,16 @@ const texture* tex::get(const char* url)
     }
     ccfset(e, 0, sizeof(entry));
     e->key = key;
-    e->tex.state = TEX_LOADING;
+    e->tex.state = TEX_EMPTY;
     e->used_frame = g_frame_counter;
     e->used_ms = GetTickCount64();
     e->owner = store::self_id();
     ccstrncpy(e->url, url, sizeof(e->url) - 1);
     g_entries.push(e);
-    LeaveCriticalSection(&g_lock);
 
-    InterlockedIncrement(&g_pending);
-    jobs::post(job_load, e);
+    start_if_room(e);
+
+    LeaveCriticalSection(&g_lock);
     return &e->tex;
 }
 

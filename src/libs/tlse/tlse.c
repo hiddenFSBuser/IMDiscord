@@ -117,6 +117,10 @@
 
 #include "tlse.h"
 
+/* IMDiscord: a way to say something from here. This file is compiled as C
+   and cannot reach the c++ logger directly. */
+extern void imd_log2(const char *tag, unsigned int a, unsigned int b);
+
 #ifndef TLS_FORWARD_SECRECY
 #undef TLS_ECDSA_SUPPORTED
 #endif
@@ -2483,6 +2487,21 @@ int _private_tls_sign_ecdsa(struct TLSContext *context, unsigned int hash_type, 
     // (1.2 and 1.3) expects a fixed-width raw signature: r || s, each padded to
     // the curve size (e.g. 32 bytes for P-256). OpenSSL rejects the DER form
     // with SSL_ERROR_RX_MALFORMED / wrong signature type, so convert it here.
+    //
+    /* IMDiscord: switched off, because for ecdsa in tls the der form is the
+       correct one - rfc 5246 4.7 and rfc 8422 5.4 for 1.2, rfc 8446 4.2.3
+       for 1.3. The fixed width r||s encoding belongs to eddsa and to
+       jose/webcrypto, not here.
+
+       It also could not have been doing its job: the guard below requires
+       both integers to fit the coordinate size, and der adds a leading zero
+       to either of them whenever its top bit is set. So it converted some
+       signatures and silently left others in der - the encoding depended on
+       the value being signed. Two runs of the same handshake produced both.
+
+       Kept rather than deleted: define TLS_ECDSA_RAW_SIGNATURE to bring it
+       back if some peer really does want the raw form. */
+#ifdef TLS_ECDSA_RAW_SIGNATURE
     {
         unsigned long der_len = *outlen;
         unsigned int coords = curve->size;   // bytes per r/s component
@@ -2527,6 +2546,7 @@ int _private_tls_sign_ecdsa(struct TLSContext *context, unsigned int hash_type, 
             // unable to parse DER -> leave as-is (later stages will fail visibly)
         }
     }
+#endif
     
     return 1;
 }
@@ -6481,7 +6501,13 @@ struct TLSPacket *tls_build_hello(struct TLSContext *context, int tls13_downgrad
             }
         }
 #endif
-        if ((context->version == TLS_V12) || (context->version == TLS_V13) || (context->version == DTLS_V13)) {
+        /* IMDiscord: DTLS_V12 was missing here while the length
+           accumulation above counts it, so a dtls 1.2 client hello
+           declared 18 bytes of extensions it never wrote. A peer that
+           reads the length walks off the end of the message and drops the
+           packet without an alert, which is what dtls does before it has
+           anything to authenticate with. */
+        if ((context->version == TLS_V12) || (context->version == DTLS_V12) || (context->version == TLS_V13) || (context->version == DTLS_V13)) {
             if (!context->is_server) {
                 // signature algorithms
                 tls_packet_uint16(packet, 0x0D); // type
@@ -8551,14 +8577,31 @@ int tls_parse_payload(struct TLSContext *context, const unsigned char *buf, int 
         // except renegotiation
         switch (write_packets) {
             case 1:
+                {
+                /* IMDiscord: a client that sent a certificate has to prove it
+                   holds the matching key, and rfc 5246 7.4.8 makes
+                   CertificateVerify mandatory in that case. This flight never
+                   carried one, which no ordinary server notices because no
+                   ordinary server asks for a client certificate - and every
+                   webrtc peer does. The symptom is a peer that answers
+                   nothing and retransmits its own flight until it gives up. */
+                int imd_sent_certificate = 0;
+
                 if (context->client_verified == 2) {
                     DEBUG_PRINT("<= Building CERTIFICATE \n");
                     _private_tls_write_packet(tls_build_certificate(context));
                     context->client_verified = 0;
+                    imd_sent_certificate = 1;
                 }
                 // client handshake
                 DEBUG_PRINT("<= Building KEY EXCHANGE\n");
                 _private_tls_write_packet(tls_build_client_key_exchange(context));
+
+                if (imd_sent_certificate) {
+                    DEBUG_PRINT("<= Building CERTIFICATE VERIFY\n");
+                    _private_tls_write_packet(tls_build_certificate_verify(context));
+                }
+
                 DEBUG_PRINT("<= Building CHANGE CIPHER SPEC\n");
                 _private_tls_write_packet(tls_build_change_cipher_spec(context));
                 context->cipher_spec_set = 1;
@@ -8587,6 +8630,7 @@ int tls_parse_payload(struct TLSContext *context, const unsigned char *buf, int 
                     }
                 }
 #endif
+                }
                 break;
             case 2:
                 // server handshake
@@ -9980,12 +10024,48 @@ struct TLSPacket *tls_build_certificate_verify(struct TLSContext *context) {
     unsigned int size_offset = packet->len;
     tls_packet_uint24(packet, 0);
 
+    /* IMDiscord: every other builder here writes the dtls message
+       header - sequence, fragment offset, fragment length - and this
+       one did not, because it was written for tls 1.3 over tcp where
+       there is no such header. Over dtls the peer then read the
+       sequence out of the signature algorithm bytes and threw the
+       message away. The length is patched at the end, so zero here. */
+    if (context->dtls)
+        _private_dtls_handshake_data(context, packet, 0);
+
     unsigned char out[TLS_MAX_RSA_KEY];
     unsigned long out_len = TLS_MAX_RSA_KEY;
 
     unsigned char signing_data[TLS_MAX_HASH_SIZE + 98];
     int signing_data_len;
 
+    /* IMDiscord: what gets signed depends on the version, and this function
+       only ever knew the 1.3 answer. Tls 1.2 signs the handshake transcript
+       itself - no context string, no separator - so the two cases are split
+       here and everything below signs whatever sign_ptr points at. */
+    const unsigned char *sign_ptr;
+    unsigned int sign_len;
+
+    if ((context->version == TLS_V12) || (context->version == DTLS_V12)) {
+        /* The transcript is only kept when the context was told to expect
+           client authentication; tls_request_client_certificate() is what
+           turns that on. Without it there is nothing to sign and a broken
+           packet is better than a signature over the wrong bytes. */
+        if ((!context->cached_handshake) || (!context->cached_handshake_len)) {
+            DEBUG_PRINT("NO CACHED HANDSHAKE FOR CERTIFICATE VERIFY\n");
+            packet->broken = 1;
+            return packet;
+        }
+
+        sign_ptr = context->cached_handshake;
+        sign_len = context->cached_handshake_len;
+        signing_data_len = 0;
+
+        /* IMDiscord: the transcript this signature covers. The far side
+           signs nothing but checks the same bytes, so a length that does
+           not match the messages actually exchanged is the whole bug. */
+        imd_log2("tlse: certificate verify over transcript", sign_len, 0);
+    } else {
     // first 64 bytes to 0x20 (32)
     memset(signing_data, 0x20, 64);
     // context string 33 bytes
@@ -9999,6 +10079,9 @@ struct TLSPacket *tls_build_certificate_verify(struct TLSContext *context) {
 
     signing_data_len += _private_tls_get_hash(context, signing_data + 98);
     DEBUG_DUMP_HEX_LABEL("verify data", signing_data, signing_data_len);
+        sign_ptr = signing_data;
+        sign_len = (unsigned int)signing_data_len;
+    }
     int hash_algorithm = sha256;
 #ifdef TLS_ECDSA_SUPPORTED
     DEBUG_PRINT("CV is_ecdsa=%d ecc=%d alg=%d\n", tls_is_ecdsa(context), (int)(context->ec_private_key != 0), context->ec_private_key ? context->ec_private_key->ec_algorithm : -1);
@@ -10032,7 +10115,7 @@ struct TLSPacket *tls_build_certificate_verify(struct TLSContext *context) {
     int packet_size = 2;
 #ifdef TLS_ECDSA_SUPPORTED
     if (tls_is_ecdsa(context)) {
-        if (_private_tls_sign_ecdsa(context, hash_algorithm, signing_data, signing_data_len, out, &out_len) == 1) {
+        if (_private_tls_sign_ecdsa(context, hash_algorithm, sign_ptr, sign_len, out, &out_len) == 1) {
             DEBUG_PRINT("ECDSA signing OK! (ECDSA, length %lu)\n", out_len);
             tls_packet_uint16(packet, out_len);
             tls_packet_append(packet, out, out_len);
@@ -10040,7 +10123,7 @@ struct TLSPacket *tls_build_certificate_verify(struct TLSContext *context) {
         }
     } else
 #endif
-    if (_private_tls_sign_rsa(context, hash_algorithm, signing_data, signing_data_len, out, &out_len) == 1) {
+    if (_private_tls_sign_rsa(context, hash_algorithm, sign_ptr, sign_len, out, &out_len) == 1) {
         DEBUG_PRINT("RSA signing OK! (length %lu)\n", out_len);
         tls_packet_uint16(packet, out_len);
         tls_packet_append(packet, out, out_len);
@@ -10051,6 +10134,13 @@ struct TLSPacket *tls_build_certificate_verify(struct TLSContext *context) {
     packet->buf[size_offset + 1] = packet_size / 0x100;
     packet_size %= 0x100;
     packet->buf[size_offset + 2] = packet_size;
+
+    /* IMDiscord: the fragment length repeats the message length for an
+       unfragmented message, and the sequence moves on. */
+    if (context->dtls) {
+        _private_dtls_handshake_copyframesize(packet);
+        context->dtls_seq ++;
+    }
 
     tls_packet_update(packet);
     return packet;
@@ -10830,7 +10920,13 @@ int tls_is_broken(struct TLSContext *context) {
 }
 
 int tls_request_client_certificate(struct TLSContext *context) {
-    if ((!context) || (!context->is_server))
+    /* IMDiscord: allowed on a client too. There it does not request
+       anything - it makes the context keep the handshake transcript,
+       which is the only place a client can get the bytes its own
+       CertificateVerify has to be signed over. Every other use of this
+       flag is guarded by is_server, so a client sets nothing else in
+       motion by turning it on. */
+    if (!context)
         return 0;
     
     context->request_client_certificate = 1;

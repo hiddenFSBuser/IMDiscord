@@ -1487,6 +1487,22 @@ void ui_view_voice_panel(float width)
         ImGui::SetCursorScreenPos(p);
     }
 
+    // A call whose media is not going through the proxy this account uses.
+    // Small, permanent, and in the one place somebody looks while in a call:
+    // the alternative is finding it out afterwards, or never.
+    if (in_voice && voice::media_unproxied())
+    {
+        const float BAND = 16.0f;
+
+        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + BAND), col::bg_deep);
+        dl->PushClipRect(p, ImVec2(p.x + width - 8.0f, p.y + BAND), true);
+        dl->AddText(ImVec2(p.x + 10.0f, p.y + 1.0f), col::red, tr("голос идёт мимо прокси"));
+        dl->PopClipRect();
+
+        p.y += BAND;
+        ImGui::SetCursorScreenPos(p);
+    }
+
     // Why the last call ended, shown where the call used to be. The log has
     // been unreachable for several rounds running, and a dropped connection
     // that will not say who dropped it cannot be fixed by guessing.
@@ -2062,6 +2078,38 @@ void ui_view_settings_popup()
 
         }
     }
+
+    ImGui::Dummy(ImVec2(0, 10));
+    ImGui::TextUnformatted(tr("Транспорт голоса"));
+    ImGui::Separator();
+
+    {
+        const char* names[] = { tr("Свой UDP-протокол Discord"),
+                                tr("WebRTC") };
+
+        int t = voice::transport();
+
+        ImGui::SetNextItemWidth(240);
+        if (ImGui::BeginCombo("##vtransport", names[t == TRANSPORT_WEBRTC ? 1 : 0]))
+        {
+            for (int i = 0; i <= TRANSPORT_WEBRTC; i++)
+                if (ImGui::Selectable(names[i], i == t)) voice::set_transport(i);
+            ImGui::EndCombo();
+        }
+
+        ImGui::PushTextWrapPos(0.0f);
+
+        if (t == TRANSPORT_WEBRTC)
+            ui_text_muted(tr("SDP, ICE, DTLS и SRTP - то, чем говорят браузерные клиенты. "
+                             "Звук идёт через них целиком. Демонстрация экрана держит "
+                             "отдельное соединение и остаётся на своём протоколе."));
+        else
+            ui_text_muted(tr("То, что этот клиент использовал всегда. Работает."));
+
+        ImGui::PopTextWrapPos();
+    }
+
+    ImGui::Dummy(ImVec2(0, 10));
 
     if (ImGui::Button(tr("Настроить приватность"), ImVec2(220, 28))) ui_open_privacy();
     ui_text_muted(tr("Кто может писать вам в личные сообщения"));

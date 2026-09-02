@@ -217,6 +217,15 @@ namespace
     // Rewritten rather than merged: it is always the full set.
     void read_member_roles(dmember* m, const jval* src)
     {
+        // Kept whenever it is offered. A member object arrives from several
+        // directions - the member list, a chunk, a message - and only some of
+        // them carry it, so an absent one must not wipe what is already known.
+        if (src->has("joined_at"))
+        {
+            const char* when = src->str("joined_at", 0);
+            if (when && when[0]) m->joined_at = store::intern(when, -1);
+        }
+
         const jval* roles = src->arr("roles");
         if (roles->type != JTYPE_ARR) return;
 
@@ -918,6 +927,109 @@ static void parse_reactions(const jval* v, dmessage* msg)
     }
 }
 
+namespace
+{
+    void copy_field(char* dst, int cap, const jval* v, const char* key)
+    {
+        ccfset(dst, 0, (unsigned int)cap);
+
+        const char* text = v->str(key, 0);
+        if (text) ccstrncpy(dst, text, (size_t)cap - 1);
+    }
+
+    void read_component_emoji(dcomponent* c, const jval* v)
+    {
+        const jval* e = v->obj("emoji");
+        if (e->type != JTYPE_OBJ) return;
+
+        c->emoji_id = e->sf("id");
+        c->emoji_animated = e->boolean("animated", false);
+        copy_field(c->emoji_name, sizeof(c->emoji_name), e, "name");
+    }
+
+    // The rows a bot hung under its message, flattened.
+    //
+    // Rewritten whole rather than merged: an edit that changes a button
+    // sends the whole set again, and half of an old set left behind is a
+    // button that does nothing when pressed.
+    void read_components(dmessage* m, const jval* v)
+    {
+        const jval* rows = v->arr("components");
+        if (rows->type != JTYPE_ARR) return;
+
+        m->components.clear_fast();
+        m->select_options.clear_fast();
+
+        for (unsigned int r = 0; r < rows->count; r++)
+        {
+            const jval* row = rows->at(r);
+
+            // A row is a container and nothing else. Anything that is not
+            // one is skipped rather than guessed at: discord keeps adding
+            // kinds, and a component this client does not know how to work
+            // is better absent than drawn as something it is not.
+            if (row->i32("type", 0) != COMP_ROW) continue;
+
+            const jval* kids = row->arr("components");
+            for (unsigned int i = 0; i < kids->count; i++)
+            {
+                const jval* k = kids->at(i);
+                int type = k->i32("type", 0);
+                if (type != COMP_BUTTON && type != COMP_SELECT) continue;
+
+                dcomponent c;
+                ccfset(&c, 0, sizeof(c));
+                c.type = type;
+                c.row = (int)r;
+                c.disabled = k->boolean("disabled", false);
+
+                copy_field(c.label, sizeof(c.label), k, "label");
+                copy_field(c.custom_id, sizeof(c.custom_id), k, "custom_id");
+                read_component_emoji(&c, k);
+
+                if (type == COMP_BUTTON)
+                {
+                    c.style = k->i32("style", BTN_SECONDARY);
+                    copy_field(c.url, sizeof(c.url), k, "url");
+                }
+                else
+                {
+                    copy_field(c.placeholder, sizeof(c.placeholder), k, "placeholder");
+                    c.min_values = k->i32("min_values", 1);
+                    c.max_values = k->i32("max_values", 1);
+
+                    c.first_option = (int)m->select_options.count;
+
+                    const jval* opts = k->arr("options");
+                    for (unsigned int o = 0; o < opts->count; o++)
+                    {
+                        const jval* ov = opts->at(o);
+
+                        dselect_option so;
+                        ccfset(&so, 0, sizeof(so));
+                        copy_field(so.label, sizeof(so.label), ov, "label");
+                        copy_field(so.value, sizeof(so.value), ov, "value");
+                        copy_field(so.description, sizeof(so.description), ov, "description");
+
+                        const jval* e = ov->obj("emoji");
+                        if (e->type == JTYPE_OBJ)
+                        {
+                            so.emoji_id = e->sf("id");
+                            copy_field(so.emoji_name, sizeof(so.emoji_name), e, "name");
+                        }
+
+                        m->select_options.push(so);
+                    }
+
+                    c.option_count = (int)m->select_options.count - c.first_option;
+                }
+
+                m->components.push(c);
+            }
+        }
+    }
+}
+
 dmessage* store::upsert_message(const jval* v)
 {
     if (!v || v->type != JTYPE_OBJ) return 0;
@@ -973,6 +1085,8 @@ dmessage* store::upsert_message(const jval* v)
         fresh.attachments = ulist<dattachment>();
         fresh.embeds = ulist<dembed>();
         fresh.reactions = ulist<dreaction>();
+        fresh.components = ulist<dcomponent>();
+        fresh.select_options = ulist<dselect_option>();
 
         // Keep the list ordered by id so rendering is a straight walk.
         unsigned int pos = ch->messages.count;
@@ -1003,6 +1117,25 @@ dmessage* store::upsert_message(const jval* v)
     parse_reactions(v, msg);
 
     if (id > ch->last_message_id) ch->last_message_id = id;
+        // The buttons and menus, and who to talk to about them.
+    read_components(msg, v);
+    if (v->has("application_id")) msg->application_id = v->sf("application_id");
+
+    // A message that merely carries components has no application_id: discord
+    // puts that field on interaction responses and on webhook messages, not on
+    // an ordinary post from a bot. The interaction has to be addressed
+    // somewhere all the same, and for a bot the application and the user are
+    // the same id - which is what the official client ends up sending.
+    //
+    // Without this the request was dropped before it was built, by the guard
+    // in use_component, and a pressed button did nothing at all: no packet, no
+    // error, no line in the log.
+    if (!msg->application_id)
+    {
+        duser* who = store::find_user(msg->author_id);
+        if (who && who->bot) msg->application_id = msg->author_id;
+    }
+
     if (ch->is_dm()) touch_dm_order();
 
     return msg;
@@ -1082,7 +1215,8 @@ void store::apply_presence(const jval* p)
 // relationships
 // ---------------------------------------------------------------------------
 
-void store::set_relationship(snowflake user_id, int type, const char* nickname)
+void store::set_relationship(snowflake user_id, int type, const char* nickname,
+                             const char* since)
 {
     for (unsigned int i = 0; i < g_relationships.count; i++)
     {
@@ -1090,6 +1224,14 @@ void store::set_relationship(snowflake user_id, int type, const char* nickname)
         {
             g_relationships[i].type = type;
             if (nickname) g_relationships[i].nickname = intern(nickname);
+
+            // The snapshot is restored before the gateway says anything, so
+            // by the time READY arrives the entry already exists and this is
+            // the path it takes. Filling the date only when the entry is
+            // created meant it was only ever filled on a first sign-in with
+            // no snapshot - which is to say, almost never.
+            if (since && since[0]) g_relationships[i].since = intern(since);
+
             bump_revision();
             return;
         }
@@ -1100,8 +1242,17 @@ void store::set_relationship(snowflake user_id, int type, const char* nickname)
     r.user_id = user_id;
     r.type = type;
     r.nickname = nickname ? intern(nickname) : 0;
+    r.since = (since && since[0]) ? intern(since) : 0;
     g_relationships.push(r);
     bump_revision();
+}
+
+const char* store::relationship_since(snowflake user_id)
+{
+    for (unsigned int i = 0; i < g_relationships.count; i++)
+        if (g_relationships[i].user_id == user_id) return g_relationships[i].since;
+
+    return 0;
 }
 
 void store::remove_relationship(snowflake user_id)

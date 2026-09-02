@@ -584,6 +584,177 @@ namespace
         char captcha_rqtoken[256];
     };
 
+    struct job_after
+    {
+        snowflake channel;
+        snowflake after;
+        snowflake until;
+    };
+
+    // ---- what has been asked about a boundary -----------------------------
+
+    struct gap_note
+    {
+        snowflake channel;
+        snowflake after;
+        int state;
+    };
+
+    const int MAX_GAP_NOTES = 256;
+
+    gap_note g_gap_notes[MAX_GAP_NOTES];
+    int g_gap_note_count = 0;
+    volatile long g_gap_checks = 0;
+    CRITICAL_SECTION g_gap_lock;
+    bool g_gap_ready = false;
+
+    void gap_lock_ready()
+    {
+        if (g_gap_ready) return;
+
+        InitializeCriticalSection(&g_gap_lock);
+        g_gap_ready = true;
+    }
+
+    gap_note* gap_find(snowflake channel, snowflake after)
+    {
+        for (int i = 0; i < g_gap_note_count; i++)
+            if (g_gap_notes[i].channel == channel && g_gap_notes[i].after == after)
+                return &g_gap_notes[i];
+
+        return 0;
+    }
+
+    void gap_set(snowflake channel, snowflake after, int state)
+    {
+        gap_note* n = gap_find(channel, after);
+
+        if (!n)
+        {
+            if (g_gap_note_count >= MAX_GAP_NOTES) g_gap_note_count = 0;
+            n = &g_gap_notes[g_gap_note_count++];
+            n->channel = channel;
+            n->after = after;
+        }
+
+        n->state = state;
+    }
+
+    void job_check_gap(void* user)
+    {
+        job_after* j = (job_after*)user;
+
+        char path[256];
+        cnprint(path, sizeof(path), "/channels/%llu/messages?limit=1&after=%llu",
+                j->channel, j->after);
+
+        http_response res;
+        res.init();
+
+        int verdict = api::GAP_UNKNOWN;
+
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
+            {
+                if (doc.root->count == 0)
+                {
+                    // Nothing at all after it. Whatever we hold on the far
+                    // side was deleted since, and there is no hole to fill.
+                    verdict = api::GAP_NONE;
+                }
+                else
+                {
+                    snowflake next = doc.root->at(0)->sf("id");
+
+                    // The very next message is the one already held: they are
+                    // neighbours and this boundary is settled for good.
+                    verdict = (next >= j->until) ? api::GAP_NONE : api::GAP_REAL;
+                }
+            }
+
+            doc.free_doc();
+        }
+
+        if (verdict == api::GAP_NONE)
+            archive::note_range(j->channel, j->after, j->until);
+
+        EnterCriticalSection(&g_gap_lock);
+        gap_set(j->channel, j->after, verdict);
+        LeaveCriticalSection(&g_gap_lock);
+
+        InterlockedDecrement(&g_gap_checks);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_fetch_after(void* user)
+    {
+        job_after* j = (job_after*)user;
+
+        char path[256];
+        cnprint(path, sizeof(path), "/channels/%llu/messages?limit=50&after=%llu",
+                j->channel, j->after);
+
+        http_response res;
+        res.init();
+
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
+            {
+                snowflake oldest = 0, newest = 0;
+
+                {
+                    store::guard g;
+                    for (unsigned int i = 0; i < doc.root->count; i++)
+                    {
+                        dmessage* m = store::upsert_message(doc.root->at(i));
+                        if (!m) continue;
+                        if (!oldest || m->id < oldest) oldest = m->id;
+                        if (m->id > newest) newest = m->id;
+                    }
+                    store::bump_revision();
+                }
+
+                for (unsigned int i = 0; i < doc.root->count; i++)
+                    archive::put_json(doc.root->at(i));
+
+                // The run has to include the message it started from, or the
+                // stretch it closes is still recorded as two separate ones and
+                // the hole is drawn again over nothing.
+                snowflake from = j->after;
+                snowflake to = newest;
+
+                // Fewer than a page means there was nothing else after the
+                // starting point, so the far side of the hole is reached too -
+                // even when it produced no messages of its own, which is what
+                // a hole over a quiet week looks like.
+                if (doc.root->count < 50 && j->until > to) to = j->until;
+
+                if (to > from) archive::note_range(j->channel, from, to);
+                else if (j->until > from) archive::note_range(j->channel, from, j->until);
+            }
+            doc.free_doc();
+        }
+        else record_api_error(tr("Не удалось загрузить историю"), &res);
+
+        {
+            store::guard g;
+            dchannel* ch = store::find_channel(j->channel);
+            if (ch) ch->history_loading = false;
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
     void job_fetch_messages(void* user)
     {
         job_ids* j = (job_ids*)user;
@@ -597,12 +768,21 @@ namespace
         http_response res;
         res.init();
 
+        // Cleared whatever happens below. It used to be cleared on the two
+        // paths somebody thought of - a good answer and a failed request - and
+        // a two hundred with a body that would not parse as an array left it
+        // set for good. After that the channel refused to load anything ever
+        // again, silently, because every later call returns at the guard that
+        // reads this flag.
+        bool answered = false;
+
         if (api::call("GET", path, 0, &res) && res.ok())
         {
             jdoc doc;
             doc.init();
             if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
             {
+                answered = true;
                 snowflake oldest = 0, newest = 0;
 
                 {
@@ -645,6 +825,17 @@ namespace
             {
                 ch->history_loading = false;
                 ch->history_failed = true;
+            }
+        }
+
+        if (!answered)
+        {
+            store::guard g;
+            dchannel* ch = store::find_channel(j->a);
+            if (ch && ch->history_loading)
+            {
+                ch->history_loading = false;
+                log_line("history: канал %llu - ответ не разобрался, снимаю замок", j->a);
             }
         }
 
@@ -1216,6 +1407,197 @@ namespace
     // CAPTCHA - which is what it does to a client that joins a server it has
     // never seen the preview of. The lookup is not decoration; it is the half
     // of the exchange that makes the join credible.
+    // ---- invites that arrive in messages ---------------------------------
+
+    ulist<api::invite_card> g_cards;
+
+    struct job_card
+    {
+        char code[16];
+        snowflake message_id;
+        snowflake channel_id;
+        snowflake location_guild;
+        int channel_type;
+    };
+
+    api::invite_card* find_card(const char* code)
+    {
+        for (unsigned int i = 0; i < g_cards.count; i++)
+            if (ccscmp(g_cards[i].code, code) == 0) return &g_cards[i];
+        return 0;
+    }
+
+    void read_card(api::invite_card* card, const jval* root)
+    {
+        const jval* g = root->obj("guild");
+        card->guild_id = g->sf("id");
+
+        const char* name = g->str("name", 0);
+        if (name) ccstrncpy(card->guild_name, name, sizeof(card->guild_name) - 1);
+
+        const char* icon = g->str("icon", 0);
+        if (icon) ccstrncpy(card->guild_icon, icon, sizeof(card->guild_icon) - 1);
+
+        const jval* c = root->obj("channel");
+        card->channel_id = c->sf("id");
+        card->channel_type = c->i32("type", 0);
+
+        const char* cname = c->str("name", 0);
+        if (cname) ccstrncpy(card->channel_name, cname, sizeof(card->channel_name) - 1);
+
+        card->inviter_id = root->obj("inviter")->sf("id");
+        card->size_online = root->i32("approximate_presence_count", 0);
+        card->size_total = root->i32("approximate_member_count", 0);
+    }
+
+    void job_resolve_invite(void* user)
+    {
+        job_card* j = (job_card*)user;
+
+        // The chain discord expects around a panel: the invite being seen,
+        // then what the server said about it. Sent even when the code is
+        // dead - a link that has expired is an ordinary thing to come across,
+        // and a client that only ever reports the good ones is stranger than
+        // one that reports both.
+        science::invite_opened_in_message(j->code, j->message_id);
+
+        char path[192];
+        cnprint(path, sizeof(path),
+                "/invites/%s?with_counts=true&with_expiration=true", j->code);
+
+        http_response res;
+        res.init();
+
+        bool ok = api::call("GET", path, 0, &res) && res.ok();
+
+        api::invite_card card;
+        ccfset(&card, 0, sizeof(card));
+        ccstrncpy(card.code, j->code, sizeof(card.code) - 1);
+        card.done = true;
+        card.ok = ok;
+
+        science::invite_result found;
+        ccfset(&found, 0, sizeof(found));
+        found.code = j->code;
+        found.input_value = j->code;
+        found.status_code = res.status;
+        found.resolved = ok;
+
+        if (ok)
+        {
+            jdoc doc;
+            doc.init();
+
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                read_card(&card, doc.root);
+
+                found.guild_id = card.guild_id;
+                found.channel_id = card.channel_id;
+                found.inviter_id = card.inviter_id;
+                found.channel_type = card.channel_type;
+                found.size_total = card.size_total;
+                found.size_online = card.size_online;
+
+                store::guard g;
+                found.user_is_member = store::find_guild(card.guild_id) != 0;
+                card.already_member = found.user_is_member;
+            }
+
+            doc.free_doc();
+        }
+
+        science::invite_resolved(&found);
+
+        EnterCriticalSection(&g_err_lock);
+        api::invite_card* slot = find_card(j->code);
+        if (slot) *slot = card;
+        else      g_cards.push(card);
+        LeaveCriticalSection(&g_err_lock);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    // The header the official client puts on a join pressed from a panel. It
+    // names the message the panel is on, which is what tells discord this was
+    // a link somebody was shown rather than one they typed.
+    void embed_context(char* out, int cap, const job_card* j)
+    {
+        char instance[64];
+        cnprint(instance, sizeof(instance), "%llu:%s", j->message_id, j->code);
+
+        if (j->location_guild)
+            cnprint(out, cap,
+                    "{\"location\":\"Invite Button Embed\",\"location_guild_id\":\"%llu\","
+                    "\"location_channel_id\":\"%llu\",\"location_channel_type\":%d,"
+                    "\"location_message_id\":\"%llu\",\"invite_instance_id\":\"%s\"}",
+                    j->location_guild, j->channel_id, j->channel_type,
+                    j->message_id, instance);
+        else
+            cnprint(out, cap,
+                    "{\"location\":\"Invite Button Embed\",\"location_guild_id\":null,"
+                    "\"location_channel_id\":\"%llu\",\"location_channel_type\":%d,"
+                    "\"location_message_id\":\"%llu\",\"invite_instance_id\":\"%s\"}",
+                    j->channel_id, j->channel_type, j->message_id, instance);
+    }
+
+    void job_join_from_message(void* user)
+    {
+        job_card* j = (job_card*)user;
+
+        char instance[64];
+        cnprint(instance, sizeof(instance), "%llu:%s", j->message_id, j->code);
+
+        char context[512];
+        embed_context(context, sizeof(context), j);
+
+        jwriter body;
+        body.init();
+        body.begin_obj();
+        body.kv_str("session_id", gateway::session_id());
+        body.kv_str("invite_instance_id", instance);
+        body.end_obj();
+
+        char path[192];
+        cnprint(path, sizeof(path), "/invites/%s", j->code);
+
+        http_response res;
+        res.init();
+
+        if (api::call("POST", path, body.buf.c_str(), &res, context) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                const jval* guild = doc.root->obj("guild");
+
+                InterlockedExchange64((volatile long long*)&g_joined_guild,
+                                      (long long)guild->sf("id"));
+
+                char msg[192];
+                cnprint(msg, sizeof(msg), tr("Вы присоединились: %s"),
+                        guild->str("name", tr("сервер")));
+                api::set_last_error(msg);
+            }
+            doc.free_doc();
+
+            EnterCriticalSection(&g_err_lock);
+            api::invite_card* slot = find_card(j->code);
+            if (slot) slot->already_member = true;
+            LeaveCriticalSection(&g_err_lock);
+        }
+        else
+        {
+            record_api_error(tr("Не удалось зайти по приглашению"), &res);
+        }
+
+        res.free_response();
+        body.free_writer();
+        memfree(j);
+    }
+
     void job_join_guild(void* user)
     {
         job_name* j = (job_name*)user;
@@ -1683,6 +2065,25 @@ namespace
 
         res.free_response();
         InterlockedExchange(&g_bans_busy, 0);
+        memfree(j);
+    }
+
+    void job_kick(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/guilds/%llu/members/%llu", j->a, j->b);
+
+        http_response res;
+        res.init();
+
+        // GUILD_MEMBER_REMOVE comes back on the gateway, so the member list
+        // is left to that rather than edited here.
+        if (!api::call("DELETE", path, 0, &res) || !res.ok())
+            record_api_error(tr("Не удалось выгнать"), &res);
+
+        res.free_response();
         memfree(j);
     }
 
@@ -2882,6 +3283,93 @@ namespace
         memfree(j);
     }
 
+    struct interact_args
+    {
+        snowflake guild_id;
+        snowflake channel_id;
+        snowflake message_id;
+        snowflake application_id;
+
+        int component_type;
+        char custom_id[128];
+
+        char values[8][100];
+        int value_count;
+    };
+
+    // Pressing a button or choosing from a menu.
+    //
+    // Not a message and not a reaction: it is an interaction, which discord
+    // routes to the application that put the component there. The answer is
+    // empty - what happens next arrives over the gateway as the bot editing
+    // its message or sending another, which is why nothing is written here.
+    //
+    // The session id is part of it. Discord uses it to decide which of the
+    // account's open clients gets shown an ephemeral reply, and an
+    // interaction without one is answered but never seen.
+    void job_interact(void* user)
+    {
+        interact_args* j = (interact_args*)user;
+
+        unsigned long long nonce = 0;
+        crypto::random_bytes(&nonce, sizeof(nonce));
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        // 3 is "somebody used a component". 2 would be a slash command.
+        w.kv_i64("type", 3);
+        w.kv_snowflake("nonce", nonce >> 4);
+
+        // Absent in a direct message rather than zero: discord reads a guild
+        // id that is not a guild as a request about somewhere else.
+        if (j->guild_id) w.kv_snowflake("guild_id", j->guild_id);
+
+        w.kv_snowflake("channel_id", j->channel_id);
+        w.kv_i64("message_flags", 0);
+        w.kv_snowflake("message_id", j->message_id);
+        w.kv_snowflake("application_id", j->application_id);
+        w.kv_str("session_id", gateway::session_id());
+
+        w.key("data");
+        w.begin_obj();
+        w.kv_i64("component_type", j->component_type);
+        w.kv_str("custom_id", j->custom_id);
+
+        if (j->component_type == COMP_SELECT)
+        {
+            w.kv_i64("type", COMP_SELECT);
+
+            w.key("values");
+            w.begin_arr();
+            for (int i = 0; i < j->value_count; i++) w.val_str(j->values[i]);
+            w.end_arr();
+        }
+
+        w.end_obj();
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        bool ok = api::call("POST", "/interactions", w.buf.c_str(), &res) && res.ok();
+
+        // Logged either way. This request was written from the protocol
+        // rather than from a capture of the real client, so the first thing
+        // worth knowing about a button that does nothing is what discord said
+        // about it.
+        log_line("interaction: %s %s -> %d %.200s",
+                 j->component_type == COMP_SELECT ? "меню" : "кнопка",
+                 j->custom_id, res.status, res.body.size ? res.text() : "");
+
+        if (!ok) record_api_error(tr("Кнопка не сработала"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
     void job_delete_message(void* user)
     {
         job_ids* j = (job_ids*)user;
@@ -3534,6 +4022,98 @@ void api::edit_message(snowflake channel_id, snowflake message_id, const char* c
     jobs::post(job_edit_message, j);
 }
 
+void api::use_component(snowflake guild_id, snowflake channel_id, snowflake message_id,
+                        snowflake application_id, int component_type,
+                        const char* custom_id, const char* const* values, int value_count)
+{
+    if (!channel_id || !message_id || !application_id || !custom_id) return;
+
+    interact_args* j = (interact_args*)memalloc(sizeof(interact_args));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->guild_id = guild_id;
+    j->channel_id = channel_id;
+    j->message_id = message_id;
+    j->application_id = application_id;
+    j->component_type = component_type;
+    ccstrncpy(j->custom_id, custom_id, sizeof(j->custom_id) - 1);
+
+    for (int i = 0; i < value_count && j->value_count < 8; i++)
+    {
+        if (!values[i]) continue;
+        ccstrncpy(j->values[j->value_count], values[i], 99);
+        j->value_count++;
+    }
+
+    jobs::post(job_interact, j);
+}
+
+int api::gap_status(snowflake channel_id, snowflake after_id)
+{
+    gap_lock_ready();
+
+    EnterCriticalSection(&g_gap_lock);
+    gap_note* n = gap_find(channel_id, after_id);
+    int state = n ? n->state : (int)GAP_UNKNOWN;
+    LeaveCriticalSection(&g_gap_lock);
+
+    return state;
+}
+
+void api::check_gap(snowflake channel_id, snowflake after_id, snowflake until_id)
+{
+    if (!channel_id || !after_id || !until_id || offline::active()) return;
+
+    gap_lock_ready();
+
+    // A few at a time. These are cheap, but a channel scrolled quickly can put
+    // a dozen boundaries on screen at once and they are not urgent.
+    if (g_gap_checks >= 3) return;
+
+    EnterCriticalSection(&g_gap_lock);
+
+    gap_note* n = gap_find(channel_id, after_id);
+    bool go = !n || n->state == GAP_UNKNOWN;
+
+    if (go) gap_set(channel_id, after_id, GAP_CHECKING);
+
+    LeaveCriticalSection(&g_gap_lock);
+
+    if (!go) return;
+
+    job_after* j = (job_after*)memalloc(sizeof(job_after));
+    if (!j) return;
+
+    j->channel = channel_id;
+    j->after = after_id;
+    j->until = until_id;
+
+    InterlockedIncrement(&g_gap_checks);
+    jobs::post(job_check_gap, j);
+}
+
+void api::fetch_messages_after(snowflake channel_id, snowflake after_id, snowflake until_id)
+{
+    if (!channel_id || !after_id || offline::active()) return;
+
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(channel_id);
+        if (!ch || ch->history_loading) return;
+        ch->history_loading = true;
+    }
+
+    job_after* j = (job_after*)memalloc(sizeof(job_after));
+    if (!j) return;
+
+    j->channel = channel_id;
+    j->after = after_id;
+    j->until = until_id;
+
+    jobs::post(job_fetch_after, j);
+}
+
 void api::delete_message(snowflake channel_id, snowflake message_id)
 {
     job_ids* j = make_ids(channel_id, message_id);
@@ -3591,6 +4171,70 @@ void api::block_user(snowflake user_id)
 {
     job_ids* j = make_ids(user_id, 0);
     if (j) jobs::post(job_block_user, j);
+}
+
+namespace
+{
+    job_card* make_card_job(const char* code, snowflake message_id, snowflake channel_id,
+                            int channel_type, snowflake location_guild)
+    {
+        if (!code || !code[0]) return 0;
+
+        job_card* j = (job_card*)memalloc(sizeof(job_card));
+        if (!j) return 0;
+
+        ccfset(j, 0, sizeof(*j));
+        ccstrncpy(j->code, code, sizeof(j->code) - 1);
+        j->message_id = message_id;
+        j->channel_id = channel_id;
+        j->channel_type = channel_type;
+        j->location_guild = location_guild;
+        return j;
+    }
+}
+
+void api::resolve_invite(const char* code, snowflake message_id,
+                         snowflake channel_id, int channel_type, snowflake location_guild)
+{
+    if (!code || !code[0]) return;
+
+    // Once per code. The panel asks on every frame it is drawn, and a request
+    // per frame is how a chat full of links becomes a rate limit.
+    EnterCriticalSection(&g_err_lock);
+    bool known = find_card(code) != 0;
+    if (!known)
+    {
+        api::invite_card pending;
+        ccfset(&pending, 0, sizeof(pending));
+        ccstrncpy(pending.code, code, sizeof(pending.code) - 1);
+        g_cards.push(pending);
+    }
+    LeaveCriticalSection(&g_err_lock);
+
+    if (known) return;
+
+    job_card* j = make_card_job(code, message_id, channel_id, channel_type, location_guild);
+    if (j) jobs::post(job_resolve_invite, j);
+}
+
+bool api::invite_card_of(const char* code, invite_card* out)
+{
+    if (!code || !out) return false;
+
+    EnterCriticalSection(&g_err_lock);
+    api::invite_card* slot = find_card(code);
+    if (slot) *out = *slot;
+    LeaveCriticalSection(&g_err_lock);
+
+    return slot != 0;
+}
+
+void api::join_invite_from_message(const char* code, snowflake message_id,
+                                   snowflake channel_id, int channel_type,
+                                   snowflake location_guild)
+{
+    job_card* j = make_card_job(code, message_id, channel_id, channel_type, location_guild);
+    if (j) jobs::post(job_join_from_message, j);
 }
 
 void api::join_guild_by_invite(const char* invite_code)
@@ -3684,6 +4328,12 @@ void api::clear_ownership_state()
 {
     g_ownership_code_at = 0;
     InterlockedExchange(&g_ownership_code_sent, 0);
+}
+
+void api::kick_member(snowflake guild_id, snowflake user_id)
+{
+    job_ids* j = make_ids(guild_id, user_id);
+    if (j) jobs::post(job_kick, j);
 }
 
 void api::unban(snowflake guild_id, snowflake user_id)

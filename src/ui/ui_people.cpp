@@ -1181,6 +1181,69 @@ void ui_view_profile_popup()
         ImGui::PopTextWrapPos();
     }
 
+    // ---- the three dates -------------------------------------------------
+    //
+    // When the account was made is in the id itself and needs nobody's
+    // permission. When they joined this server comes off the member object the
+    // gateway already sends for the member list - the profile endpoint knows
+    // nothing about it, because it answers about a person rather than about a
+    // membership. When the friendship started is on the relationship, which
+    // discord sends at sign-in and its own client never displays.
+    {
+        char line[96];
+        bool any = false;
+
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, 4));
+
+        char made[48];
+        format_epoch_ms(snowflake_time_ms(u->id), made, sizeof(made));
+
+        if (made[0])
+        {
+            cnprint(line, sizeof(line), tr("Аккаунт создан: %s"), made);
+            ui_text_muted(line);
+            any = true;
+        }
+
+        // The server the profile was opened from, when it was opened from one.
+        dguild* g = store::find_guild(g_ui.active_guild);
+        if (g)
+        {
+            dmember* mem = store::find_member(g, u->id);
+
+            if (mem && mem->joined_at)
+            {
+                char joined[48];
+                format_timestamp(mem->joined_at, joined, sizeof(joined));
+
+                if (joined[0])
+                {
+                    cnprint(line, sizeof(line), tr("На сервере с: %s"), joined);
+                    ui_text_muted(line);
+                    any = true;
+                }
+            }
+        }
+
+        const char* friends_since = store::relationship_since(u->id);
+        if (friends_since)
+        {
+            char since[48];
+            format_timestamp(friends_since, since, sizeof(since));
+
+            if (since[0])
+            {
+                cnprint(line, sizeof(line), tr("В друзьях с: %s"), since);
+                ui_text_muted(line);
+                any = true;
+            }
+        }
+
+        if (!any) ui_text_muted(tr("Дат нет"));
+    }
+
     ImGui::Dummy(ImVec2(0, 12));
 
     int rel = store::relationship_type(u->id);

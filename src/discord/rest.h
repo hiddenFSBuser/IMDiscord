@@ -61,6 +61,34 @@ namespace api
 
     // ---- async ----
     void fetch_messages(snowflake channel_id, snowflake before_id);
+
+    // The other direction: everything newer than this id, oldest first. Used
+    // to close a hole - the stretch between what was saved on an earlier visit
+    // and what was fetched on this one, which nothing else ever asks for.
+    // ---- is anything actually missing here? ------------------------------
+    //
+    // Between two messages the client holds, either the archive already knows
+    // the stretch arrived in one piece, or nobody knows. Guessing from how
+    // much time passed marks a quiet night as a hole and a busy minute as
+    // continuous, so instead discord is asked what follows: one message, one
+    // small request, once ever. The answer goes into the archive's ranges when
+    // it is "nothing", so the question is never repeated.
+    enum gap_state
+    {
+        GAP_UNKNOWN = 0,   // nobody has looked
+        GAP_CHECKING,      // asked, waiting
+        GAP_NONE,          // discord says these two are neighbours
+        GAP_REAL,          // something is in between
+    };
+
+    int gap_status(snowflake channel_id, snowflake after_id);
+    void check_gap(snowflake channel_id, snowflake after_id, snowflake until_id);
+
+    // until_id is the message on the far side of the hole, or zero when
+    // there is none. Reaching it - or running out before it - is what proves
+    // the stretch is whole, and that gets written down so the hole is not
+    // offered again.
+    void fetch_messages_after(snowflake channel_id, snowflake after_id, snowflake until_id);
     void send_message(snowflake channel_id, const char* content, snowflake reply_to);
     // Takes ownership of every file buffer in the list, and of the list storage.
     void send_message_with_files(snowflake channel_id, const char* content, ulist<upload_file>* files);
@@ -96,6 +124,12 @@ namespace api
     // Rewrites one of our own. Discord takes only the text; an empty one is
     // refused rather than treated as a delete.
     void edit_message(snowflake channel_id, snowflake message_id, const char* content);
+    // Presses a button or answers a menu that a bot put under a message. The
+    // values are the chosen options and are ignored for a button.
+    void use_component(snowflake guild_id, snowflake channel_id, snowflake message_id,
+                       snowflake application_id, int component_type,
+                       const char* custom_id, const char* const* values, int value_count);
+
     void delete_message(snowflake channel_id, snowflake message_id);
     // Rings the other side of a direct-message call. Joining the voice channel
     // alone connects us but never makes their client notify them.
@@ -124,6 +158,52 @@ namespace api
     // Declines an incoming request, cancels an outgoing one, or removes a friend.
     void remove_relationship(snowflake user_id);
     void block_user(snowflake user_id);
+    // ---- an invite sitting in a message ----------------------------------
+    //
+    // Discord draws those as a panel with the server on it rather than as a
+    // link, and asks the server about the code to fill it in. Resolved once
+    // per code and kept, because the same link posted in five places is one
+    // server and one request.
+
+    struct invite_card
+    {
+        char code[16];
+
+        snowflake guild_id;
+        char guild_name[104];
+        char guild_icon[64];
+
+        snowflake channel_id;
+        char channel_name[104];
+        int channel_type;
+
+        snowflake inviter_id;
+        int size_online;
+        int size_total;
+
+        // The request has come back, and what it said. An invite that has
+        // expired resolves to nothing and the panel says so rather than
+        // sitting empty for ever.
+        bool done;
+        bool ok;
+        bool already_member;
+    };
+
+    // Asks about a code once. Where it is - the message and its channel - is
+    // for the analytics that goes with it, which discord expects to name the
+    // panel rather than just the invite.
+    void resolve_invite(const char* code, snowflake message_id,
+                        snowflake channel_id, int channel_type, snowflake location_guild);
+
+    // What is known about a code, or false if nothing has been asked yet.
+    bool invite_card_of(const char* code, invite_card* out);
+
+    // Joining from the panel, which is a different request from joining a
+    // pasted link: it names the message the panel is on.
+    void join_invite_from_message(const char* code, snowflake message_id,
+                                  snowflake channel_id, int channel_type,
+                                  snowflake location_guild);
+
     void join_guild_by_invite(const char* invite_code);
     void leave_guild(snowflake guild_id);
     // Owner only, and gone for good: discord keeps no copy to restore from.
@@ -223,6 +303,9 @@ namespace api
     bool bans_loading();
     bool bans_forbidden();
 
+    // Out of the server, but able to come back with a fresh invite. The
+    // difference from a ban, and the reason both exist.
+    void kick_member(snowflake guild_id, snowflake user_id);
     void unban(snowflake guild_id, snowflake user_id);
 
     // ---- handing the server over ------------------------------------------

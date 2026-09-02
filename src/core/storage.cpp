@@ -332,6 +332,11 @@ void storage::accounts_load()
                     entry.proxy.port = (unsigned short)px->i32("port", 0);
                     ccstrncpy(entry.proxy.user, px->str("user", ""), sizeof(entry.proxy.user) - 1);
                     ccstrncpy(entry.proxy.pass, px->str("pass", ""), sizeof(entry.proxy.pass) - 1);
+
+                    // Absent in files written before media routing was a
+                    // choice, and VOICE_AUTO is the right thing to assume for
+                    // them: it is what they were effectively doing.
+                    entry.proxy.voice = px->i32("voice", VOICE_AUTO);
                 }
 
                 g_accounts.push(entry);
@@ -348,6 +353,7 @@ void storage::accounts_load()
                 g_default_proxy.port = (unsigned short)dpx->i32("port", 0);
                 ccstrncpy(g_default_proxy.user, dpx->str("user", ""), sizeof(g_default_proxy.user) - 1);
                 ccstrncpy(g_default_proxy.pass, dpx->str("pass", ""), sizeof(g_default_proxy.pass) - 1);
+                g_default_proxy.voice = dpx->i32("voice", VOICE_AUTO);
             }
         }
         doc.free_doc();
@@ -393,6 +399,7 @@ void storage::accounts_save()
         w.kv_i64("port", g_default_proxy.port);
         w.kv_str("user", g_default_proxy.user);
         w.kv_str("pass", g_default_proxy.pass);
+        w.kv_i64("voice", g_default_proxy.voice);
         w.end_obj();
     }
     w.key("accounts");
@@ -418,6 +425,7 @@ void storage::accounts_save()
             w.kv_i64("port", g_accounts[i].proxy.port);
             w.kv_str("user", g_accounts[i].proxy.user);
             w.kv_str("pass", g_accounts[i].proxy.pass);
+            w.kv_i64("voice", g_accounts[i].proxy.voice);
             w.end_obj();
         }
 
@@ -514,6 +522,39 @@ void storage::account_set_group(int index, const char* group)
                          sizeof(g_accounts[index].group) - 1);
 
     accounts_save();
+}
+
+void storage::account_move(int from, int to)
+{
+    storage::accounts_load();
+
+    int n = (int)g_accounts.count;
+    if (from < 0 || from >= n || to < 0 || to >= n || from == to) return;
+
+    saved_account moved = g_accounts[(unsigned int)from];
+
+    // Shifted one at a time rather than erase-then-insert: the list has no
+    // insert, and a copy of twenty structs is not worth borrowing one for.
+    if (from < to)
+        for (int i = from; i < to; i++) g_accounts[(unsigned int)i] = g_accounts[(unsigned int)(i + 1)];
+    else
+        for (int i = from; i > to; i--) g_accounts[(unsigned int)i] = g_accounts[(unsigned int)(i - 1)];
+
+    g_accounts[(unsigned int)to] = moved;
+
+    // The active index points at a position, and the positions have just
+    // changed underneath it. Without this, reordering the list silently marks
+    // a different account as the one signed in.
+    int a = g_active_account;
+    if (a >= 0)
+    {
+        if (a == from) a = to;
+        else if (from < to && a > from && a <= to) a--;
+        else if (from > to && a >= to && a < from) a++;
+        g_active_account = a;
+    }
+
+    storage::accounts_save();
 }
 
 int storage::account_groups(char out[][32], int cap)

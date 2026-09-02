@@ -1614,6 +1614,10 @@ namespace
         }
     }
 
+    // Defined below, next to the teardown it belongs to: this thread cannot
+    // stop itself, so it asks another one to.
+    void stop_later(bool notify);
+
     DWORD WINAPI ws_thread(LPVOID)
     {
         CoInitializeEx(0, COINIT_MULTITHREADED);
@@ -1682,6 +1686,27 @@ namespace
 
         msg.free_buffer();
         log_line("watch: websocket loop ended (close %u)", g_ws.close_status);
+
+        // The socket died while we still thought we were watching.
+        //
+        // This is what happens when the person streaming restarts their
+        // client: discord keeps their stream alive for half a minute, so no
+        // STREAM_DELETE arrives, and only the connection to the old stream
+        // server goes. Nothing here noticed - the flag stayed up, the badge
+        // stayed lit, and discord went on counting us as a viewer of a stream
+        // we were no longer receiving. The next press was then read as "stop
+        // watching", and the one after it asked to watch something discord
+        // thought we were already watching.
+        //
+        // Ended properly instead, and discord told about it, so the next press
+        // is a fresh subscription. On a thread of its own because stopping
+        // waits for this one.
+        if (g_running)
+        {
+            log_line("watch: связь с трансляцией оборвалась - прекращаю смотреть");
+            stop_later(true);
+        }
+
         CoUninitialize();
         return 0;
     }

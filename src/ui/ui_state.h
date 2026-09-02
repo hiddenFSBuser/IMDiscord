@@ -159,6 +159,7 @@ struct ui_state
     char proxy_pass[64];
     char proxy_paste[256];
     int proxy_kind;
+    int proxy_voice;
     bool proxy_own;          // this account wants its own instead of the default
 
     // Held between opening the add-account box and the account existing.

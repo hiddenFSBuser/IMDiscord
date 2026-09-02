@@ -60,6 +60,10 @@ namespace storage
     // Puts an account in a group, or takes it out of one with an empty name.
     void account_set_group(int index, const char* group);
 
+    // Moves an account to another place in the list. The one signed in keeps
+    // its mark: the index that points at it moves with it.
+    void account_move(int from, int to);
+
     // The groups that exist, which is to say the ones somebody is in. Sorted
     // the way the accounts are, so the buttons do not move about.
     int account_groups(char out[][32], int cap);

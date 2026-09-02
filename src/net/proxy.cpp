@@ -646,6 +646,12 @@ bool proxy::dial_through(const proxy_config* cfg, const char* host, unsigned sho
 const char* proxy::voice_blocked_reason(const proxy_config* cfg)
 {
     if (!cfg || !cfg->in_use()) return 0;
+
+    // A proxy that cannot carry udp only blocks a call when it was told to.
+    // Otherwise the media goes out directly, which is what every browser
+    // based client does and the reason calls work there at all.
+    if (cfg->voice_may_go_direct()) return 0;
+
     if (cfg->kind == PROXY_HTTPS) return "HTTPS-прокси не пропускает UDP, звонки недоступны";
     if (cfg->kind == PROXY_SOCKS4) return "SOCKS4 не умеет UDP, звонки недоступны";
     return 0;
@@ -655,22 +661,25 @@ const char* proxy::voice_blocked_reason(const proxy_config* cfg)
 // udp
 // ---------------------------------------------------------------------------
 
-bool proxy::open_udp(udp_route* route, SOCKET s, const sockaddr_in* peer,
-                     const proxy_config* cfg, const char** why)
+// Media leaving without the proxy. `unproxied` says whether that is a fact
+// worth reporting - going direct with no proxy configured is just going out.
+static bool udp_straight_out(proxy::udp_route* route, SOCKET s,
+                             const sockaddr_in* peer, bool unproxied,
+                             const char** why)
 {
-    ccfset(route, 0, sizeof(*route));
     route->control = INVALID_SOCKET;
-    route->data = s;
-    route->peer = *peer;
-    if (why) *why = "";
+    route->active = false;
+    route->direct = unproxied;
 
-    if (!cfg || !cfg->in_use() || !cfg->carries_udp())
-    {
-        // No proxy, or one that cannot carry datagrams. Straight out.
-        route->active = false;
-        return connect(s, (const sockaddr*)peer, sizeof(*peer)) == 0;
-    }
+    if (connect(s, (const sockaddr*)peer, sizeof(*peer)) == 0) return true;
 
+    if (why) *why = "не удалось открыть UDP";
+    return false;
+}
+
+static bool socks5_associate(proxy::udp_route* route, SOCKET s,
+                             const proxy_config* cfg, const char** why)
+{
     SOCKET control = dial(cfg->host, cfg->port);
     if (control == INVALID_SOCKET)
     {
@@ -744,6 +753,17 @@ bool proxy::open_udp(udp_route* route, SOCKET s, const sockaddr_in* peer,
     // keeps send/recv usable and drops anything from elsewhere.
     if (connect(s, (const sockaddr*)&relay, sizeof(relay)) != 0)
     {
+        // Named in full, because this is where a proxy that only pretends to
+        // support udp ends up: the association is accepted and the relay it
+        // hands back cannot be reached. Without the address in the log that
+        // looks like a network fault rather than the proxy.
+        log_line("proxy: реле %u.%u.%u.%u:%u недоступно (ошибка %d)",
+                 (unsigned int)(relay.sin_addr.s_addr & 0xFF),
+                 (unsigned int)((relay.sin_addr.s_addr >> 8) & 0xFF),
+                 (unsigned int)((relay.sin_addr.s_addr >> 16) & 0xFF),
+                 (unsigned int)((relay.sin_addr.s_addr >> 24) & 0xFF),
+                 (unsigned int)ntohs(relay.sin_port), WSAGetLastError());
+
         closesocket(control);
         if (why) *why = "не удалось привязаться к UDP-каналу прокси";
         return false;
@@ -760,6 +780,51 @@ bool proxy::open_udp(udp_route* route, SOCKET s, const sockaddr_in* peer,
              (unsigned int)((relay.sin_addr.s_addr >> 24) & 0xFF),
              (unsigned int)ntohs(relay.sin_port));
     return true;
+}
+
+bool proxy::open_udp(udp_route* route, SOCKET s, const sockaddr_in* peer,
+                     const proxy_config* cfg, const char** why)
+{
+    ccfset(route, 0, sizeof(*route));
+    route->control = INVALID_SOCKET;
+    route->data = s;
+    route->peer = *peer;
+    if (why) *why = "";
+
+    bool have = cfg && cfg->in_use();
+    int policy = have ? cfg->voice : VOICE_AUTO;
+
+    if (!have || policy == VOICE_DIRECT)
+        return udp_straight_out(route, s, peer, have, why);
+
+    if (!cfg->carries_udp())
+    {
+        if (policy == VOICE_STRICT)
+        {
+            if (why) *why = cfg->kind == PROXY_SOCKS4 ? "SOCKS4 не умеет UDP"
+                                                      : "этот прокси не пропускает UDP";
+            return false;
+        }
+
+        log_line("proxy: %s не носит UDP, медиа пойдёт напрямую",
+                 cfg->kind == PROXY_SOCKS4 ? "socks4" : "https");
+
+        return udp_straight_out(route, s, peer, true, why);
+    }
+
+    const char* failed = "";
+    if (socks5_associate(route, s, cfg, &failed)) return true;
+
+    if (policy == VOICE_STRICT)
+    {
+        if (why) *why = failed[0] ? failed : "UDP через прокси не поднялся";
+        return false;
+    }
+
+    log_line("proxy: UDP ASSOCIATE не вышел (%s), медиа пойдёт напрямую",
+             failed[0] ? failed : "без причины");
+
+    return udp_straight_out(route, s, peer, true, why);
 }
 
 void proxy::close_udp(udp_route* route)

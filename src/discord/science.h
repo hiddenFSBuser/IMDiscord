@@ -99,6 +99,12 @@ namespace science
     // A code entered, before anything is asked of the server.
     void invite_opened(const char* code);
 
+    // The same event for an invite that was not typed but was already
+    // sitting in a message. Discord names those by where they are rather
+    // than by the code alone: "<message id>:<code>", which is what tells two
+    // panels for the same server apart.
+    void invite_opened_in_message(const char* code, snowflake message_id);
+
     // What came back from GET /invites/{code}. Reported whether or not it
     // resolved: a dead code is a thing that happens to people, and hiding it
     // makes the chain look stranger rather than safer.
@@ -122,6 +128,33 @@ namespace science
     };
 
     void invite_resolved(const invite_result* r);
+
+    // Where an invite panel is being shown, and what it is offering. Sent
+    // once per panel that comes on screen; discord counts these as
+    // impressions and a client that never reports one is a client whose
+    // panels nobody ever saw.
+    struct invite_embed_where
+    {
+        const char* code;
+        snowflake message_id;
+
+        // The conversation the message is in.
+        snowflake channel_id;
+        int channel_type;
+        int channel_size_total;
+
+        // What the invite points at.
+        snowflake invite_guild_id;
+        snowflake invite_channel_id;
+        int invite_channel_type;
+
+        snowflake inviter_id;
+    };
+
+    void invite_embed_shown(const invite_embed_where* w);
+
+    // The button on it being pressed.
+    void invite_embed_actioned(const invite_embed_where* w, const char* action);
 
     // ---- deliberate actions (TIER_ACTION) --------------------------------
     void channel_opened(snowflake channel_id, snowflake guild_id);

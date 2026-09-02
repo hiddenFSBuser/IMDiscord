@@ -11,6 +11,7 @@
 #include "discord/archive.h"
 #include "discord/store.h"
 #include "discord/rest.h"
+#include "discord/cdnfix.h"
 #include "discord/science.h"
 #include "discord/gateway.h"
 #include "discord/dmscan.h"
@@ -1173,6 +1174,7 @@ void ui_proxy_editor_open(int slot, const proxy_config* cfg, bool own)
     g_ui.proxy_editing = slot;
     g_ui.proxy_own = own;
     g_ui.proxy_kind = cfg ? cfg->kind : PROXY_NONE;
+    g_ui.proxy_voice = cfg ? cfg->voice : VOICE_AUTO;
 
     ccfset(g_ui.proxy_host, 0, sizeof(g_ui.proxy_host));
     ccfset(g_ui.proxy_user, 0, sizeof(g_ui.proxy_user));
@@ -1222,8 +1224,12 @@ bool ui_proxy_editor(proxy_config* out, bool* own)
         proxy_config parsed;
         if (proxy::parse_url(g_ui.proxy_paste, &parsed))
         {
+            // The pasted line says nothing about media, so the routing that
+            // was already chosen is kept rather than reset.
+            int keep_voice = g_ui.proxy_voice;
             ui_proxy_editor_open(g_ui.proxy_editing, &parsed, g_ui.proxy_own);
             g_ui.proxy_kind = parsed.kind;
+            g_ui.proxy_voice = keep_voice;
         }
         else
         {
@@ -1259,13 +1265,37 @@ bool ui_proxy_editor(proxy_config* out, bool* own)
         ImGui::InputTextWithHint("##ppass", tr("пароль"), g_ui.proxy_pass, sizeof(g_ui.proxy_pass),
                                  ImGuiInputTextFlags_Password);
 
+        // Media is the one thing a proxy often cannot carry, so the choice
+        // is made here rather than found out during a call.
+        ImGui::Spacing();
+        ui_text_muted(tr("Голос"));
+
+        const char* routes[] = { tr("Через прокси, иначе напрямую"),
+                                 tr("Только через прокси"),
+                                 tr("Всегда напрямую") };
+
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##pvoice", routes[g_ui.proxy_voice % 3]))
+        {
+            for (int v = 0; v < 3; v++)
+                if (ImGui::Selectable(routes[v], g_ui.proxy_voice == v)) g_ui.proxy_voice = v;
+            ImGui::EndCombo();
+        }
+
         // Said now rather than discovered when somebody tries to join a call.
-        if (g_ui.proxy_kind == PROXY_HTTPS)
-            ui_text_muted(tr("HTTPS не пропускает UDP - звонки будут недоступны"));
-        else if (g_ui.proxy_kind == PROXY_SOCKS4)
-            ui_text_muted(tr("SOCKS4 не умеет UDP - звонки будут недоступны"));
+        if (g_ui.proxy_voice == VOICE_STRICT)
+        {
+            if (g_ui.proxy_kind == PROXY_HTTPS)
+                ui_text_muted(tr("HTTPS не пропускает UDP - звонки будут недоступны"));
+            else if (g_ui.proxy_kind == PROXY_SOCKS4)
+                ui_text_muted(tr("SOCKS4 не умеет UDP - звонки будут недоступны"));
+            else
+                ui_text_muted(tr("Звонок не состоится, если прокси не умеет UDP ASSOCIATE"));
+        }
         else
-            ui_text_muted(tr("Звонки пойдут через UDP ASSOCIATE, если прокси его умеет"));
+        {
+            ui_text_muted(tr("Голос уйдёт с вашего адреса, если прокси не носит UDP"));
+        }
     }
 
     proxy_config draft;
@@ -1275,6 +1305,7 @@ bool ui_proxy_editor(proxy_config* out, bool* own)
     ccstrncpy(draft.user, g_ui.proxy_user, sizeof(draft.user) - 1);
     ccstrncpy(draft.pass, g_ui.proxy_pass, sizeof(draft.pass) - 1);
     draft.port = (unsigned short)ccstrtoull(g_ui.proxy_port, 0, 10);
+    draft.voice = g_ui.proxy_voice;
 
     if (ImGui::Button(tr("Сохранить"), ImVec2(110, 0)))
     {
@@ -1382,6 +1413,12 @@ void ui_view_accounts_popup()
     int active = storage::active_account();
     int switch_to = -1;
     int forget = -1;
+
+    // Where a dragged account was let go, applied after the list rather than
+    // during it: moving an entry while walking the entries is drawing one list
+    // and reading another.
+    int drag_from = -1;
+    int drag_to = -1;
 
     // Groups, as a row of buttons rather than as sections that fold open.
     //
@@ -1515,8 +1552,28 @@ void ui_view_accounts_popup()
             switch_to = i;
         ImGui::PopStyleColor();
 
+        // Dragged by the row itself. The payload is the position rather than
+        // the account, because position is the whole of what is being changed.
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceNoPreviewTooltip))
+        {
+            ImGui::SetDragDropPayload("IMD_ACCOUNT", &i, sizeof(int));
+            ImGui::TextUnformatted(entry->name[0] ? entry->name : tr("Аккаунт"));
+            ImGui::EndDragDropSource();
+        }
+
+        if (ImGui::BeginDragDropTarget())
+        {
+            const ImGuiPayload* p = ImGui::AcceptDragDropPayload("IMD_ACCOUNT");
+            if (p && p->DataSize == (int)sizeof(int))
+            {
+                drag_from = *(const int*)p->Data;
+                drag_to = i;
+            }
+            ImGui::EndDragDropTarget();
+        }
+
         if (!current && ImGui::IsItemHovered())
-            ImGui::SetTooltip(tr("Переключиться на этот аккаунт"));
+            ImGui::SetTooltip(tr("Переключиться на этот аккаунт, перетащить - переставить"));
 
         // Right click on the account itself, because that is the thing being
         // sorted. A field per row would be twenty text boxes on screen for a
@@ -1755,6 +1812,10 @@ void ui_view_accounts_popup()
     {
         g_ui.pending_account = switch_to;
         ImGui::CloseCurrentPopup();
+    }
+    else if (drag_from >= 0 && drag_to >= 0)
+    {
+        storage::account_move(drag_from, drag_to);
     }
 
     ImGui::EndPopup();
@@ -2014,6 +2075,7 @@ void ui_init()
     // Cross-account and long lived: it is loaded once and outlives every sign
     // in, sign out and switch that happens while the client is open.
     people::init();
+    cdnfix::init();
     offline::init();
     api::init();
     voice::init();
@@ -2137,6 +2199,9 @@ void ui_frame()
     // Before the UI is built, so nothing released here can still be sitting in
     // a draw list from the frame that just went out.
     tex::collect();
+
+    // Stale attachment links, asked about in batches rather than one at a time.
+    cdnfix::tick();
 
 #ifdef IMD_VOICE_TEST
     // Test-only: join a voice channel right after READY so the DAVE handshake

@@ -11,8 +11,37 @@ enum voice_state_kind
     VOICE_FAILED,
 };
 
+// How a call's media is carried.
+//
+// Discord speaks two of these. The first is its own: a compact udp protocol
+// with its own header and its own encryption, which is what this client has
+// always used and what nothing but discord's own app implements. The second is
+// ordinary webrtc - sdp, ice, dtls, srtp - which is what every browser based
+// client ends up using because it is what a browser already has.
+//
+// Both go out over udp. Choosing webrtc changes the shape of the packets and
+// not the way they leave the machine: discord publishes exactly one ice
+// candidate and it is a udp one.
+enum voice_transport
+{
+    TRANSPORT_OWN = 0,     // discord's own udp protocol
+    TRANSPORT_WEBRTC,      // sdp / ice / dtls-srtp
+};
+
 namespace voice
 {
+    // Which transport the next call will use, and changing it. Kept in
+    // settings, so it survives a restart.
+    int  transport();
+    void set_transport(int t);
+
+    // True while a call's media is leaving without the proxy that the account
+    // is otherwise using. Not a fault - it is what "иначе напрямую" asks for -
+    // but it means discord's voice server sees this machine's address, and
+    // somebody running an account behind a proxy should be told rather than
+    // left to assume.
+    bool media_unproxied();
+
     void init();
     void shutdown();
 

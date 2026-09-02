@@ -160,6 +160,65 @@ struct dreaction
     bool me;
 };
 
+// The buttons and menus a bot hangs under its message.
+//
+// Discord calls them components and nests them: a message holds rows, a row
+// holds buttons or one menu. Kept flat here with a row number on each, which
+// is all the nesting is worth - it decides what shares a line and nothing
+// else.
+enum component_kind
+{
+    COMP_ROW = 1,
+    COMP_BUTTON = 2,
+    COMP_SELECT = 3,        // a menu of text options
+};
+
+enum button_style
+{
+    BTN_PRIMARY = 1,
+    BTN_SECONDARY = 2,
+    BTN_SUCCESS = 3,
+    BTN_DANGER = 4,
+    // Not a button at all in the protocol sense: it carries a url and is
+    // never sent back to anybody.
+    BTN_LINK = 5,
+};
+
+struct dselect_option
+{
+    char label[100];
+    char value[100];
+    char description[100];
+
+    snowflake emoji_id;
+    char emoji_name[64];
+};
+
+struct dcomponent
+{
+    int type;               // component_kind
+    int row;
+
+    int style;              // button_style, buttons only
+    bool disabled;
+
+    char label[96];
+    char custom_id[128];
+    char url[320];          // link buttons only
+
+    snowflake emoji_id;
+    bool emoji_animated;
+    char emoji_name[64];
+
+    // Menus only. The options live in one list on the message and every menu
+    // names its own slice of it.
+    char placeholder[128];
+    int first_option;
+    int option_count;
+    int min_values;
+    int max_values;
+};
+
 struct dmessage
 {
     snowflake id;
@@ -181,6 +240,15 @@ struct dmessage
     ulist<dembed> embeds;
     ulist<dreaction> reactions;
 
+    // What a bot put under it, and the options of every menu among them.
+    ulist<dcomponent> components;
+    ulist<dselect_option> select_options;
+
+    // Which application to address when one of them is used. A component
+    // belongs to the bot that sent the message, and the interaction has to
+    // name it.
+    snowflake application_id;
+
     // How tall this message drew last time, so the ones scrolled out of
     // sight can be skipped without changing the length of the list. Zero
     // until it has been drawn once.
@@ -197,12 +265,19 @@ struct dmember
     // there is none. Discord leaves the stamp in place after it has passed
     // rather than clearing it, so a value in the past means the same as none.
     unsigned long long timeout_until_ms;
+
+    // When they joined this server, as discord writes it. Absent from the
+    // profile endpoint - that one answers about a person, not about their
+    // membership - and present on every member object the gateway sends, which
+    // is where the member list already comes from.
+    const char* joined_at;
 };
 
 // The permission bits this client actually reasons about. Discord defines
 // several dozen; naming the ones that matter here is clearer than carrying
 // the whole table around for no reason.
 const unsigned long long PERM_CREATE_INVITE    = 1ULL << 0;
+const unsigned long long PERM_KICK_MEMBERS     = 1ULL << 1;
 const unsigned long long PERM_BAN_MEMBERS      = 1ULL << 2;
 const unsigned long long PERM_ADMINISTRATOR    = 1ULL << 3;
 const unsigned long long PERM_VIEW_CHANNEL     = 1ULL << 10;
@@ -213,6 +288,9 @@ const unsigned long long PERM_MUTE_MEMBERS     = 1ULL << 22;
 // permission: a disconnect is a move to nowhere.
 const unsigned long long PERM_MOVE_MEMBERS     = 1ULL << 24;
 const unsigned long long PERM_MANAGE_ROLES     = 1ULL << 28;
+// Listing a channel's webhooks needs this as much as making one does, so the
+// whole feature stands or falls on it.
+const unsigned long long PERM_MANAGE_WEBHOOKS  = 1ULL << 29;
 const unsigned long long PERM_MODERATE_MEMBERS = 1ULL << 40;
 
 // One line of a channel's permission table: who it is about, and what it
@@ -355,6 +433,11 @@ struct drelationship
     snowflake user_id;
     int type;
     const char* nickname;
+
+    // When the friendship started. Discord sends it and its own client does
+    // not show it anywhere; it costs nothing to keep and it is the only place
+    // the answer exists.
+    const char* since;
 };
 
 struct dvoice_state

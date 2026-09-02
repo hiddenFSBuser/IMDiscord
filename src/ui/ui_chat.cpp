@@ -10,8 +10,10 @@
 #include "stb/stb_image.h"
 #include "core/log.h"
 #include "discord/store.h"
+#include "discord/science.h"
 #include "core/offline.h"
 #include "discord/archive.h"
+#include "discord/cdnfix.h"
 #include "discord/rest.h"
 #include "discord/gateway.h"
 #include "discord/voice.h"
@@ -269,11 +271,223 @@ namespace
         out[cap - 1] = 0;
     }
 
+    // Whether what is about to be drawn is worth downloading yet.
+    //
+    // A channel with a thousand pictures in it used to ask for every one of
+    // them the moment it opened, because the list is built whole and only
+    // clipped afterwards. One screen of margin either way is enough to keep
+    // scrolling smooth and turns "everything at once" into "what you can
+    // nearly see".
+    bool near_view()
+    {
+        float y = ImGui::GetCursorPosY();
+        float top = ImGui::GetScrollY();
+        float height = ImGui::GetWindowHeight();
+
+        return y >= top - height && y <= top + height * 2.0f;
+    }
+
+    // ---- which part of a long channel is on screen -------------------------
+    //
+    // Only a few hundred messages are drawn at once; a busy channel holds
+    // thousands and imgui lays out every item it is given, whether or not it
+    // is visible.
+    //
+    // That window used to be pinned to the end of the list: first = count -
+    // 300, recomputed every frame. Loading older messages put them at the
+    // front, the window went on starting three hundred from the end, and none
+    // of them were ever drawn. The button worked, the request went out, the
+    // answer arrived and was stored - and the view could not be moved past
+    // the same wall however many times it was pressed.
+    //
+    // So the window follows the reader instead. It is anchored to a message
+    // id rather than to an index, because ids survive the arrival of anything
+    // older, and indices do not.
+
+    struct chat_window
+    {
+        snowflake channel;
+        snowflake anchor;        // first message drawn, or 0 while pinned
+        bool pinned;             // sitting at the end, as a chat normally does
+
+        // Content height last frame, and whether the window was just extended
+        // upwards. Adding messages above the scroll position moves everything
+        // down by however tall they turned out to be, and that has to be
+        // taken back out of the scroll or the view jumps.
+        float last_height;
+        bool grew_upwards;
+    };
+
+    chat_window g_win = { 0, 0, true, 0.0f, false };
+
+    // Index of the first message with an id at least this one. The list is
+    // sorted, so this is a binary search - a linear one runs per frame over
+    // every message in a channel.
+    unsigned int index_of(const dchannel* ch, snowflake id)
+    {
+        unsigned int lo = 0, hi = ch->messages.count;
+
+        while (lo < hi)
+        {
+            unsigned int mid = lo + (hi - lo) / 2;
+            if (ch->messages[mid].id < id) lo = mid + 1;
+            else hi = mid;
+        }
+
+        return lo;
+    }
+
+    // ---- holes in the history ---------------------------------------------
+    //
+    // A channel visited today and a channel visited a month ago leave two
+    // separate stretches on disk with nothing between them. The list shows
+    // them one after another and reads as continuous, so a month of
+    // conversation looks like an evening when nobody spoke - which is exactly
+    // how somebody concludes that nobody answered them.
+    //
+    // The archive already writes down which stretches arrived in one run. Two
+    // neighbouring messages that belong to different runs have a hole between
+    // them, and that is what gets drawn.
+
+    struct gap_view
+    {
+        snowflake channel;
+        unsigned int counted;
+        archive::span spans[64];
+        int count;
+    };
+
+    gap_view g_gaps = { 0, 0, {}, 0 };
+
+    void refresh_gaps(const dchannel* ch)
+    {
+        if (g_gaps.channel == ch->id && g_gaps.counted == ch->messages.count) return;
+
+        g_gaps.channel = ch->id;
+        g_gaps.counted = ch->messages.count;
+        g_gaps.count = archive::channel_spans(ch->id, g_gaps.spans, 64);
+
+        // Runs are appended and never merged on disk, so a stretch filled in
+        // later is written as a third run overlapping the two it joins.
+        // Sorting and coalescing here is what turns that back into one.
+        for (int i = 1; i < g_gaps.count; i++)
+        {
+            archive::span v = g_gaps.spans[i];
+            int k = i - 1;
+            while (k >= 0 && g_gaps.spans[k].from_id > v.from_id)
+            {
+                g_gaps.spans[k + 1] = g_gaps.spans[k];
+                k--;
+            }
+            g_gaps.spans[k + 1] = v;
+        }
+
+        int merged = 0;
+        for (int i = 0; i < g_gaps.count; i++)
+        {
+            if (merged && g_gaps.spans[i].from_id <= g_gaps.spans[merged - 1].to_id)
+            {
+                if (g_gaps.spans[i].to_id > g_gaps.spans[merged - 1].to_id)
+                    g_gaps.spans[merged - 1].to_id = g_gaps.spans[i].to_id;
+            }
+            else
+            {
+                g_gaps.spans[merged++] = g_gaps.spans[i];
+            }
+        }
+
+        g_gaps.count = merged;
+    }
+
+    int run_of(snowflake id)
+    {
+        for (int i = 0; i < g_gaps.count; i++)
+            if (g_gaps.spans[i].from_id <= id && id <= g_gaps.spans[i].to_id) return i;
+
+        return -1;
+    }
+
+    // Whether a run already settles this boundary.
+    bool run_covers(snowflake older, snowflake newer)
+    {
+        for (int i = 0; i < g_gaps.count; i++)
+            if (g_gaps.spans[i].from_id <= older && newer <= g_gaps.spans[i].to_id)
+                return true;
+
+        return false;
+    }
+
+    void draw_hole(dchannel* ch, snowflake after_id, snowflake until_id,
+                   unsigned long long span_ms)
+    {
+        ImGui::Dummy(ImVec2(0, 4));
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 at = ImGui::GetCursorScreenPos();
+        float width = ImGui::GetContentRegionAvail().x;
+
+        dl->AddLine(ImVec2(at.x, at.y + 9.0f), ImVec2(at.x + width, at.y + 9.0f),
+                    col::red, 1.0f);
+
+        char label[96];
+        unsigned long long hours = span_ms / 3600000ull;
+
+        if (hours >= 48) cnprint(label, sizeof(label), tr(" перерыв %llu дн. "), hours / 24);
+        else             cnprint(label, sizeof(label), tr(" перерыв %llu ч. "), hours);
+
+        ImVec2 ts = ImGui::CalcTextSize(label);
+        float lx = at.x + (width - ts.x) * 0.5f;
+
+        dl->AddRectFilled(ImVec2(lx, at.y), ImVec2(lx + ts.x, at.y + 18.0f), col::bg_deep);
+        dl->AddText(ImVec2(lx, at.y + 2.0f), col::red, label);
+
+        ImGui::Dummy(ImVec2(0, 20));
+
+        ImGui::Indent(16.0f);
+        ImGui::PushID((int)(after_id & 0x7FFFFFFF));
+
+        if (ch->history_loading) ui_text_muted(tr("Загрузка..."));
+        else if (ImGui::SmallButton(tr("Проверить, нет ли пропуска")))
+            api::fetch_messages_after(ch->id, after_id, until_id);
+
+        ImGui::PopID();
+        ImGui::Unindent(16.0f);
+
+        ImGui::Dummy(ImVec2(0, 4));
+    }
+
     // Draws an image, scaled to fit, and returns true when it was clicked.
     bool draw_image(const char* url, int native_w, int native_h)
     {
-        const texture* t = tex::get(url);
-        if (!t->ready())
+        // Off screen: the space is still reserved, at exactly the size the
+        // picture will take, so nothing jumps when it does arrive.
+        if (!near_view())
+        {
+            float w = native_w > 0 ? (float)native_w : 240.0f;
+            float h = native_h > 0 ? (float)native_h : 160.0f;
+            float scale = 1.0f;
+            if (w > MAX_IMAGE_WIDTH) scale = MAX_IMAGE_WIDTH / w;
+            if (h * scale > MAX_IMAGE_HEIGHT) scale = MAX_IMAGE_HEIGHT / h;
+
+            ImVec2 p = ImGui::GetCursorScreenPos();
+            ImVec2 size(w * scale, h * scale);
+            ImGui::GetWindowDrawList()->AddRectFilled(
+                p, ImVec2(p.x + size.x, p.y + size.y), col::bg_hover, 6.0f);
+
+            ImGui::Dummy(size);
+            return false;
+        }
+
+        // A saved message carries the link it had when it was saved, and an
+        // attachment link stops working on a date written into it. So the one
+        // actually used may be a refreshed one, and while that is being
+        // fetched there is no link at all.
+        const char* live = cdnfix::usable(url);
+        bool refreshing = (live == 0);
+
+        const texture* t = live ? tex::get(live) : 0;
+
+        if (!t || !t->ready())
         {
             float w = native_w > 0 ? (float)native_w : 240.0f;
             float h = native_h > 0 ? (float)native_h : 160.0f;
@@ -285,12 +499,29 @@ namespace
             ImVec2 size(w * scale, h * scale);
             ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + size.x, p.y + size.y), col::bg_hover, 6.0f);
 
-            const char* label = (t->state == TEX_FAILED) ? tr("не удалось загрузить") : tr("загрузка...");
+            bool failed = !refreshing && t && t->state == TEX_FAILED;
+
+            const char* label = failed ? tr("не удалось загрузить, нажмите чтобы повторить")
+                                       : tr("загрузка...");
+
             ImVec2 ts = ImGui::CalcTextSize(label);
             ImGui::GetWindowDrawList()->AddText(
                 ImVec2(p.x + (size.x - ts.x) * 0.5f, p.y + (size.y - ts.y) * 0.5f), col::text_muted, label);
 
-            ImGui::Dummy(size);
+            // The placeholder is the button. A separate control beside it
+            // would be one more thing to aim at, and the square is already
+            // exactly where the person is looking.
+            if (failed)
+            {
+                ImGui::InvisibleButton(url, size);
+                if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                if (ImGui::IsItemClicked()) tex::retry(live);
+            }
+            else
+            {
+                ImGui::Dummy(size);
+            }
+
             return false;
         }
 
@@ -1067,6 +1298,56 @@ namespace
         }
 
         ImGui::PopStyleColor();
+
+        // The same menu the ordinary rows have, because these are ordinary
+        // messages: discord gives "so-and-so joined" an id like any other and
+        // lets it be deleted like any other. Drawn without one, there was no
+        // way to clear a channel of them.
+        //
+        // Opened from the whole strip rather than from the last item drawn.
+        // The row ends with the timestamp, so hanging the menu on the last
+        // item would mean right-clicking the little grey time and nothing
+        // else - which is not where anybody aims.
+        {
+            float row_w = ImGui::GetContentRegionAvail().x;
+            ImVec2 row_end = ImGui::GetCursorScreenPos();
+
+            if (ImGui::IsMouseHoveringRect(p, ImVec2(p.x + row_w, row_end.y), false) &&
+                ImGui::IsMouseReleased(ImGuiMouseButton_Right))
+                ImGui::OpenPopup("##sysctx");
+        }
+
+        if (ImGui::BeginPopup("##sysctx"))
+        {
+            if (author && ImGui::MenuItem(tr("Профиль автора")))
+                ui_open_profile(author->id, m->guild_id);
+
+            bool mine = author && author->id == store::self_id();
+            bool may_delete = mine;
+
+            if (!mine && m->guild_id)
+            {
+                dguild* g = store::find_guild(m->guild_id);
+                dchannel* c = store::find_channel(m->channel_id);
+                if (g)
+                    may_delete = (store::member_permissions(g, store::self_id(), c)
+                                  & PERM_MANAGE_MESSAGES) != 0;
+            }
+
+            if (may_delete)
+            {
+                if (ImGui::MenuItem(tr("Удалить")))
+                    api::delete_message(m->channel_id, m->id);
+            }
+
+            ImGui::Separator();
+            if (author) ui_copy_id_item(author->id, tr("Скопировать ID автора"));
+            ui_copy_id_item(m->id, tr("Скопировать ID сообщения"));
+
+            if (author && m->guild_id) ui_member_moderation_menu(m->guild_id, author->id);
+            ImGui::EndPopup();
+        }
+
         ImGui::Unindent(20.0f);
         ImGui::Unindent(12.0f);
         ImGui::PopID();
@@ -1142,6 +1423,368 @@ namespace
         if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) end_edit();
 
         return true;
+    }
+
+    // ---- what a bot hangs under its message -----------------------------
+
+    ImU32 button_tint(int style)
+    {
+        switch (style)
+        {
+        case BTN_PRIMARY: return col::accent;
+        case BTN_SUCCESS: return col::green;
+        case BTN_DANGER:  return col::red;
+        default:          return col::bg_input;
+        }
+    }
+
+    void draw_button(dmessage* m, const dcomponent* c)
+    {
+        // A link button is a link. It is not sent anywhere and the bot never
+        // hears about it, which is the whole difference between the two kinds
+        // and worth showing rather than hiding behind the same look.
+        bool link = c->style == BTN_LINK || c->url[0];
+
+        char label[160];
+        if (c->emoji_name[0] && !c->emoji_id)
+            cnprint(label, sizeof(label), "%s %s", c->emoji_name, c->label);
+        else
+            cnprint(label, sizeof(label), "%s", c->label[0] ? c->label : tr("кнопка"));
+
+        if (c->disabled) ImGui::BeginDisabled();
+
+        ImU32 tint = link ? col::bg_input : button_tint(c->style);
+        ImGui::PushStyleColor(ImGuiCol_Button, tint);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, tint);
+        ImGui::PushStyleColor(ImGuiCol_Text, link ? col::text_link : col::text_normal);
+
+        if (ImGui::Button(label))
+        {
+            if (link)
+            {
+                wchar_t wide[512];
+                chartowcs(c->url, wide, 512);
+                ShellExecuteW(0, L"open", wide, 0, 0, SW_SHOWNORMAL);
+            }
+            else
+                api::use_component(m->guild_id, m->channel_id, m->id, m->application_id,
+                                   COMP_BUTTON, c->custom_id, 0, 0);
+        }
+
+        ImGui::PopStyleColor(3);
+        if (c->disabled) ImGui::EndDisabled();
+
+        if (link && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", c->url);
+    }
+
+    void draw_select(dmessage* m, const dcomponent* c)
+    {
+        const char* shown = c->placeholder[0] ? c->placeholder : tr("выбрать...");
+
+        if (c->disabled) ImGui::BeginDisabled();
+
+        ImGui::SetNextItemWidth(280.0f);
+        if (ImGui::BeginCombo("##sel", shown))
+        {
+            for (int i = 0; i < c->option_count; i++)
+            {
+                const dselect_option* o = &m->select_options[(unsigned int)(c->first_option + i)];
+
+                char label[220];
+                if (o->emoji_name[0] && !o->emoji_id)
+                    cnprint(label, sizeof(label), "%s %s", o->emoji_name, o->label);
+                else
+                    cnprint(label, sizeof(label), "%s", o->label);
+
+                ImGui::PushID(i);
+                if (ImGui::Selectable(label))
+                {
+                    // One at a time, whatever the menu allows. Sending a set
+                    // means holding a set while it is being built, and a menu
+                    // that takes several is rare enough that the difference is
+                    // one extra press.
+                    const char* values[1] = { o->value };
+                    api::use_component(m->guild_id, m->channel_id, m->id,
+                                       m->application_id, COMP_SELECT, c->custom_id,
+                                       values, 1);
+                }
+
+                if (o->description[0])
+                {
+                    ImGui::SameLine();
+                    ui_text_muted(o->description);
+                }
+                ImGui::PopID();
+            }
+
+            ImGui::EndCombo();
+        }
+
+        if (c->disabled) ImGui::EndDisabled();
+    }
+
+    void draw_components(dmessage* m, float indent)
+    {
+        if (!m->components.count) return;
+
+        ImGui::Dummy(ImVec2(0, 2));
+
+        int row = -1;
+        for (unsigned int i = 0; i < m->components.count; i++)
+        {
+            const dcomponent* c = &m->components[i];
+
+            // A new row starts a new line; everything else joins the one
+            // before it. That is all the nesting discord's rows are for.
+            if (c->row != row)
+            {
+                row = c->row;
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+            }
+            else
+            {
+                ImGui::SameLine();
+            }
+
+            ImGui::PushID((int)i);
+            if (c->type == COMP_BUTTON) draw_button(m, c);
+            else                        draw_select(m, c);
+            ImGui::PopID();
+        }
+
+        ImGui::Dummy(ImVec2(0, 2));
+    }
+
+    // ---- an invite sitting in a message ---------------------------------
+    //
+    // Drawn as a panel with the server on it, the way discord does, because a
+    // bare "discord.gg/xxxx" says nothing: whether it is a server worth
+    // joining, whether it is still alive, and whether you are already in it
+    // are all things the link cannot tell you and the panel can.
+
+    // The code out of one link, or 0. Both spellings, because both are what
+    // people paste: the short domain and the long path.
+    int invite_code_at(const char* p, char* out, int cap)
+    {
+        const char* forms[] = { "discord.gg/", "discord.com/invite/",
+                                "discordapp.com/invite/", "invite.gg/" };
+
+        for (int f = 0; f < 4; f++)
+        {
+            int n = (int)ccslenf(forms[f]);
+            if (ccsncmpf(p, forms[f], (size_t)n) != 0) continue;
+
+            int at = 0;
+            const char* c = p + n;
+
+            // A code is letters and digits, and sometimes a dash. Anything
+            // else ends it - including the punctuation somebody put after
+            // the link in their sentence.
+            while (*c && at < cap - 1 &&
+                   ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+                    (*c >= '0' && *c <= '9') || *c == '-' || *c == '_'))
+                out[at++] = *c++;
+
+            out[at] = 0;
+            if (at < 2) return 0;
+
+            return n + at;
+        }
+
+        return 0;
+    }
+
+    void invite_where(science::invite_embed_where* w, const dmessage* m,
+                      const char* code, const api::invite_card* card)
+    {
+        ccfset(w, 0, sizeof(*w));
+        w->code = code;
+        w->message_id = m->id;
+        w->channel_id = m->channel_id;
+
+        dchannel* c = store::find_channel(m->channel_id);
+        w->channel_type = c ? c->type : 0;
+        w->channel_size_total = c ? (int)c->recipients.count : 0;
+
+        if (card)
+        {
+            w->invite_guild_id = card->guild_id;
+            w->invite_channel_id = card->channel_id;
+            w->invite_channel_type = card->channel_type;
+            w->inviter_id = card->inviter_id;
+        }
+    }
+
+    void draw_invite(dmessage* m, const char* code, float indent)
+    {
+        dchannel* here = store::find_channel(m->channel_id);
+        int here_type = here ? here->type : 0;
+
+        api::invite_card card;
+        bool known = api::invite_card_of(code, &card);
+
+        if (!known)
+        {
+            // Asked for once. The panel is drawn every frame; the request is
+            // not, which is the difference between a chat full of links and a
+            // rate limit.
+            api::resolve_invite(code, m->id, m->channel_id, here_type, m->guild_id);
+            return;
+        }
+
+        const float W = 340.0f;
+        float H = 96.0f;
+
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+
+        ImVec2 at = ImGui::GetCursorScreenPos();
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+
+        dl->AddRectFilled(at, ImVec2(at.x + W, at.y + H), col::bg_deep, 8.0f);
+
+        if (!card.done)
+        {
+            ImGui::Dummy(ImVec2(W, H));
+            dl->AddText(ImVec2(at.x + 12.0f, at.y + 12.0f), col::text_muted, tr("Приглашение..."));
+            return;
+        }
+
+        if (!card.ok)
+        {
+            ImGui::Dummy(ImVec2(W, 44.0f));
+            dl->AddRectFilled(at, ImVec2(at.x + W, at.y + 44.0f), col::bg_deep, 8.0f);
+            dl->AddText(ImVec2(at.x + 12.0f, at.y + 14.0f), col::text_muted,
+                        tr("Приглашение больше не работает"));
+            return;
+        }
+
+        // Told discord it was seen, once per panel rather than per frame.
+        {
+            static uset<unsigned long long> seen;
+
+            unsigned long long key = m->id ^ (ccscrc64(code) * 31);
+            if (!seen.contains(key))
+            {
+                seen.push(key);
+
+                science::invite_embed_where w;
+                invite_where(&w, m, code, &card);
+                science::invite_embed_shown(&w);
+            }
+        }
+
+        ImGui::Dummy(ImVec2(W, H));
+
+        dl->AddText(ImVec2(at.x + 12.0f, at.y + 10.0f), col::text_muted,
+                    tr("ПРИГЛАШЕНИЕ НА СЕРВЕР"));
+
+        // The icon, or a square where it would be: a server without one is
+        // ordinary and a hole in the panel is not.
+        ImVec2 icon(at.x + 12.0f, at.y + 32.0f);
+        if (card.guild_icon[0])
+        {
+            char url[256];
+            cnprint(url, sizeof(url), "https://cdn.discordapp.com/icons/%llu/%s.png?size=128",
+                    card.guild_id, card.guild_icon);
+
+            const texture* t = tex::get(url);
+            if (t->ready())
+                dl->AddImageRounded(t->id(), icon, ImVec2(icon.x + 48.0f, icon.y + 48.0f),
+                                    ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 12.0f);
+            else
+                dl->AddRectFilled(icon, ImVec2(icon.x + 48.0f, icon.y + 48.0f), col::bg_panel, 12.0f);
+        }
+        else
+        {
+            dl->AddRectFilled(icon, ImVec2(icon.x + 48.0f, icon.y + 48.0f), col::bg_panel, 12.0f);
+        }
+
+        float text_x = at.x + 72.0f;
+        ui_draw_text_emoji(dl, ImVec2(text_x, at.y + 34.0f), col::text_normal, card.guild_name);
+
+        char line[160];
+        cnprint(line, sizeof(line), tr("%d в сети, %d участников"),
+                card.size_online, card.size_total);
+        dl->AddText(ImVec2(text_x, at.y + 54.0f), col::text_muted, line);
+
+        if (card.channel_name[0])
+        {
+            cnprint(line, sizeof(line), "#%s", card.channel_name);
+            dl->AddText(ImVec2(text_x, at.y + 72.0f), col::text_muted, line);
+        }
+
+        // The button, over the panel that was just drawn.
+        bool member = card.already_member || store::find_guild(card.guild_id) != 0;
+
+        ImVec2 back = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorScreenPos(ImVec2(at.x + W - 108.0f, at.y + 46.0f));
+
+        ImGui::PushID(code);
+
+        if (member)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button, col::bg_panel);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col::bg_hover);
+
+            if (ImGui::Button(tr("Открыть"), ImVec2(96, 28)))
+            {
+                g_ui.active_guild = card.guild_id;
+                g_ui.active_channel = card.channel_id;
+                g_ui.show_friends = false;
+            }
+
+            ImGui::PopStyleColor(2);
+        }
+        else
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button, col::green);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col::green);
+
+            if (ImGui::Button(tr("Присоединиться"), ImVec2(96, 28)))
+            {
+                science::invite_embed_where w;
+                invite_where(&w, m, code, &card);
+                science::invite_embed_actioned(&w, "accept");
+
+                api::join_invite_from_message(code, m->id, m->channel_id,
+                                              here_type, m->guild_id);
+            }
+
+            ImGui::PopStyleColor(2);
+        }
+
+        ImGui::PopID();
+        ImGui::SetCursorScreenPos(back);
+    }
+
+    void draw_invites(dmessage* m, float indent)
+    {
+        if (!m->content) return;
+
+        // At most a few per message. Somebody who pastes ten links gets the
+        // first few as panels and the rest as the text they already are.
+        char shown[4][16];
+        int count = 0;
+
+        for (const char* p = m->content; *p && count < 4; )
+        {
+            char code[16];
+            int taken = invite_code_at(p, code, sizeof(code));
+
+            if (!taken) { p++; continue; }
+            p += taken;
+
+            bool had = false;
+            for (int i = 0; i < count; i++) if (ccscmp(shown[i], code) == 0) had = true;
+            if (had) continue;
+
+            ccstrncpy(shown[count], code, 15);
+            shown[count][15] = 0;
+            count++;
+
+            ImGui::Dummy(ImVec2(0, 2));
+            draw_invite(m, code, indent);
+        }
     }
 
     void draw_message(dmessage* m, bool grouped)
@@ -1241,6 +1884,9 @@ namespace
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + text_indent);
             draw_attachment(&m->attachments[i]);
         }
+
+        draw_invites(m, text_indent);
+        draw_components(m, text_indent);
 
         for (unsigned int i = 0; i < m->embeds.count; i++)
         {
@@ -1760,8 +2406,12 @@ void ui_view_chat(float width, float height)
         }
         ImGui::Unindent(16.0f);
     }
-    else if (!ch->history_exhausted && ch->messages.count > 0)
+    else if (!ch->history_exhausted && ch->messages.count > 0 &&
+             (g_win.pinned || !g_win.anchor || g_win.anchor == ch->messages[0].id))
     {
+        // Offered only at the true start of what is held. Higher up there are
+        // still messages in memory, and scrolling reaches them without asking
+        // discord for anything.
         ImGui::Dummy(ImVec2(0, 8));
         ImGui::Indent(16.0f);
         if (ImGui::SmallButton(tr("Загрузить более старые сообщения")))
@@ -1771,8 +2421,53 @@ void ui_view_chat(float width, float height)
 
     ImGui::Indent(12.0f);
 
-    unsigned int first = 0;
-    if (ch->messages.count > MAX_RENDERED_MESSAGES) first = ch->messages.count - MAX_RENDERED_MESSAGES;
+    refresh_gaps(ch);
+
+    if (g_win.channel != ch->id)
+    {
+        g_win.channel = ch->id;
+        g_win.anchor = 0;
+        g_win.pinned = true;
+        g_win.last_height = 0.0f;
+        g_win.grew_upwards = false;
+    }
+
+    unsigned int total = ch->messages.count;
+    unsigned int tail = total > MAX_RENDERED_MESSAGES ? total - MAX_RENDERED_MESSAGES : 0;
+
+    unsigned int first = tail;
+
+    if (!g_win.pinned && g_win.anchor)
+    {
+        first = index_of(ch, g_win.anchor);
+        if (first > tail) first = tail;
+    }
+
+    // At the very top of what is drawn, with more of it above: show more.
+    // This is what makes scrolling up work at all - the button below only
+    // asks discord for messages that are not here yet.
+    if (ImGui::GetScrollY() <= 2.0f && first > 0 && ImGui::GetScrollMaxY() > 0.0f)
+    {
+        unsigned int step = MAX_RENDERED_MESSAGES / 3;
+        first = first > step ? first - step : 0;
+
+        g_win.pinned = false;
+        g_win.anchor = ch->messages[first].id;
+        g_win.grew_upwards = true;
+    }
+    else if (ImGui::GetScrollMaxY() > 0.0f &&
+             ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f)
+    {
+        // Back at the end: follow it again, so a new message still scrolls
+        // into view the way it should.
+        g_win.pinned = true;
+        g_win.anchor = 0;
+        first = tail;
+    }
+    else if (!g_win.pinned)
+    {
+        g_win.anchor = first < total ? ch->messages[first].id : 0;
+    }
 
     snowflake prev_author = 0;
     unsigned long long prev_time = 0;
@@ -1781,6 +2476,24 @@ void ui_view_chat(float width, float height)
     {
         dmessage* m = &ch->messages[i];
         unsigned long long t = snowflake_time_ms(m->id);
+
+        if (i > first)
+        {
+            snowflake previous = ch->messages[i - 1].id;
+
+            // Only what is on screen is worth asking about, and only what no
+            // run already settles. A marker is drawn when discord has said
+            // there is something in between - never on a guess.
+            if (!run_covers(previous, m->id) && near_view())
+            {
+                int state = api::gap_status(ch->id, previous);
+
+                if (state == api::GAP_UNKNOWN)
+                    api::check_gap(ch->id, previous, m->id);
+                else if (state == api::GAP_REAL)
+                    draw_hole(ch, previous, m->id, t - snowflake_time_ms(previous));
+            }
+        }
 
         // Consecutive messages from one author within 7 minutes share a header.
         bool grouped = (m->author_id == prev_author) && (t - prev_time < 7 * 60 * 1000) && !m->referenced_id;
@@ -1819,6 +2532,24 @@ void ui_view_chat(float width, float height)
     ImGui::Unindent(12.0f);
     ImGui::Dummy(ImVec2(0, 8));
 
+    // How tall everything turned out. When the window grew upwards this
+    // frame, the difference is exactly how far the content moved down, and
+    // giving it back to the scroll is what keeps the reader on the message
+    // they were looking at instead of throwing them to the top.
+    {
+        float height = ImGui::GetCursorPosY();
+
+        if (g_win.grew_upwards)
+        {
+            float grew = height - g_win.last_height;
+            if (grew > 0.0f) ImGui::SetScrollY(ImGui::GetScrollY() + grew);
+
+            g_win.grew_upwards = false;
+        }
+
+        g_win.last_height = height;
+    }
+
     if (g_ui.scroll_to_bottom || ch->messages.count != g_ui.seen_message_count)
     {
         // Only auto-scroll when the user is already near the end.
@@ -1853,7 +2584,20 @@ void ui_view_chat(float width, float height)
     //
     // The buttons that turn it on and make one live under the box instead -
     // those are things done to the channel, not to this message.
+    // Offered only to somebody who could actually use it. Both halves of the
+    // feature - listing the webhooks of a channel and making one - are behind
+    // Manage Webhooks, so without it the buttons lead nowhere: pressing them
+    // earns a 403 and an error line, which is a worse answer than not being
+    // asked in the first place.
     bool hook_here = ch->guild_id && ch->is_textual();
+
+    if (hook_here)
+    {
+        dguild* hg = store::find_guild(ch->guild_id);
+
+        hook_here = hg && (store::member_permissions(hg, store::self_id(), ch)
+                           & PERM_MANAGE_WEBHOOKS) != 0;
+    }
 
     api::webhook_row hooks[16];
     int hook_count = 0;

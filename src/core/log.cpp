@@ -224,3 +224,11 @@ void log_install_crash_handler()
 {
     SetUnhandledExceptionFilter(crash_filter);
 }
+
+// A way for the vendored C sources to say something. They are compiled as C
+// and cannot reach log_line, which has c++ linkage; two numbers and a tag is
+// all any of them has needed.
+extern "C" void imd_log2(const char* tag, unsigned int a, unsigned int b)
+{
+    log_line("%s: %u, %u", tag ? tag : "?", a, b);
+}

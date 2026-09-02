@@ -89,8 +89,13 @@ rem this single file is the whole of it.
 echo [build] tlse.c
 rem ARGTYPE=4 turns libtomcrypt's argument checks into CRYPT_INVALID_ARG
 rem returns instead of the default crypt_argchk, which drags in fprintf/raise.
+rem TLS_SRTP turns on the DTLS-SRTP half of tlse: the STUN parser, the ICE
+rem credentials, the EXTRACTOR-dtls_srtp key export and the SRTP cipher, which
+rem is what a webrtc voice transport needs. It costs nothing on an ordinary
+rem connection: the use_srtp extension is written only for a context that was
+rem made as a DTLS-SRTP one, so plain https to discord goes out unchanged.
 cl %COMMON% /TC /D_NO_CRT_STDIO_INLINE /wd4267 /wd4244 /wd4133 /wd4101 /wd4189 /wd4127 /wd4706 /wd4310 /wd4245 ^
-   /DTLS_AMALGAMATION /DTLS_FORWARD_SECRECY /DARGTYPE=4 /D_CRT_SECURE_NO_WARNINGS ^
+   /DTLS_AMALGAMATION /DTLS_FORWARD_SECRECY /DTLS_SRTP /DARGTYPE=4 /D_CRT_SECURE_NO_WARNINGS ^
    /I"%SRC%\libs\tlse" /Fo"%OBJ%\tlse.obj" "%SRC%\libs\tlse\tlse.c"
 if errorlevel 1 goto :fail
 
@@ -192,7 +197,7 @@ rem ---- link -----------------------------------------------------------------
 echo [build] linking
 rem mfplat/mfuuid are the Media Foundation imports the H.264 encoder needs. Like
 rem winhttp and d3d11 they are plain system DLLs, so no CRT comes with them.
-set LIBS=kernel32.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib comdlg32.lib ws2_32.lib dwmapi.lib imm32.lib bcrypt.lib crypt32.lib avrt.lib winmm.lib mfplat.lib mfuuid.lib mmdevapi.lib "%SRC%\libs\rnnoise\rnnoise.lib"
+set LIBS=kernel32.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib comdlg32.lib ws2_32.lib dwmapi.lib imm32.lib bcrypt.lib crypt32.lib avrt.lib winmm.lib mfplat.lib mfuuid.lib mmdevapi.lib iphlpapi.lib "%SRC%\libs\rnnoise\rnnoise.lib"
 
 link /NOLOGO %LFLAGS% /MAP:"%BIN%\IMDiscord.map" /NODEFAULTLIB /ENTRY:im_entry /SUBSYSTEM:WINDOWS /MACHINE:X64 /STACK:0x200000,0x200000 /INCREMENTAL:NO /MANIFEST:NO /OUT:"%BIN%\IMDiscord.exe" @"%RSP%" %LIBS%
 if errorlevel 1 goto :fail

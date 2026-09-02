@@ -628,6 +628,7 @@ bool archive::snapshot_save()
             w.kv_snowflake("id", rels[i].user_id);
             w.kv_i64("type", rels[i].type);
             if (rels[i].nickname) w.kv_str("nickname", rels[i].nickname);
+            if (rels[i].since) w.kv_str("since", rels[i].since);
             w.end_obj();
         }
         w.end_arr();
@@ -728,7 +729,8 @@ bool archive::snapshot_load()
         for (unsigned int i = 0; i < rels->count; i++)
         {
             const jval* r = rels->at(i);
-            store::set_relationship(r->sf("id"), (int)r->i64("type", 0), r->str("nickname", 0));
+            store::set_relationship(r->sf("id"), (int)r->i64("type", 0), r->str("nickname", 0),
+                                    r->str("since", 0));
         }
 
         const jval* guilds = root->arr("guilds");
