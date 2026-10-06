@@ -10,6 +10,7 @@
 #include "video/encoder.h"
 #include "imgui.h"
 #include "ui/emoji.h"
+#include "ui/ui_state.h"
 #include "net/proxy.h"
 #include "net/tlsconn.h"
 #include "net/websocket.h"
@@ -377,6 +378,24 @@ extern "C" void __stdcall im_entry()
         if (wanted)
         {
             bool ok = ws::self_test();
+            WSACleanup();
+            log_shutdown();
+            ExitProcess(ok ? 0 : 1);
+        }
+    }
+
+    // "--ziptest" packs a few in-memory files and reads the archive back,
+    // through the same code the attachment downloader uses.
+    {
+        bool wanted = false;
+        for (const wchar_t* p = cmdline; *p; p++)
+            if (p[0] == L'-' && p[1] == L'-' && p[2] == L'z' && p[3] == L'i' &&
+                p[4] == L'p' && p[5] == L't' && p[6] == L'e' && p[7] == L's' && p[8] == L't')
+            { wanted = true; break; }
+
+        if (wanted)
+        {
+            bool ok = ui_zip_self_test();
             WSACleanup();
             log_shutdown();
             ExitProcess(ok ? 0 : 1);

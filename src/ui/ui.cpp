@@ -2087,6 +2087,7 @@ void ui_init()
     proxy::init();
     player::init();
     censor::init();
+    ui_downloads_init();
     http::init("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     apply_active_proxy();
     jobs::init(6);
@@ -2420,6 +2421,7 @@ void ui_frame()
     ui_view_camera_window();
     ui_view_offline_banner();
     ui_view_accounts_popup();
+    ui_view_downloads();
 
     // Global shortcut: logging out is always available.
     ImGuiIO& io = ImGui::GetIO();

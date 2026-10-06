@@ -99,6 +99,29 @@ cl %COMMON% /TC /D_NO_CRT_STDIO_INLINE /wd4267 /wd4244 /wd4133 /wd4101 /wd4189 /
    /I"%SRC%\libs\tlse" /Fo"%OBJ%\tlse.obj" "%SRC%\libs\tlse\tlse.c"
 if errorlevel 1 goto :fail
 
+rem ---- miniz ------------------------------------------------------------------
+rem Zip writing for the attachment downloader. C, no PCH. Only the heap
+rem archive path is used (MINIZ_NO_STDIO) with fixed stamps (MINIZ_NO_TIME);
+rem asserts are compiled out in miniz_cfg.h, which is force-included above
+rem miniz.h on each unit below.
+echo [build] miniz
+cl %COMMON% /TC /D_NO_CRT_STDIO_INLINE /wd4267 /wd4244 /wd4133 /wd4101 /wd4189 /wd4127 /wd4706 /wd4310 /wd4245 ^
+   /FI"%SRC%\libs\miniz\miniz_cfg.h" /I"%SRC%\libs\miniz" ^
+   /Fo"%OBJ%\miniz.obj" "%SRC%\libs\miniz\miniz.c"
+if errorlevel 1 goto :fail
+cl %COMMON% /TC /D_NO_CRT_STDIO_INLINE /wd4267 /wd4244 /wd4133 /wd4101 /wd4189 /wd4127 /wd4706 /wd4310 /wd4245 ^
+   /FI"%SRC%\libs\miniz\miniz_cfg.h" /I"%SRC%\libs\miniz" ^
+   /Fo"%OBJ%\miniz_tdef.obj" "%SRC%\libs\miniz\miniz_tdef.c"
+if errorlevel 1 goto :fail
+cl %COMMON% /TC /D_NO_CRT_STDIO_INLINE /wd4267 /wd4244 /wd4133 /wd4101 /wd4189 /wd4127 /wd4706 /wd4310 /wd4245 ^
+   /FI"%SRC%\libs\miniz\miniz_cfg.h" /I"%SRC%\libs\miniz" ^
+   /Fo"%OBJ%\miniz_tinfl.obj" "%SRC%\libs\miniz\miniz_tinfl.c"
+if errorlevel 1 goto :fail
+cl %COMMON% /TC /D_NO_CRT_STDIO_INLINE /wd4267 /wd4244 /wd4133 /wd4101 /wd4189 /wd4127 /wd4706 /wd4310 /wd4245 ^
+   /FI"%SRC%\libs\miniz\miniz_cfg.h" /I"%SRC%\libs\miniz" ^
+   /Fo"%OBJ%\miniz_zip.obj" "%SRC%\libs\miniz\miniz_zip.c"
+if errorlevel 1 goto :fail
+
 rem ---- no-intrinsics math aliases -------------------------------------------
 rem customcrt_mathalias.cpp defines names (sqrtf, pow, ...) that /Oi keeps as
 rem intrinsics; it has to be compiled with intrinsics off and without the PCH.
@@ -112,6 +135,10 @@ rem so it is handed to the linker through a response file instead.
 set "RSP=%OBJ%\objects.rsp"
 echo "%OBJ%\pch.obj"> "%RSP%"
 echo "%OBJ%\tlse.obj">> "%RSP%"
+echo "%OBJ%\miniz.obj">> "%RSP%"
+echo "%OBJ%\miniz_tdef.obj">> "%RSP%"
+echo "%OBJ%\miniz_tinfl.obj">> "%RSP%"
+echo "%OBJ%\miniz_zip.obj">> "%RSP%"
 echo "%OBJ%\customcrt_mathalias.obj">> "%RSP%"
 set /a INDEX=0
 

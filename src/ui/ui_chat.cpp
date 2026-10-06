@@ -20,6 +20,7 @@
 #include "video/screenshare.h"
 #include "net/http.h"
 #include "system/io/ufile.h"
+#include "libs/miniz/miniz.h"
 
 namespace
 {
@@ -40,33 +41,120 @@ namespace
         wchar_t path[MAX_PATH];
     };
 
-    void job_download(void* user)
+    // Downloads in flight, for the progress overlay. Jobs write here, the
+    // interface reads once a frame; the lock is process lifetime, created by
+    // ui_downloads_init before any download can start.
+    struct dl_slot
     {
-        download_job* j = (download_job*)user;
+        bool used;
+        char label[160];
+        int done;
+        int total;
+    };
 
-        // Through the texture cache: a picture that was already looked at is
-        // read off the disk, which survives the address expiring. A fresh
-        // download is the fallback, not the only try.
-        ubuffer blob;
-        blob.init();
-        bool ok = tex::fetch_blob(j->url, &blob) && blob.size;
+    CRITICAL_SECTION g_dl_lock;
+    bool g_dl_ready = false;
+    dl_slot g_dls[8];
+
+    void downloads_registry_init()
+    {
+        if (g_dl_ready) return;
+        InitializeCriticalSection(&g_dl_lock);
+        ccfset(g_dls, 0, sizeof(g_dls));
+        g_dl_ready = true;
+    }
+
+    void path_label(const wchar_t* path, char* out, int cap)
+    {
+        char full[MAX_PATH];
+        wcstochar(path, full, sizeof(full));
+
+        const char* base = full;
+        for (const char* q = full; *q; q++)
+            if (*q == '\\' || *q == '/') base = q + 1;
+        if (!*base) base = "file";
+
+        ccstrncpy(out, base, cap - 1);
+    }
+
+    int dl_register(const char* label, int total)
+    {
+        if (!g_dl_ready) return -1;
+
+        EnterCriticalSection(&g_dl_lock);
+        int id = -1;
+        for (int i = 0; i < 8; i++)
+            if (!g_dls[i].used) { id = i; break; }
+        if (id >= 0)
+        {
+            g_dls[id].used = true;
+            ccstrncpy(g_dls[id].label, label && label[0] ? label : "?", sizeof(g_dls[id].label) - 1);
+            g_dls[id].done = 0;
+            g_dls[id].total = total > 0 ? total : 1;
+        }
+        LeaveCriticalSection(&g_dl_lock);
+        return id;
+    }
+
+    void dl_advance(int id, int done)
+    {
+        if (!g_dl_ready || id < 0 || id >= 8) return;
+
+        EnterCriticalSection(&g_dl_lock);
+        if (g_dls[id].used) g_dls[id].done = done;
+        LeaveCriticalSection(&g_dl_lock);
+    }
+
+    void dl_finish(int id)
+    {
+        if (!g_dl_ready || id < 0 || id >= 8) return;
+
+        EnterCriticalSection(&g_dl_lock);
+        g_dls[id].used = false;
+        LeaveCriticalSection(&g_dl_lock);
+    }
+
+    // One place that turns a (possibly expired) address into bytes: through
+    // the texture cache, so a picture that was already looked at is read off
+    // the disk, which survives the address expiring. A fresh download is the
+    // fallback, not the only try.
+    bool fetch_file_bytes(const char* url, ubuffer* blob)
+    {
+        blob->init();
+        bool ok = tex::fetch_blob(url, blob) && blob->size;
 
         if (!ok)
         {
             // The address likely expired. The frame loop sends the refresh
             // cdnfix queued on the ask above, so wait for it rather than
             // failing at once.
-            blob.clear();
+            blob->clear();
             for (int i = 0; i < 20 && !ok; i++)
             {
                 Sleep(500);
-                const char* live = cdnfix::usable(j->url);
+                const char* live = cdnfix::usable(url);
                 if (!live) continue;
-                if (live == j->url) break;   // not expirable: tried already
-                blob.clear();
-                ok = tex::fetch_blob(live, &blob) && blob.size;
+                if (live == url) break;   // not expirable: tried already
+                blob->clear();
+                ok = tex::fetch_blob(live, blob) && blob->size;
             }
         }
+
+        return ok;
+    }
+
+    void job_download(void* user)
+    {
+        download_job* j = (download_job*)user;
+
+        char label[160];
+        path_label(j->path, label, sizeof(label));
+        int prog = dl_register(label, 1);
+
+        ubuffer blob;
+        bool ok = fetch_file_bytes(j->url, &blob);
+
+        dl_advance(prog, 1);
 
         if (ok)
         {
@@ -88,6 +176,7 @@ namespace
             api::set_last_error(tr("Скачивание не удалось"));
         }
 
+        dl_finish(prog);
         blob.free_buffer();
         memfree(j);
     }
@@ -235,6 +324,368 @@ namespace
         j->path[i] = 0;
 
         jobs::post(job_download, j);
+    }
+
+    struct zip_item
+    {
+        char url[600];
+        char name[128];
+    };
+
+    struct zip_job
+    {
+        wchar_t path[MAX_PATH];
+        zip_item items[10];
+        int count;
+    };
+
+    // An archive-safe name: no directories, never empty, never twice. Two
+    // files with one name become "name (2).ext", which is what explorers do
+    // when asked the same question.
+    void zip_unique_name(const char* filename, char used[][128], int used_count,
+                         char* out, int cap)
+    {
+        const char* base = (filename && filename[0]) ? filename : "file";
+        const char* p = base;
+        for (const char* q = base; *q; q++)
+            if (*q == '/' || *q == '\\' || *q == ':') p = q + 1;
+        if (!*p) p = "file";
+
+        char stem[128];
+        ccstrncpy(stem, p, sizeof(stem) - 1);
+
+        for (int n = 1; ; n++)
+        {
+            if (n == 1)
+            {
+                ccstrncpy(out, stem, cap - 1);
+            }
+            else
+            {
+                // Split off the extension by hand: the last dot that is not
+                // the first character.
+                char left[128];
+                const char* ext = "";
+                ccfset(left, 0, sizeof(left));
+
+                const char* dot = 0;
+                for (const char* q = stem; *q; q++)
+                    if (*q == '.' && q != stem) dot = q;
+
+                if (dot)
+                {
+                    unsigned int keep = (unsigned int)(dot - stem);
+                    if (keep > sizeof(left) - 1) keep = sizeof(left) - 1;
+                    for (unsigned int i = 0; i < keep; i++) left[i] = stem[i];
+                    ext = dot;
+                }
+                else
+                {
+                    ccstrncpy(left, stem, sizeof(left) - 1);
+                }
+
+                cnprint(out, cap, "%s (%d)%s", left, n, ext);
+            }
+            out[cap - 1] = 0;
+
+            bool taken = false;
+            for (int i = 0; i < used_count; i++)
+                if (ccscmp(used[i], out) == 0) { taken = true; break; }
+            if (!taken) return;
+        }
+    }
+
+    void job_zip_download(void* user)
+    {
+        zip_job* j = (zip_job*)user;
+
+        char label[160];
+        path_label(j->path, label, sizeof(label));
+        int prog = dl_register(label, j->count > 0 ? j->count : 1);
+
+        mz_zip_archive zip;
+        ccfset(&zip, 0, sizeof(zip));
+        if (!mz_zip_writer_init_heap(&zip, 0, 0))
+        {
+            api::set_last_error(tr("Скачивание не удалось"));
+            dl_finish(prog);
+            memfree(j);
+            return;
+        }
+
+        char used[10][128];
+        int used_count = 0;
+        int added = 0;
+
+        for (int i = 0; i < j->count; i++)
+        {
+            ubuffer blob;
+            if (!fetch_file_bytes(j->items[i].url, &blob))
+            {
+                log_line("zip: пропуск %s", j->items[i].name);
+                blob.free_buffer();
+                dl_advance(prog, i + 1);
+                continue;
+            }
+
+            char arc[128];
+            zip_unique_name(j->items[i].name, used, used_count, arc, sizeof(arc));
+            if (used_count < 10)
+            {
+                ccstrncpy(used[used_count], arc, sizeof(used[0]) - 1);
+                used_count++;
+            }
+
+            if (mz_zip_writer_add_mem(&zip, arc, blob.data, blob.size,
+                                      (mz_uint)MZ_DEFAULT_COMPRESSION))
+                added++;
+            else
+                log_line("zip: не влез %s", arc);
+
+            blob.free_buffer();
+            dl_advance(prog, i + 1);
+        }
+
+        bool ok = false;
+        if (added)
+        {
+            void* packed = 0;
+            size_t packed_size = 0;
+            if (mz_zip_writer_finalize_heap_archive(&zip, &packed, &packed_size) &&
+                packed && packed_size && packed_size <= 0xFFFFFFFFu &&
+                ufile::write_all(j->path, packed, (unsigned int)packed_size))
+                ok = true;
+            if (packed) mz_free(packed);
+        }
+        mz_zip_end(&zip);
+
+        if (ok)
+        {
+            char name[MAX_PATH];
+            wcstochar(j->path, name, sizeof(name));
+            char msg[512];
+            if (j->count > 1)
+                cnprint(msg, sizeof(msg), tr("Сохранено: %s (файлов: %d)"), name, added);
+            else
+                cnprint(msg, sizeof(msg), tr("Сохранено: %s"), name);
+            api::set_last_error(msg);
+        }
+        else
+        {
+            api::set_last_error(added ? tr("Не удалось записать файл на диск")
+                                      : tr("Скачивание не удалось"));
+        }
+
+        dl_finish(prog);
+        memfree(j);
+    }
+
+    void start_zip_download(const zip_item* items, int count, const char* suggested)
+    {
+        if (!items || count <= 0) return;
+        if (count > 10) count = 10;
+
+        wchar_t want[MAX_PATH];
+        chartowcs(suggested, want, MAX_PATH);
+
+        wchar_t chosen[MAX_PATH];
+        if (!ufile::save_dialog(want, chosen, MAX_PATH)) return;
+
+        zip_job* j = (zip_job*)memalloc(sizeof(zip_job));
+        if (!j) return;
+        ccfset(j, 0, sizeof(zip_job));
+
+        int i = 0;
+        while (chosen[i] && i < MAX_PATH - 1) { j->path[i] = chosen[i]; i++; }
+        j->path[i] = 0;
+
+        for (int k = 0; k < count; k++) j->items[k] = items[k];
+        j->count = count;
+
+        jobs::post(job_zip_download, j);
+    }
+
+    // A file card is anything that is not drawn large: pictures and played
+    // video keep their full-width look, everything else is grid material.
+    bool is_file_card(const dattachment* a)
+    {
+        if (!a) return false;
+        if (a->is_image()) return false;
+        if (a->is_video() && ui_video_player()) return false;
+        return true;
+    }
+
+    // File cards of one message, in order. Discord caps a message at ten
+    // files, so ten slots are exactly enough.
+    int collect_file_cards(dmessage* m, const dattachment** out, int cap)
+    {
+        int n = 0;
+        if (!m) return 0;
+
+        for (unsigned int i = 0; i < m->attachments.count && n < cap; i++)
+        {
+            const dattachment* a = &m->attachments[i];
+            if (is_file_card(a)) out[n++] = a;
+        }
+        return n;
+    }
+
+    void start_file_zip(const dattachment* a)
+    {
+        if (!a || !a->url || !a->url[0] || !a->filename || !a->filename[0]) return;
+
+        // A lone executable wrapped before it can be double-clicked by
+        // accident is the whole point of zipping one file.
+        char sugg[260];
+        ccstrncpy(sugg, a->filename, 200);
+        int n = (int)ccslenf(sugg);
+        ccstrncpy(sugg + n, ".zip", sizeof(sugg) - n - 1);
+
+        zip_item one;
+        ccfset(&one, 0, sizeof(one));
+        ccstrncpy(one.url, a->url, sizeof(one.url) - 1);
+        ccstrncpy(one.name, a->filename, sizeof(one.name) - 1);
+
+        start_zip_download(&one, 1, sugg);
+    }
+
+    void start_message_zip(dmessage* m)
+    {
+        const dattachment* files[10];
+        int n = collect_file_cards(m, files, 10);
+        if (!n) return;
+
+        zip_item items[10];
+        ccfset(items, 0, sizeof(items));
+        for (int i = 0; i < n; i++)
+        {
+            ccstrncpy(items[i].url, files[i]->url ? files[i]->url : "", sizeof(items[i].url) - 1);
+            ccstrncpy(items[i].name, files[i]->filename ? files[i]->filename : "file",
+                      sizeof(items[i].name) - 1);
+        }
+
+        start_zip_download(items, n, "attachments.zip");
+    }
+
+    // Packs four in-memory files and reads the archive back, through the
+    // same helpers the download uses: duplicate names, a Cyrillic name and
+    // an empty file. Run from --ziptest.
+    bool zip_self_test()
+    {
+        struct sample
+        {
+            const char* name;
+            const char* data;
+        };
+
+        static const sample samples[] = {
+            { "hello.txt", "hello world" },
+            { "hello.txt", "second copy" },
+            { "файл.txt", "cyrillic name" },
+            { "empty.bin", "" },
+        };
+        const int SAMPLES = 4;
+
+        mz_zip_archive zip;
+        ccfset(&zip, 0, sizeof(zip));
+        if (!mz_zip_writer_init_heap(&zip, 0, 0))
+        {
+            log_line("ziptest: FAIL init");
+            return false;
+        }
+
+        char used[10][128];
+        int used_count = 0;
+        char expect[4][128];
+        ccfset(expect, 0, sizeof(expect));
+
+        for (int i = 0; i < SAMPLES; i++)
+        {
+            zip_unique_name(samples[i].name, used, used_count, expect[i], sizeof(expect[i]));
+            ccstrncpy(used[used_count], expect[i], sizeof(used[0]) - 1);
+            if (used_count < 10) used_count++;
+
+            size_t len = ccslenf(samples[i].data);
+            const void* ptr = len ? (const void*)samples[i].data : (const void*)"";
+            if (!mz_zip_writer_add_mem(&zip, expect[i], ptr, len, (mz_uint)MZ_DEFAULT_COMPRESSION))
+            {
+                log_line("ziptest: FAIL add %s", expect[i]);
+                mz_zip_end(&zip);
+                return false;
+            }
+        }
+
+        void* packed = 0;
+        size_t packed_size = 0;
+        if (!mz_zip_writer_finalize_heap_archive(&zip, &packed, &packed_size) ||
+            !packed || !packed_size)
+        {
+            log_line("ziptest: FAIL finalize");
+            mz_zip_end(&zip);
+            return false;
+        }
+        mz_zip_end(&zip);
+
+        log_line("ziptest: упаковано %u байт в %u", (unsigned int)packed_size, SAMPLES);
+
+        bool ok = true;
+        mz_zip_archive rd;
+        ccfset(&rd, 0, sizeof(rd));
+        if (!mz_zip_reader_init_mem(&rd, packed, packed_size, 0))
+        {
+            log_line("ziptest: FAIL open for reading");
+            ok = false;
+        }
+        else
+        {
+            mz_uint n = mz_zip_reader_get_num_files(&rd);
+            if (n != (mz_uint)SAMPLES)
+            {
+                log_line("ziptest: FAIL файлов %u, ждали %d", n, SAMPLES);
+                ok = false;
+            }
+
+            for (mz_uint i = 0; i < n && ok; i++)
+            {
+                char name[128];
+                if (!mz_zip_reader_get_filename(&rd, i, name, sizeof(name)))
+                {
+                    log_line("ziptest: FAIL имя %u", i);
+                    ok = false;
+                    break;
+                }
+
+                int want = -1;
+                for (int k = 0; k < SAMPLES; k++)
+                    if (ccscmp(name, expect[k]) == 0) want = k;
+                if (want < 0)
+                {
+                    log_line("ziptest: FAIL лишнее имя %s", name);
+                    ok = false;
+                    break;
+                }
+
+                size_t got = 0;
+                void* data = mz_zip_reader_extract_to_heap(&rd, i, &got, 0);
+                size_t want_len = ccslenf(samples[want].data);
+                bool same = data && got == want_len &&
+                    ccmp(data, samples[want].data, want_len) == 0;
+                if (want_len == 0) same = data && got == 0;
+                if (data) mz_free(data);
+
+                if (!same)
+                {
+                    log_line("ziptest: FAIL содержимое %s", name);
+                    ok = false;
+                }
+            }
+            mz_zip_end(&rd);
+        }
+
+        mz_free(packed);
+
+        if (ok) log_line("ziptest: все проверки пройдены");
+        return ok;
     }
 
     void human_size(unsigned int bytes, char* out, int cap)
@@ -1436,6 +1887,71 @@ namespace
         }
     }
 
+    void draw_file_card(const dattachment* a, float w)
+    {
+        ImGui::PushID((const void*)(size_t)a->id);
+
+        char size_text[32];
+        human_size(a->size, size_text, sizeof(size_text));
+
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float h = 52.0f;
+
+        // Background item so the whole card answers right click. Drawn
+        // first, so the download button on top of it keeps its own click.
+        ImGui::InvisibleButton("##attcard", ImVec2(w, h));
+        if (ImGui::IsItemHovered()) g_media_hovered = true;
+        if (ImGui::BeginPopupContextItem("##attctx"))
+        {
+            if (ImGui::MenuItem(tr("Копировать ссылку"))) copy_link_url(a->url);
+            if (ImGui::MenuItem(tr("Скачать"))) start_download(a->url, a->filename);
+            if (ImGui::MenuItem(tr("Скачать в ZIP"))) start_file_zip(a);
+            ImGui::EndPopup();
+        }
+        ImGui::SetCursorScreenPos(p);
+
+        ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col::bg_panel, 6.0f);
+
+        // The name cut to the card, on a character boundary. Long Unity
+        // paths would otherwise march straight past its edge.
+        char shown[192];
+        ccstrncpy(shown, (a->filename && a->filename[0]) ? a->filename : "?", sizeof(shown) - 1);
+
+        float max_w = w - 24.0f;
+        if (max_w > 40.0f)
+        {
+            while (shown[0])
+            {
+                if (ImGui::CalcTextSize(shown).x <= max_w) break;
+
+                char probe[200];
+                cnprint(probe, sizeof(probe), "%s...", shown);
+                if (ImGui::CalcTextSize(probe).x <= max_w)
+                {
+                    ccstrncpy(shown, probe, sizeof(shown) - 1);
+                    break;
+                }
+
+                int n = (int)ccslenf(shown);
+                if (n <= 1) { shown[0] = 0; break; }
+                n--;
+                while (n > 0 && (((unsigned char)shown[n] & 0xC0) == 0x80)) n--;
+                shown[n] = 0;
+            }
+        }
+
+        ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 12, p.y + 8), col::text_link, shown);
+        ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 12, p.y + 28), col::text_muted, size_text);
+
+        ImGui::SetCursorScreenPos(ImVec2(p.x + w - 104, p.y + 12));
+        if (ui_icon_button(tr("Скачать##att"), ImVec2(92, 28), col::accent, col::accent_hover))
+            start_download(a->url, a->filename);
+
+        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h + 4));
+
+        ImGui::PopID();
+    }
+
     void draw_attachment(const dattachment* a)
     {
         ImGui::PushID((const void*)(size_t)a->id);
@@ -1474,36 +1990,73 @@ namespace
         }
         else
         {
-            char size_text[32];
-            human_size(a->size, size_text, sizeof(size_text));
-
-            ImVec2 p = ImGui::GetCursorScreenPos();
-            float w = 340.0f, h = 52.0f;
-
-            // Background item so the whole card answers right click. Drawn
-            // first, so the download button on top of it keeps its own click.
-            ImGui::InvisibleButton("##attcard", ImVec2(w, h));
-            if (ImGui::IsItemHovered()) g_media_hovered = true;
-            if (ImGui::BeginPopupContextItem("##attctx"))
-            {
-                if (ImGui::MenuItem(tr("Копировать ссылку"))) copy_link_url(a->url);
-                if (ImGui::MenuItem(tr("Скачать"))) start_download(a->url, a->filename);
-                ImGui::EndPopup();
-            }
-            ImGui::SetCursorScreenPos(p);
-
-            ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col::bg_panel, 6.0f);
-            ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 12, p.y + 8), col::text_link, a->filename);
-            ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 12, p.y + 28), col::text_muted, size_text);
-
-            ImGui::SetCursorScreenPos(ImVec2(p.x + w - 104, p.y + 12));
-            if (ui_icon_button(tr("Скачать##att"), ImVec2(92, 28), col::accent, col::accent_hover))
-                start_download(a->url, a->filename);
-
-            ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h + 4));
+            draw_file_card(a, 340.0f);
         }
 
         ImGui::PopID();
+    }
+
+    // File cards of one message laid out as a grid: as many 340-wide cards
+    // per row as fit, the rest wrapping below. The old loop set the cursor
+    // past the indent once per card, which is the staircase on the
+    // screenshot: every card started where the indent ended the time before.
+    void draw_attachments_grid(dmessage* m, float indent)
+    {
+        const dattachment* files[10];
+        int nfiles = 0;
+
+        for (unsigned int i = 0; i < m->attachments.count; i++)
+        {
+            const dattachment* a = &m->attachments[i];
+            if (is_file_card(a))
+            {
+                if (nfiles < 10) files[nfiles++] = a;
+                continue;
+            }
+
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+            draw_attachment(a);
+        }
+
+        if (!nfiles) return;
+
+        float x0 = ImGui::GetCursorPosX() + indent;
+        float avail = ImGui::GetContentRegionMax().x - x0;
+
+        float card_w = 340.0f;
+        if (card_w > avail && avail > 220.0f) card_w = avail;
+
+        float gap = 8.0f;
+        int per_row = (int)((avail + gap) / (card_w + gap));
+        if (per_row < 1) per_row = 1;
+
+        // Positioned by absolute coordinates, never by SameLine: after the
+        // cursor jumps a SameLine aligns to whatever item was last, which is
+        // how the columns came out crooked. Both axes are window-local, to
+        // match what SetCursorPos takes: the screen-space Y was what threw
+        // every card hundreds of pixels down and out of sight.
+        float row_y = 0.0f;
+        for (int i = 0; i < nfiles; i++)
+        {
+            int at = i % per_row;
+            if (at == 0)
+            {
+                if (i) ImGui::Dummy(ImVec2(0, 6));
+                row_y = ImGui::GetCursorPos().y;
+            }
+
+            ImGui::SetCursorPos(ImVec2(x0 + (float)at * (card_w + gap), row_y));
+            draw_file_card(files[i], card_w);
+        }
+
+        ImGui::SetCursorPosX(x0);
+        if (nfiles > 1)
+        {
+            if (ImGui::Button(tr("Скачать всё (.zip)"), ImVec2(220, 28)))
+                start_message_zip(m);
+            ImGui::SetCursorPosX(x0);
+        }
+        ImGui::Dummy(ImVec2(0, 2));
     }
 
     // Which address build_image_url is allowed to fall back to for an embed.
@@ -2331,11 +2884,7 @@ namespace
         // of content. Without these the message is just its button.
         draw_v2(m, text_indent);
 
-        for (unsigned int i = 0; i < m->attachments.count; i++)
-        {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + text_indent);
-            draw_attachment(&m->attachments[i]);
-        }
+        draw_attachments_grid(m, text_indent);
 
         draw_invites(m, text_indent);
         draw_components(m, text_indent);
@@ -2901,6 +3450,65 @@ void ui_view_modal_popup()
     }
 
     ImGui::EndPopup();
+}
+
+bool ui_zip_self_test()
+{
+    return zip_self_test();
+}
+
+void ui_downloads_init()
+{
+    downloads_registry_init();
+}
+
+// Downloads in flight, bottom right, above the message box. One line each:
+// a spinner, the name, and done-of-total for archives. Single files have a
+// total of one, so they read as a spinner plus a name until they land.
+void ui_view_downloads()
+{
+    if (!g_dl_ready) return;
+
+    dl_slot snap[8];
+    int n = 0;
+    EnterCriticalSection(&g_dl_lock);
+    for (int i = 0; i < 8; i++)
+        if (g_dls[i].used && n < 8) snap[n++] = g_dls[i];
+    LeaveCriticalSection(&g_dl_lock);
+    if (!n) return;
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x - 310.0f,
+                                   vp->WorkPos.y + vp->WorkSize.y - 160.0f - (float)n * 30.0f),
+                            ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(290, 0));
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImGui::ColorConvertU32ToFloat4(col::bg_panel));
+    if (!ImGui::Begin("##downloads", 0,
+                      ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                      ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    static const char* spin = "|/-\\";
+    int frame = ((int)(ImGui::GetTime() * 8.0)) & 3;
+
+    for (int i = 0; i < n; i++)
+    {
+        char line[200];
+        if (snap[i].total > 1)
+            cnprint(line, sizeof(line), "%c %s %d/%d",
+                    spin[frame], snap[i].label, snap[i].done, snap[i].total);
+        else
+            cnprint(line, sizeof(line), "%c %s", spin[frame], snap[i].label);
+        ImGui::TextUnformatted(line);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor();
 }
 
 void ui_view_chat(float width, float height)
