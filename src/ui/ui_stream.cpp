@@ -424,6 +424,17 @@ void ui_view_camera_window()
     {
         ImVec2 avail = ImGui::GetContentRegionAvail();
 
+        // What the camera path has done since the window was opened. A
+        // picture that never arrives reads the same as a window that never
+        // asked, so the counters say which of the two it is: no packets
+        // means nothing is forwarded, packets without frames means nothing
+        // assembles, frames without a picture means the decoder is stuck.
+        char stats[192];
+        cnprint(stats, sizeof(stats),
+                tr("пакетов %u | кадров %u | выброшено %u | ssrc %u"),
+                voice::camera_packets(), voice::camera_frames(),
+                voice::camera_dropped(), voice::camera_video_ssrc());
+
         if (g_cam_view && g_cam_w > 0 && g_cam_h > 0)
         {
             ImVec2 origin = ImGui::GetCursorScreenPos();
@@ -434,15 +445,22 @@ void ui_view_camera_window()
             ImGui::SetCursorScreenPos(ImVec2(origin.x + (avail.x - size.x) * 0.5f,
                                              origin.y + (avail.y - size.y) * 0.5f));
             ImGui::Image((ImTextureID)g_cam_view, size);
+
+            ImGui::GetWindowDrawList()->AddText(ImVec2(origin.x + 8.0f, origin.y + 6.0f),
+                                                col::text_muted, stats);
         }
         else
         {
             // A camera sends nothing until it has a picture worth sending, and
             // the first self contained frame can be a second or two coming.
-            ImGui::Dummy(ImVec2(0, avail.y * 0.45f));
+            ImGui::Dummy(ImVec2(0, avail.y * 0.40f));
             float text_w = ImGui::CalcTextSize(tr("Жду картинку...")).x;
             ImGui::SetCursorPosX((avail.x - text_w) * 0.5f);
             ui_text_muted(tr("Жду картинку..."));
+
+            float stats_w = ImGui::CalcTextSize(stats).x;
+            ImGui::SetCursorPosX((avail.x - stats_w) * 0.5f);
+            ui_text_muted(stats);
         }
     }
 

@@ -23,6 +23,20 @@ namespace crypto
     void sha256_final(sha256_ctx* ctx, unsigned char out[32]);
     void sha256(const void* data, unsigned int len, unsigned char out[32]);
 
+    // ---- sha1 (websocket handshake only) ----
+    struct sha1_ctx
+    {
+        unsigned int state[5];
+        unsigned long long length;
+        unsigned char block[64];
+        unsigned int block_len;
+    };
+
+    void sha1_init(sha1_ctx* ctx);
+    void sha1_update(sha1_ctx* ctx, const void* data, unsigned int len);
+    void sha1_final(sha1_ctx* ctx, unsigned char out[20]);
+    void sha1(const void* data, unsigned int len, unsigned char out[20]);
+
     // ---- base64 ----
     void base64_encode(const void* data, unsigned int len, ubuffer* out);
     bool base64_decode(const char* text, int len, ubuffer* out);
@@ -100,35 +114,33 @@ namespace crypto
 
     // ---- NIST P-256 (the only ciphersuite DAVE v1 uses) ----
     const unsigned int P256_PUBLIC_BYTES = 65;   // uncompressed 0x04 || X || Y
-    // CNG cannot rebuild the public point from the scalar alone, so a private
-    // key is kept as the full X || Y || d triple that BCryptExportKey hands out.
+    // The public point is cached rather than recomputed on every use, so a
+    // private key is kept as the full X || Y || d triple.
     const unsigned int P256_PRIVATE_BYTES = 96;
     // MLS carries ECDSA signatures DER encoded as SEQUENCE{INTEGER r, INTEGER s},
-    // which is 70 to 72 bytes, not the raw 64 byte R||S that CNG produces.
+    // which is 70 to 72 bytes, not the raw 64 byte R||S the signer produces.
     const unsigned int P256_SIGNATURE_MAX_BYTES = 72;
 
     unsigned int der_encode_signature(const unsigned char raw[64], unsigned char* out);
     bool der_decode_signature(const unsigned char* der, unsigned int der_len,
                               unsigned char raw[64]);
 
-    // Scalar times the base point, which CNG has no call for. MLS needs it:
-    // TreeKEM turns a secret derived up the tree into a key pair, and every
-    // member has to arrive at the same one. Implemented in p256.cpp.
+    // Scalar times the base point. MLS needs it: TreeKEM turns a secret
+    // derived up the tree into a key pair, and every member has to arrive at
+    // the same one. Implemented in p256.cpp.
     bool p256_scalar_base_mult(const unsigned char scalar[32],
                                unsigned char out_x[32], unsigned char out_y[32]);
 
-    // Builds the CNG shaped private blob and the matching public point from a
-    // scalar. False when the scalar is zero or not below the group order.
+    // Builds the X || Y || d private triple and the matching public point
+    // from a scalar. False when the scalar is zero or not below the group
+    // order.
     bool p256_keypair_from_scalar(const unsigned char scalar[32],
                                   unsigned char public_key[65],
                                   unsigned char private_key[96]);
     bool p256_scalar_in_range(const unsigned char scalar[32]);
 
-    // scalar times an arbitrary point, which is the whole of ECDH. Written
-    // here rather than asked of the system because the system's answer costs
-    // more than it is worth: BCryptDeriveKey with a raw secret only exists
-    // from Windows 8.1, and that one call was the entire reason end to end
-    // encrypted calls had a floor two versions above the rest of the client.
+    // scalar times an arbitrary point, which is the whole of ECDH.
+    // Implemented in p256.cpp, next to the field arithmetic.
     //
     // Returns false for a point that is not on the curve, which is a check
     // that has to happen somewhere and belongs next to the arithmetic.
@@ -156,7 +168,7 @@ namespace crypto
     // Runs the built-in known-answer tests; results go to the log.
     bool self_test();
 
-    // ---- aes-256-gcm (aead_aes256_gcm_rtpsize), via bcrypt ----
+    // ---- aes-256-gcm (aead_aes256_gcm_rtpsize) ----
     bool aes256gcm_available();
     bool aes256gcm_encrypt(const unsigned char key[32],
                            const unsigned char nonce[12],

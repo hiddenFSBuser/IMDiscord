@@ -75,6 +75,10 @@ namespace science
     void friends_list_viewed(const char* tab);
     void friends_list_clicked(const char* tab);
     void add_friend_input_clicked();
+    // A captcha solved elsewhere and retried with its token. The official
+    // client reports the solve right after it worked; the flow key is the
+    // challenge session the refusal carried.
+    void captcha_verified(const char* sitekey, const char* flow_key);
 
     // The settings screen discord points people at when it will not show
     // something in place - blocked accounts are behind it - reported as the

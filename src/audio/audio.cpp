@@ -330,7 +330,8 @@ namespace
             hr = ep->enumerator->GetDevice(wanted, &ep->device);
             if (FAILED(hr))
             {
-                log_line("audio: the selected device is gone, falling back to the default");
+                log_line("audio: the selected device is gone (0x%08X), falling back to the default",
+                         (unsigned int)hr);
                 ep->device = 0;
             }
         }

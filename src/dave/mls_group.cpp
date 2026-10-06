@@ -426,6 +426,35 @@ bool build_commit(group_state* g,
         ref_count++;
     }
 
+    // A viewer rejoining under a new session arrives as an add for a user_id
+    // that already holds a leaf from the dead session. Committing the add
+    // alone leaves two leaves for one identity - a shape nothing here has
+    // ever exercised and official clients reject, which reads as a stream
+    // that loads forever until it is restarted. The stale leaf is removed
+    // in the same commit instead; removes run before adds below and free
+    // the slot. Our own leaf is never a stale one.
+    for (unsigned int i = 0; i < add_count; i++)
+    {
+        unsigned long long who = adds[i].kp.leaf.cred.user_id();
+        if (!who) continue;
+
+        for (unsigned int leaf = 0; leaf < MAX_MEMBERS; leaf++)
+        {
+            if (!g->leaf_used[leaf] || leaf == g->my_leaf) continue;
+            if (g->leaves[leaf].cred.user_id() != who) continue;
+
+            bool already = false;
+            for (unsigned int r = 0; r < remove_count; r++)
+                if (removes[r] == leaf) { already = true; break; }
+            if (already) break;
+
+            if (remove_count >= MAX_MEMBERS) break;
+            removes[remove_count++] = leaf;
+            log_line("mls: add for %llu replaces its stale leaf %u", who, leaf);
+            break;
+        }
+    }
+
     if (ref_count == 0)
     {
         log_line("mls: nothing to commit");

@@ -22,8 +22,48 @@ namespace
     char g_last_link[256];
     char g_captcha_sitekey[128];
     char g_captcha_rqtoken[256];
+    char g_captcha_session[64];
     CRITICAL_SECTION g_err_lock;
     bool g_ready = false;
+
+    // A form the worker parsed out of a type-9 interaction response, waiting
+    // for the interface to pick it up and show it.
+    CRITICAL_SECTION g_modal_lock;
+    bool g_modal_lock_ready = false;
+    api::modal_form g_pending_modal;
+    bool g_modal_ready = false;
+
+    // Nonces of component clicks this client sent, so a form arriving over
+    // the gateway can be matched to the click that asked for it. A modal for
+    // a click from another client (the same account in a browser) is not
+    // ours to open.
+    unsigned long long g_modal_nonce[8];
+    int g_modal_nonce_at = 0;
+
+    void note_modal_nonce(unsigned long long nonce)
+    {
+        g_modal_nonce[g_modal_nonce_at] = nonce;
+        g_modal_nonce_at = (g_modal_nonce_at + 1) % 8;
+    }
+
+    bool claim_modal_nonce(const char* nonce)
+    {
+        if (!nonce || !nonce[0]) return false;
+
+        for (int i = 0; i < 8; i++)
+        {
+            if (!g_modal_nonce[i]) continue;
+
+            char mine[32];
+            cnprint(mine, sizeof(mine), "%llu", g_modal_nonce[i]);
+            if (ccscmp(mine, nonce) == 0)
+            {
+                g_modal_nonce[i] = 0;
+                return true;
+            }
+        }
+        return false;
+    }
 
     char g_launch_id[40];
     char g_launch_signature[40];
@@ -381,6 +421,8 @@ void api::init()
 {
     if (g_ready) return;
     InitializeCriticalSection(&g_err_lock);
+    InitializeCriticalSection(&g_modal_lock);
+    g_modal_lock_ready = true;
     ccfset(g_token, 0, sizeof(g_token));
     ccfset(g_last_error, 0, sizeof(g_last_error));
     // The onboarding lists and the raw rules form live for the whole run, so
@@ -399,6 +441,8 @@ void api::shutdown()
 {
     if (!g_ready) return;
     ccfset(g_token, 0, sizeof(g_token));
+    DeleteCriticalSection(&g_modal_lock);
+    g_modal_lock_ready = false;
     DeleteCriticalSection(&g_err_lock);
     g_ready = false;
 }
@@ -582,6 +626,7 @@ namespace
         char name[128];
         char captcha_key[2048];      // hcaptcha tokens are long
         char captcha_rqtoken[256];
+        char note[256];              // attached to the request, may be empty
     };
 
     struct job_after
@@ -1170,6 +1215,39 @@ namespace
         memfree(j);
     }
 
+    void job_fetch_guild_member(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[96];
+        cnprint(path, sizeof(path), "/guilds/%llu/members/%llu", j->a, j->b);
+
+        http_response res;
+        res.init();
+
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size))
+            {
+                store::guard g;
+                dguild* guild = store::find_guild(j->a);
+                store::add_guild_member(guild, doc.root);
+                store::bump_revision();
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            log_line("rest: member %llu of guild %llu not fetched (http %d)",
+                     j->b, j->a, res.status);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
     void job_open_dm(void* user)
     {
         job_ids* j = (job_ids*)user;
@@ -1218,10 +1296,12 @@ namespace
 
         http_response res;
         res.init();
-        // The field is not optional any more: without it discord refuses to
-        // accept a request from somebody it considers a stranger.
-        if (!(api::call("PUT", path, "{\"confirm_stranger_request\":false}", &res,
-                        "Friends") && res.ok()))
+        // The field is not optional any more: without an explicit true
+        // discord refuses to accept a request from somebody it considers a
+        // stranger (400 code 80013).
+        const char* body = j->b ? "{\"confirm_stranger_request\":true}"
+                                : "{\"confirm_stranger_request\":false}";
+        if (!(api::call("PUT", path, body, &res, "Friends") && res.ok()))
             record_api_error(tr("Заявка в друзья не принята"), &res);
         else
             api::clear_last_error();
@@ -1295,6 +1375,11 @@ namespace
             w.kv_null("discriminator");
         }
 
+        // The note the request carries. The official client sends it beside
+        // the name, and the recipient sees it as a small line with the
+        // request - and as a type-67 message at the top of the fresh DM.
+        if (j->note[0]) w.kv_str("note", j->note);
+
         // Carried only when the person has been through a captcha and handed
         // the token back. Solving it is theirs to do; this passes it on.
         if (j->captcha_key[0]) w.kv_str("captcha_key", j->captcha_key);
@@ -1341,6 +1426,12 @@ namespace
             char msg[192];
             cnprint(msg, sizeof(msg), tr("Заявка отправлена: %s"), j->name);
             api::set_last_error(msg);
+
+            // Solved elsewhere and retried with the token: report the solve
+            // the way the official client does, right after it worked.
+            if (j->captcha_key[0])
+                science::captcha_verified(g_captcha_sitekey, g_captcha_session);
+
             api::clear_captcha();
         }
         else
@@ -1354,12 +1445,15 @@ namespace
             {
                 const char* site = doc.root->str("captcha_sitekey", 0);
                 const char* rq = doc.root->str("captcha_rqtoken", 0);
+                const char* sess = doc.root->str("captcha_session_id", 0);
 
                 ccfset(g_captcha_sitekey, 0, sizeof(g_captcha_sitekey));
                 ccfset(g_captcha_rqtoken, 0, sizeof(g_captcha_rqtoken));
+                ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
 
                 if (site) ccstrncpy(g_captcha_sitekey, site, sizeof(g_captcha_sitekey) - 1);
                 if (rq) ccstrncpy(g_captcha_rqtoken, rq, sizeof(g_captcha_rqtoken) - 1);
+                if (sess) ccstrncpy(g_captcha_session, sess, sizeof(g_captcha_session) - 1);
             }
             doc.free_doc();
 
@@ -3295,14 +3389,149 @@ namespace
 
         char values[8][100];
         int value_count;
+
+        // The message's own flags, echoed back. A Components-V2 message
+        // carries 32768 here; the official client sends what the message
+        // has, so this does the same.
+        int message_flags;
     };
+
+    void stash_modal(const api::modal_form* form)
+    {
+        EnterCriticalSection(&g_modal_lock);
+        g_pending_modal = *form;
+        g_modal_ready = true;
+        LeaveCriticalSection(&g_modal_lock);
+    }
+
+    // One input of a modal: either the input itself or the label wrapped
+    // round it (type 18), or an action row holding it.
+    bool parse_modal_field(const jval* node, api::modal_field* f)
+    {
+        if (!node || node->type != JTYPE_OBJ || !f) return false;
+
+        char wrap_label[160];
+        ccfset(wrap_label, 0, sizeof(wrap_label));
+
+        const jval* input = node;
+        int ntype = node->i32("type", 0);
+
+        if (ntype == V2_LABEL)
+        {
+            const char* l = node->str("label", 0);
+            if (l) ccstrncpy(wrap_label, l, sizeof(wrap_label) - 1);
+
+            input = node->obj("component");
+            if (input->type != JTYPE_OBJ) return false;
+        }
+        else if (ntype == COMP_ROW)
+        {
+            const jval* kids = node->arr("components");
+            if (kids->type != JTYPE_ARR || !kids->count) return false;
+            input = kids->at(0);
+        }
+
+        const char* cid = input->str("custom_id", 0);
+        if (!cid || !cid[0]) return false;
+
+        ccfset(f, 0, sizeof(*f));
+        ccstrncpy(f->custom_id, cid, sizeof(f->custom_id) - 1);
+
+        int kind = input->i32("type", 0);
+        f->kind = kind;
+
+        const char* l = input->str("label", 0);
+        if (l && l[0]) ccstrncpy(f->label, l, sizeof(f->label) - 1);
+        else if (wrap_label[0]) ccstrncpy(f->label, wrap_label, sizeof(f->label) - 1);
+
+        const char* p = input->str("placeholder", 0);
+        if (p) ccstrncpy(f->placeholder, p, sizeof(f->placeholder) - 1);
+
+        f->required = input->boolean("required", false);
+        f->min_len = input->i32("min_length", 0);
+        f->max_len = input->i32("max_length", 0);
+        f->style = input->i32("style", 1);
+
+        const char* v = input->str("value", 0);
+        if (v) ccstrncpy(f->text, v, sizeof(f->text) - 1);
+
+        f->selected = -1;
+        f->min_values = input->i32("min_values", 0);
+        f->max_values = input->i32("max_values", 1);
+
+        const jval* opts = input->arr("options");
+        if (opts->type == JTYPE_ARR)
+        {
+            for (unsigned int o = 0; o < opts->count && f->option_count < 25; o++)
+            {
+                const jval* ov = opts->at(o);
+                api::modal_option* dst = &f->options[f->option_count];
+
+                const char* ol = ov->str("label", 0);
+                const char* ovv = ov->str("value", 0);
+                if (!ol || !ovv) continue;
+
+                ccstrncpy(dst->label, ol, sizeof(dst->label) - 1);
+                ccstrncpy(dst->value, ovv, sizeof(dst->value) - 1);
+
+                const char* od = ov->str("description", 0);
+                if (od) ccstrncpy(dst->description, od, sizeof(dst->description) - 1);
+
+                f->option_count++;
+            }
+        }
+
+        return true;
+    }
+
+    // The "data" half of a type-9 interaction response: the form itself.
+    bool parse_modal_response(const jval* data, api::modal_form* form,
+                              snowflake guild_id, snowflake channel_id,
+                              snowflake application_id)
+    {
+        if (!data || data->type != JTYPE_OBJ || !form) return false;
+
+        ccfset(form, 0, sizeof(*form));
+        form->guild_id = guild_id;
+        form->channel_id = channel_id;
+        form->application_id = application_id;
+
+        const char* title = data->str("title", 0);
+        ccstrncpy(form->title, title && title[0] ? title : tr("Форма"), sizeof(form->title) - 1);
+
+        const char* cid = data->str("custom_id", 0);
+        if (!cid || !cid[0]) return false;
+        ccstrncpy(form->custom_id, cid, sizeof(form->custom_id) - 1);
+
+        // data.id arrives as a string, not a number; absent means the submit
+        // carries no id at all.
+        const char* sid = data->str("id", 0);
+        if (sid) ccstrncpy(form->submit_id, sid, sizeof(form->submit_id) - 1);
+
+        const jval* rows = data->arr("components");
+        if (rows->type != JTYPE_ARR) return false;
+
+        for (unsigned int i = 0; i < rows->count && form->field_count < 12; i++)
+        {
+            api::modal_field f;
+            if (!parse_modal_field(rows->at(i), &f)) continue;
+            form->fields[form->field_count++] = f;
+        }
+
+        return form->field_count > 0;
+    }
 
     // Pressing a button or choosing from a menu.
     //
     // Not a message and not a reaction: it is an interaction, which discord
     // routes to the application that put the component there. The answer is
-    // empty - what happens next arrives over the gateway as the bot editing
-    // its message or sending another, which is why nothing is written here.
+    // usually empty - what happens next arrives over the gateway as the bot
+    // editing its message or sending another.
+    //
+    // Usually. A button that opens a form is answered on the spot with a
+    // type-9 interaction response carrying the form itself, which is parsed
+    // here and handed to the interface. There is no separate fetch for it:
+    // the definition arrives in this response, not over the gateway.
     //
     // The session id is part of it. Discord uses it to decide which of the
     // account's open clients gets shown an ephemeral reply, and an
@@ -3313,6 +3542,7 @@ namespace
 
         unsigned long long nonce = 0;
         crypto::random_bytes(&nonce, sizeof(nonce));
+        note_modal_nonce(nonce);
 
         jwriter w;
         w.init();
@@ -3320,14 +3550,14 @@ namespace
 
         // 3 is "somebody used a component". 2 would be a slash command.
         w.kv_i64("type", 3);
-        w.kv_snowflake("nonce", nonce >> 4);
+        w.kv_snowflake("nonce", nonce);
 
         // Absent in a direct message rather than zero: discord reads a guild
         // id that is not a guild as a request about somewhere else.
         if (j->guild_id) w.kv_snowflake("guild_id", j->guild_id);
 
         w.kv_snowflake("channel_id", j->channel_id);
-        w.kv_i64("message_flags", 0);
+        w.kv_i64("message_flags", j->message_flags);
         w.kv_snowflake("message_id", j->message_id);
         w.kv_snowflake("application_id", j->application_id);
         w.kv_str("session_id", gateway::session_id());
@@ -3353,17 +3583,135 @@ namespace
         http_response res;
         res.init();
 
+        bool ok = api::call("POST", "/interactions", w.buf.c_str(), &res);
+        bool modal = false;
+
+        if (ok && res.status == 200 && res.body.size)
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root &&
+                doc.root->i32("type", 0) == 9)
+            {
+                api::modal_form form;
+                if (parse_modal_response(doc.root->obj("data"), &form,
+                                         j->guild_id, j->channel_id, j->application_id))
+                {
+                    stash_modal(&form);
+                    modal = true;
+                    log_line("interaction: форма \"%s\", полей %d", form.title, form.field_count);
+                }
+            }
+            if (!modal)
+            {
+                // Not a form, but worth seeing once: this request was written
+                // from the protocol rather than from a capture of the real
+                // client, so the first thing worth knowing about a button
+                // that does nothing is what discord said about it.
+                log_line("interaction: ответ %d %.500s", res.status, res.text());
+            }
+            doc.free_doc();
+        }
+
+        if (!modal)
+        {
+            ok = ok && res.ok();
+
+            // Logged either way. This request was written from the protocol
+            // rather than from a capture of the real client, so the first thing
+            // worth knowing about a button that does nothing is what discord said
+            // about it.
+            log_line("interaction: %s %s -> %d %.200s",
+                     j->component_type == COMP_SELECT ? "меню" : "кнопка",
+                     j->custom_id, res.status, res.body.size ? res.text() : "");
+
+            if (!ok) record_api_error(tr("Кнопка не сработала"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    struct modal_submit_args
+    {
+        api::modal_form form;
+    };
+
+    // Sends the filled form back: interaction type 5, shaped after a capture
+    // of the official client. Every field goes back wrapped in its label
+    // node; text answers ride as "value", menus and anything unrecognised
+    // as "values" (null when left empty).
+    void job_modal_submit(void* user)
+    {
+        modal_submit_args* j = (modal_submit_args*)user;
+        const api::modal_form* f = &j->form;
+
+        unsigned long long nonce = 0;
+        crypto::random_bytes(&nonce, sizeof(nonce));
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+
+        w.kv_i64("type", 5);
+        w.kv_snowflake("application_id", f->application_id);
+        w.kv_snowflake("channel_id", f->channel_id);
+        if (f->guild_id) w.kv_snowflake("guild_id", f->guild_id);
+
+        w.key("data");
+        w.begin_obj();
+        if (f->submit_id[0]) w.kv_str("id", f->submit_id);
+        w.kv_str("custom_id", f->custom_id);
+
+        w.key("components");
+        w.begin_arr();
+        for (int i = 0; i < f->field_count; i++)
+        {
+            const api::modal_field* fd = &f->fields[i];
+
+            w.begin_obj();
+            w.kv_i64("type", V2_LABEL);
+            w.key("component");
+            w.begin_obj();
+            w.kv_i64("type", fd->kind);
+            w.kv_str("custom_id", fd->custom_id);
+
+            if (fd->kind == COMP_TEXTINPUT)
+            {
+                w.kv_str("value", fd->text);
+            }
+            else if (fd->selected >= 0 && fd->selected < fd->option_count)
+            {
+                w.key("values");
+                w.begin_arr();
+                w.val_str(fd->options[fd->selected].value);
+                w.end_arr();
+            }
+            else
+            {
+                w.kv_null("values");
+            }
+
+            w.end_obj();
+            w.end_obj();
+        }
+        w.end_arr();
+        w.end_obj();
+
+        w.kv_str("session_id", gateway::session_id());
+        w.kv_snowflake("nonce", nonce);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
         bool ok = api::call("POST", "/interactions", w.buf.c_str(), &res) && res.ok();
 
-        // Logged either way. This request was written from the protocol
-        // rather than from a capture of the real client, so the first thing
-        // worth knowing about a button that does nothing is what discord said
-        // about it.
-        log_line("interaction: %s %s -> %d %.200s",
-                 j->component_type == COMP_SELECT ? "меню" : "кнопка",
-                 j->custom_id, res.status, res.body.size ? res.text() : "");
+        log_line("interaction: форма \"%s\" -> %d %.200s",
+                 f->custom_id, res.status, res.body.size ? res.text() : "");
 
-        if (!ok) record_api_error(tr("Кнопка не сработала"), &res);
+        if (!ok) record_api_error(tr("Форма не отправилась"), &res);
 
         res.free_response();
         w.free_writer();
@@ -3521,6 +3869,14 @@ void api::fetch_channel(snowflake channel_id)
 {
     job_ids* j = make_ids(channel_id, 0);
     if (j) jobs::post(job_fetch_channel, j);
+}
+
+// One guild member by id, for places that name a person without having them
+// in the member list - a voice channel row opening a profile, for example.
+void api::fetch_guild_member(snowflake guild_id, snowflake user_id)
+{
+    job_ids* j = make_ids(guild_id, user_id);
+    if (j) jobs::post(job_fetch_guild_member, j);
 }
 
 void api::open_dm(snowflake user_id)
@@ -4024,9 +4380,18 @@ void api::edit_message(snowflake channel_id, snowflake message_id, const char* c
 
 void api::use_component(snowflake guild_id, snowflake channel_id, snowflake message_id,
                         snowflake application_id, int component_type,
-                        const char* custom_id, const char* const* values, int value_count)
+                        const char* custom_id, const char* const* values, int value_count,
+                        int message_flags)
 {
-    if (!channel_id || !message_id || !application_id || !custom_id) return;
+    if (!channel_id || !message_id || !application_id || !custom_id)
+    {
+        // Silent here used to mean a dead button with no trace: no packet,
+        // no error, no log line. Now at least the log says which part of
+        // the address was missing.
+        log_line("interaction: кнопка без адреса (канал %llu, сообщение %llu, приложение %llu)",
+                 channel_id, message_id, application_id);
+        return;
+    }
 
     interact_args* j = (interact_args*)memalloc(sizeof(interact_args));
     if (!j) return;
@@ -4037,6 +4402,7 @@ void api::use_component(snowflake guild_id, snowflake channel_id, snowflake mess
     j->message_id = message_id;
     j->application_id = application_id;
     j->component_type = component_type;
+    j->message_flags = message_flags;
     ccstrncpy(j->custom_id, custom_id, sizeof(j->custom_id) - 1);
 
     for (int i = 0; i < value_count && j->value_count < 8; i++)
@@ -4047,6 +4413,63 @@ void api::use_component(snowflake guild_id, snowflake channel_id, snowflake mess
     }
 
     jobs::post(job_interact, j);
+}
+
+bool api::take_pending_modal(api::modal_form* out)
+{
+    if (!out) return false;
+
+    EnterCriticalSection(&g_modal_lock);
+    bool got = g_modal_ready;
+    if (got)
+    {
+        *out = g_pending_modal;
+        g_modal_ready = false;
+    }
+    LeaveCriticalSection(&g_modal_lock);
+    return got;
+}
+
+void api::submit_modal(const api::modal_form* form)
+{
+    if (!form || !form->field_count) return;
+
+    modal_submit_args* j = (modal_submit_args*)memalloc(sizeof(modal_submit_args));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->form = *form;
+
+    jobs::post(job_modal_submit, j);
+}
+
+void api::handle_modal_dispatch(const jval* d)
+{
+    if (!d || d->type != JTYPE_OBJ) return;
+
+    // Not our click, not our popup.
+    if (!claim_modal_nonce(d->str("nonce", 0))) return;
+
+    snowflake channel_id = d->sf("channel_id");
+    snowflake application_id = d->obj("application")->sf("id");
+    snowflake guild_id = d->sf("guild_id");
+
+    if (!guild_id && channel_id)
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(channel_id);
+        if (ch) guild_id = ch->guild_id;
+    }
+
+    api::modal_form form;
+    if (!parse_modal_response(d, &form, guild_id, channel_id, application_id))
+    {
+        log_line("interaction: чужую форму с gateway разобрать не вышло");
+        return;
+    }
+
+    stash_modal(&form);
+    log_line("interaction: форма \"%s\" с gateway, полей %d", form.title, form.field_count);
 }
 
 int api::gap_status(snowflake channel_id, snowflake after_id)
@@ -4127,7 +4550,7 @@ void api::ring_call(snowflake channel_id)
 }
 
 void api::send_friend_request(const char* username, const char* captcha_key,
-                              const char* captcha_rqtoken)
+                              const char* captcha_rqtoken, const char* note)
 {
     if (!username || !username[0]) return;
 
@@ -4139,6 +4562,7 @@ void api::send_friend_request(const char* username, const char* captcha_key,
     if (captcha_key) ccstrncpy(j->captcha_key, captcha_key, sizeof(j->captcha_key) - 1);
     if (captcha_rqtoken)
         ccstrncpy(j->captcha_rqtoken, captcha_rqtoken, sizeof(j->captcha_rqtoken) - 1);
+    if (note) ccstrncpy(j->note, note, sizeof(j->note) - 1);
 
     jobs::post(job_friend_by_name, j);
 }
@@ -4148,16 +4572,18 @@ const char* api::launch_signature() { return g_launch_signature; }
 
 const char* api::captcha_sitekey() { return g_captcha_sitekey; }
 const char* api::captcha_rqtoken() { return g_captcha_rqtoken; }
+const char* api::captcha_session() { return g_captcha_session; }
 
 void api::clear_captcha()
 {
     ccfset(g_captcha_sitekey, 0, sizeof(g_captcha_sitekey));
     ccfset(g_captcha_rqtoken, 0, sizeof(g_captcha_rqtoken));
+    ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
 }
 
-void api::accept_friend_request(snowflake user_id)
+void api::accept_friend_request(snowflake user_id, bool confirm)
 {
-    job_ids* j = make_ids(user_id, 0);
+    job_ids* j = make_ids(user_id, confirm ? 1 : 0);
     if (j) jobs::post(job_simple_put_relationship, j);
 }
 

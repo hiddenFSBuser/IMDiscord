@@ -1,13 +1,13 @@
 #include "pch.h"
 #include "crypto.h"
 
-// Scalar multiplication of the P-256 base point.
+// P-256 field arithmetic, scalar multiplication and ECDSA, written by hand
+// so the client depends on no system crypto at all.
 //
-// CNG will not do this: it generates keys and it agrees on secrets, but there
-// is no call that turns a scalar somebody handed us into the matching point.
-// MLS needs exactly that. TreeKEM derives a node secret and both sides have to
-// arrive at the same key pair from it, so the multiplication has to happen
-// here.
+// MLS needs scalar times the base point: TreeKEM derives a node secret and
+// both sides have to arrive at the same key pair from it. ECDH is scalar
+// times the peer's point, and ECDSA needs the group-order arithmetic below
+// alongside it.
 //
 // None of this is on a hot path - a handful of points per epoch - so the
 // reduction is done by long division rather than by the Solinas formula for
@@ -158,10 +158,11 @@ namespace
         }
     }
 
-    // Reduces a 512 bit product, held as sixteen words least significant first.
+    // Reduces a 512 bit product, held as sixteen words least significant first,
+    // modulo whatever prime is handed in (the field p or the group order n).
     // The accumulator needs one word more than the modulus: shifting a value
-    // already below p left by one bit can reach 2p.
-    void reduce_512(const u32 product[16], big* out)
+    // already below the modulus left by one bit can reach twice it.
+    void reduce_mod(const u32 product[16], big* out, const big* mod)
     {
         u32 acc[9];
         for (int i = 0; i < 9; i++) acc[i] = 0;
@@ -179,14 +180,14 @@ namespace
 
             acc[0] |= (product[bit >> 5] >> (bit & 31)) & 1;
 
-            // if acc >= p then acc -= p
+            // if acc >= mod then acc -= mod
             bool ge = acc[8] != 0;
             if (!ge)
             {
                 ge = true;
                 for (int i = 7; i >= 0; i--)
                 {
-                    if (acc[i] != g_p.w[i]) { ge = acc[i] > g_p.w[i]; break; }
+                    if (acc[i] != mod->w[i]) { ge = acc[i] > mod->w[i]; break; }
                     if (i == 0) ge = true;    // exactly equal
                 }
             }
@@ -196,7 +197,7 @@ namespace
                 u64 borrow = 0;
                 for (int i = 0; i < 8; i++)
                 {
-                    u64 diff = (u64)acc[i] - g_p.w[i] - borrow;
+                    u64 diff = (u64)acc[i] - mod->w[i] - borrow;
                     acc[i] = (u32)diff;
                     borrow = (diff >> 32) & 1;
                 }
@@ -224,7 +225,7 @@ namespace
             product[i + 8] = (u32)carry;
         }
 
-        reduce_512(product, r);
+        reduce_mod(product, r, &g_p);
     }
 
     void mod_sqr(big* r, const big* a) { mod_mul(r, a, a); }
@@ -265,6 +266,101 @@ namespace
         unsigned char bytes[32];
         to_bytes(&exponent, bytes);
         mod_exp(r, a, bytes, 32);
+    }
+
+    // ---- arithmetic modulo the group order n, for ECDSA ----
+    // Same shapes as the field layer above, with the order instead of the
+    // prime. Only the signature code uses these; point arithmetic stays mod p.
+
+    void n_add(big* r, const big* a, const big* b)
+    {
+        u32 carry = add_raw(r, a, b);
+        if (carry || compare(r, &g_n) >= 0)
+        {
+            big t;
+            sub_raw(&t, r, &g_n);
+            copy(r, &t);
+        }
+    }
+
+    void n_sub(big* r, const big* a, const big* b)
+    {
+        u32 borrow = sub_raw(r, a, b);
+        if (borrow)
+        {
+            big t;
+            add_raw(&t, r, &g_n);
+            copy(r, &t);
+        }
+    }
+
+    void n_mul(big* r, const big* a, const big* b)
+    {
+        u32 product[16];
+        for (int i = 0; i < 16; i++) product[i] = 0;
+
+        for (int i = 0; i < 8; i++)
+        {
+            u64 carry = 0;
+            for (int j = 0; j < 8; j++)
+            {
+                u64 cur = (u64)a->w[i] * b->w[j] + product[i + j] + carry;
+                product[i + j] = (u32)cur;
+                carry = cur >> 32;
+            }
+            product[i + 8] = (u32)carry;
+        }
+
+        reduce_mod(product, r, &g_n);
+    }
+
+    void n_exp(big* r, const big* a, const unsigned char* e, unsigned int e_len)
+    {
+        big result;
+        set_word(&result, 1);
+
+        for (unsigned int i = 0; i < e_len; i++)
+        {
+            for (int bit = 7; bit >= 0; bit--)
+            {
+                big t;
+                n_mul(&t, &result, &result);
+                copy(&result, &t);
+
+                if ((e[i] >> bit) & 1)
+                {
+                    n_mul(&t, &result, a);
+                    copy(&result, &t);
+                }
+            }
+        }
+        copy(r, &result);
+    }
+
+    // Fermat again: n is prime, so a^(n-2) is the inverse.
+    void n_inv(big* r, const big* a)
+    {
+        big exponent;
+        big two;
+        set_word(&two, 2);
+        sub_raw(&exponent, &g_n, &two);
+
+        unsigned char bytes[32];
+        to_bytes(&exponent, bytes);
+        n_exp(r, a, bytes, 32);
+    }
+
+    // Folds a 256 bit value below 2n into range with one conditional
+    // subtraction. Digests and x coordinates qualify: both sit under 2^256
+    // while n sits above 2^255, and p itself is below 2n.
+    void n_cond_reduce(big* a)
+    {
+        if (compare(a, &g_n) >= 0)
+        {
+            big t;
+            sub_raw(&t, a, &g_n);
+            copy(a, &t);
+        }
     }
 
     // Jacobian coordinates: the affine point is (X/Z^2, Y/Z^3), and Z zero is
@@ -535,4 +631,149 @@ bool crypto::p256_scalar_in_range(const unsigned char scalar[32])
     big d;
     from_bytes(scalar, &d);
     return !is_zero(&d) && compare(&d, &g_n) < 0;
+}
+
+bool crypto::p256_generate(unsigned char public_key[65], unsigned char private_key[96])
+{
+    // A uniform 256 bit string reduced by rejection: zero and anything at or
+    // above the order is not a key, so draw again. The bias the rejection
+    // leaves is below one draw in four billion.
+    for (int tries = 0; tries < 8; tries++)
+    {
+        unsigned char scalar[32];
+        random_bytes(scalar, sizeof(scalar));
+        bool ok = p256_keypair_from_scalar(scalar, public_key, private_key);
+        ccfset(scalar, 0, sizeof(scalar));
+        if (ok) return true;
+    }
+    return false;
+}
+
+bool crypto::p256_sign(const unsigned char private_key[96],
+                       const void* data, unsigned int data_len,
+                       unsigned char* signature, unsigned int* signature_len)
+{
+    ensure_constants();
+
+    big d;
+    from_bytes(private_key + 64, &d);
+    if (is_zero(&d) || compare(&d, &g_n) >= 0) return false;
+
+    unsigned char digest[32];
+    sha256(data, data_len, digest);
+
+    big e;
+    from_bytes(digest, &e);
+    n_cond_reduce(&e);
+
+    // A fresh uniform nonce per signature, FIPS 186-4 style. The deterministic
+    // RFC 6979 variant would do as well; randomness is already depended on for
+    // key generation, so there is nothing extra to trust here.
+    for (int tries = 0; tries < 8; tries++)
+    {
+        unsigned char kb[32];
+        random_bytes(kb, sizeof(kb));
+
+        big k;
+        from_bytes(kb, &k);
+        if (is_zero(&k) || compare(&k, &g_n) >= 0) continue;
+
+        unsigned char kx[32], ky[32];
+        if (!p256_scalar_base_mult(kb, kx, ky))
+        {
+            ccfset(kb, 0, sizeof(kb));
+            continue;
+        }
+        ccfset(kb, 0, sizeof(kb));
+
+        big r;
+        from_bytes(kx, &r);
+        n_cond_reduce(&r);
+        if (is_zero(&r)) continue;
+
+        big kinv, rd, t, s;
+        n_inv(&kinv, &k);
+        n_mul(&rd, &r, &d);
+        n_add(&t, &e, &rd);
+        n_mul(&s, &kinv, &t);
+        if (is_zero(&s)) continue;
+
+        unsigned char raw[64];
+        to_bytes(&r, raw);
+        to_bytes(&s, raw + 32);
+        *signature_len = der_encode_signature(raw, signature);
+        return true;
+    }
+    return false;
+}
+
+bool crypto::p256_verify(const unsigned char public_key[65],
+                         const void* data, unsigned int data_len,
+                         const unsigned char* signature, unsigned int signature_len)
+{
+    ensure_constants();
+
+    if (public_key[0] != 0x04) return false;
+
+    unsigned char raw[64];
+    if (!der_decode_signature(signature, signature_len, raw)) return false;
+
+    big r, s;
+    from_bytes(raw, &r);
+    from_bytes(raw + 32, &s);
+    if (is_zero(&r) || compare(&r, &g_n) >= 0) return false;
+    if (is_zero(&s) || compare(&s, &g_n) >= 0) return false;
+
+    unsigned char digest[32];
+    sha256(data, data_len, digest);
+
+    big e;
+    from_bytes(digest, &e);
+    n_cond_reduce(&e);
+
+    // P = u1*G + u2*Q with u1 = e/s and u2 = r/s; the signature is valid when
+    // P's x folded into [1, n) is r.
+    big w, u1, u2;
+    n_inv(&w, &s);
+    n_mul(&u1, &e, &w);
+    n_mul(&u2, &r, &w);
+
+    unsigned char u1b[32], u2b[32];
+    to_bytes(&u1, u1b);
+    to_bytes(&u2, u2b);
+
+    // The point multiply checks the peer's point is on the curve, which is
+    // the whole invalid-curve defence; a point off it fails here.
+    unsigned char bx[32], by[32];
+    if (!p256_scalar_point_mult(u2b, public_key + 1, public_key + 33, bx, by))
+        return false;
+
+    big rx, ry;
+    if (!is_zero(&u1))
+    {
+        unsigned char ax[32], ay[32];
+        if (!p256_scalar_base_mult(u1b, ax, ay)) return false;
+
+        // One side lifted to Jacobian (Z = 1), the other added as affine.
+        big bxx, bxy, axx, axy;
+        from_bytes(bx, &bxx);
+        from_bytes(by, &bxy);
+        from_bytes(ax, &axx);
+        from_bytes(ay, &axy);
+
+        jacobian jb, sum;
+        copy(&jb.x, &bxx);
+        copy(&jb.y, &bxy);
+        set_word(&jb.z, 1);
+        point_add_affine(&sum, &jb, &axx, &axy);
+        if (!to_affine(&sum, &rx, &ry)) return false;
+    }
+    else
+    {
+        from_bytes(bx, &rx);
+        from_bytes(by, &ry);
+    }
+
+    n_cond_reduce(&rx);
+    return compare(&rx, &r) == 0;
 }

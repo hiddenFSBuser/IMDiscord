@@ -20,6 +20,7 @@
 #include "discord/voice.h"
 #include "video/screenshare.h"
 #include "video/streamview.h"
+#include "video/streampreview.h"
 #include "audio/audio.h"
 #include "audio/noise.h"
 #include "audio/vad.h"
@@ -28,6 +29,7 @@
 #include "video/capture.h"
 #include "net/proxy.h"
 #include "net/http.h"
+#include "net/tlsconn.h"
 #include "system/io/ufile.h"
 #include "stb_image_write.h"
 
@@ -1830,8 +1832,17 @@ void ui_view_login()
     // back in as one of them is a click rather than another paste.
     int remembered = storage::accounts_count();
     float proxy_room = (g_ui.proxy_editing == PROXY_SLOT_DEFAULT) ? 230.0f : 24.0f;
-    ImVec2 size(460.0f, 330.0f + proxy_room +
-                        (remembered > 0 ? 46.0f + remembered * 30.0f : 0.0f));
+    float want_h = 330.0f + proxy_room +
+                   (remembered > 0 ? 46.0f + remembered * 30.0f : 0.0f);
+
+    // The account list grows without bound, and the window used to grow with
+    // it: past screen height the token field, the proxy row and the error
+    // line ended up above the visible area, with NoScrollbar leaving no way
+    // back to them. Cap the window at the viewport; the list scrolls inside.
+    float max_h = vp->WorkSize.y - 30.0f;
+    if (max_h < 320.0f) max_h = 320.0f;
+    if (want_h > max_h) want_h = max_h;
+    ImVec2 size(460.0f, want_h);
     ImGui::SetNextWindowPos(ImVec2(center.x - size.x * 0.5f, center.y - size.y * 0.5f));
     ImGui::SetNextWindowSize(size);
 
@@ -1957,6 +1968,14 @@ void ui_view_login()
         ImGui::Dummy(ImVec2(0, 6));
         ui_text_muted(tr("Сохранённые аккаунты"));
 
+        // Whatever does not fit scrolls here, so the token field, the proxy
+        // row and the error above never leave the screen however long the
+        // list gets. 330 covers the chrome above and below, 46 the header.
+        float list_h = size.y - 330.0f - proxy_room - 46.0f;
+        if (list_h < 80.0f) list_h = 80.0f;
+        ImGui::BeginChild("##loginaccounts", ImVec2(0, list_h), false,
+                          ImGuiWindowFlags_NoMove);
+
         int pick = -1;
         int drop = -1;
 
@@ -1998,6 +2017,8 @@ void ui_view_login()
         // Applied after the loop, which is walking the list being changed.
         if (drop >= 0) storage::account_forget(drop);
         else if (pick >= 0) g_ui.pending_account = pick;
+
+        ImGui::EndChild();
     }
 
     ImGui::Dummy(ImVec2(0, 14));
@@ -2081,6 +2102,7 @@ void ui_init()
     voice::init();
     screenshare::init();
     streamview::init();
+    streampreview::init();
 
 #ifdef IMD_VOICE_TEST
     {
@@ -2345,6 +2367,7 @@ void ui_frame()
     }
 
     ui_view_profile_popup();
+    ui_view_friend_accept_popup();
     ui_view_server_info_popup();
     ui_view_roles_popup();
     ui_view_invites_popup();
@@ -2359,6 +2382,7 @@ void ui_frame()
     ui_view_rename_popup();
     ui_view_onboarding_popup();
     ui_view_token_popup();
+    ui_view_modal_popup();
     ui_view_guild_edit_popup();
     ui_view_channel_info_popup();
     ui_view_share_popup();
@@ -2406,6 +2430,7 @@ void ui_shutdown()
 {
     gateway::stop();
     streamview::shutdown();
+    streampreview::shutdown();
     screenshare::shutdown();
     // The walk gets its minute on a switch; on the way out there is no
     // minute to give it.

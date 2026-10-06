@@ -53,7 +53,13 @@ namespace
         ImGui::PushID((const void*)(size_t)rel->user_id);
 
         ImVec2 start = ImGui::GetCursorScreenPos();
-        float row_h = 52.0f;
+
+        // The note attached to an incoming request, if any. It gets its own
+        // line, so a row carrying one is taller.
+        const char* note = 0;
+        if (rel->type == REL_INCOMING && rel->note && rel->note[0])
+            note = rel->note;
+        float row_h = note ? 70.0f : 52.0f;
 
         // The row is one wide invisible button, and the real controls are put
         // on top of it afterwards by moving the cursor back. Without this the
@@ -98,13 +104,27 @@ namespace
         else if (u->username) sub = u->username;
         dl->AddText(ImVec2(start.x + 54.0f, start.y + 28.0f), col::text_muted, sub);
 
+        if (note)
+        {
+            // One short line, cut on a character boundary. The full text
+            // lives in the accept box and at the top of the DM.
+            char short_note[84];
+            unsigned int n = 0;
+            while (note[n] && n < sizeof(short_note) - 5) n++;
+            while (n > 0 && (((unsigned char)note[n] & 0xC0) == 0x80)) n--;
+            for (unsigned int i = 0; i < n; i++) short_note[i] = note[i];
+            short_note[n] = 0;
+            if (note[n]) ccstrncpy(short_note + n, "...", 4);
+            dl->AddText(ImVec2(start.x + 54.0f, start.y + 44.0f), col::text_muted, short_note);
+        }
+
         float bx = start.x + width - 60.0f;
         ImGui::SetCursorScreenPos(ImVec2(bx - 200.0f, start.y + 12.0f));
 
         if (rel->type == REL_INCOMING)
         {
             if (ui_icon_button(tr("Принять##acc"), ImVec2(96, 28), col::green, col::green))
-                api::accept_friend_request(u->id);
+                ui_open_friend_accept(u->id);
             ImGui::SameLine(0, 6);
             if (ui_icon_button(tr("Отклонить##dec"), ImVec2(96, 28), col::red, col::red))
                 api::remove_relationship(u->id);
@@ -225,6 +245,10 @@ void ui_view_friends(float width, float height)
         // The field being focused is its own step in the sequence the official
         // client sends before a request goes out.
         if (ImGui::IsItemActivated()) science::add_friend_input_clicked();
+
+        ImGui::SetNextItemWidth(340);
+        ImGui::InputTextWithHint("##friendnote", tr("Заметка к заявке (необязательно)"),
+                                 g_ui.friend_note, sizeof(g_ui.friend_note));
         ImGui::SameLine();
         if (ImGui::Button(tr("Отправить заявку"), ImVec2(180, 0)) || go)
         {
@@ -233,7 +257,9 @@ void ui_view_friends(float width, float height)
                 api::clear_captcha();
                 ccstrncpy(g_ui.captcha_for, g_ui.friend_input,
                           sizeof(g_ui.captcha_for) - 1);
-                api::send_friend_request(g_ui.friend_input);
+                ccstrncpy(g_ui.captcha_note, g_ui.friend_note,
+                          sizeof(g_ui.captcha_note) - 1);
+                api::send_friend_request(g_ui.friend_input, 0, 0, g_ui.friend_note);
             }
         }
 
@@ -263,7 +289,7 @@ void ui_view_friends(float width, float height)
                 g_ui.captcha_token[0] && g_ui.captcha_for[0])
             {
                 api::send_friend_request(g_ui.captcha_for, g_ui.captcha_token,
-                                         api::captcha_rqtoken());
+                                         api::captcha_rqtoken(), g_ui.captcha_note);
                 ccfset(g_ui.captcha_token, 0, sizeof(g_ui.captcha_token));
             }
 
@@ -540,6 +566,39 @@ static void draw_group_members(dchannel* c, float width)
                 if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, 0);
                 ui_invite_to_server_menu(c->id);
                 ImGui::Separator();
+
+                // Voice controls for group call participants (same as in server sidebar)
+                if (u->id != store::self_id())
+                {
+                    bool muted = voice::user_muted(u->id);
+                    if (ImGui::MenuItem(muted ? tr("Вернуть звук") : tr("Заглушить"), 0, muted))
+                        voice::set_user_muted(u->id, !muted);
+
+                    ImGui::Separator();
+
+                    float volume = voice::user_volume(u->id);
+                    int percent = (int)(volume * 100.0f + 0.5f);
+
+                    ImGui::TextUnformatted(tr("Громкость"));
+                    ImGui::SetNextItemWidth(200.0f);
+
+                    if (ImGui::SliderInt("##gmvol", &percent, 0, 1000, "%d%%",
+                                         ImGuiSliderFlags_Logarithmic))
+                        voice::set_user_volume(u->id, (float)percent / 100.0f);
+
+                    if (percent > 200)
+                    {
+                        ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+                        ImGui::TextUnformatted(tr("Ограничитель срежет часть прибавки"));
+                        ImGui::PopStyleColor();
+                    }
+
+                    if (percent != 100 && ImGui::MenuItem(tr("Сбросить на 100%")))
+                        voice::set_user_volume(u->id, 1.0f);
+
+                    ImGui::Separator();
+                }
+
                 ui_copy_id_item(u->id, tr("Скопировать ID пользователя"));
                 ui_copy_id_item(c->id, tr("Скопировать ID чата"));
                 ImGui::EndPopup();
@@ -1022,6 +1081,77 @@ namespace
     }
 }
 
+void ui_open_friend_accept(snowflake user_id)
+{
+    g_ui.friend_accept_id = user_id;
+    g_ui.open_friend_accept_popup = true;
+}
+
+void ui_view_friend_accept_popup()
+{
+    if (g_ui.open_friend_accept_popup)
+    {
+        ImGui::OpenPopup("##friendaccept");
+        g_ui.open_friend_accept_popup = false;
+    }
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                                   vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(420, 0));
+
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(col::bg_panel));
+    if (!ImGui::BeginPopupModal("##friendaccept", 0,
+                                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    duser* u = store::find_user(g_ui.friend_accept_id);
+    const char* name = u ? u->display_name() : tr("Аккаунт");
+
+    ImGui::TextUnformatted(tr("Принять заявку в друзья"));
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 4));
+
+    char line[256];
+    cnprint(line, sizeof(line), tr("Добавить %s в друзья?"), name);
+    ImGui::TextWrapped("%s", line);
+
+    // The note they attached, if any. It is the only thing known about a
+    // stranger, so it is shown rather than hidden behind the button.
+    const char* note = u ? store::relationship_note(u->id) : 0;
+    if (note && note[0])
+    {
+        ImGui::Dummy(ImVec2(0, 4));
+        ui_text_muted(note);
+    }
+
+    ImGui::Dummy(ImVec2(0, 8));
+
+    if (ui_icon_button(tr("Принять"), ImVec2(140, 32), col::green, col::green))
+    {
+        if (u)
+        {
+            api::accept_friend_request(u->id, true);
+            g_ui.friend_accept_id = 0;
+        }
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Отмена"), ImVec2(120, 32)) ||
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+    {
+        g_ui.friend_accept_id = 0;
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
+    ImGui::PopStyleColor();
+}
+
 void ui_view_profile_popup()
 {
     if (g_ui.open_profile_popup)
@@ -1208,10 +1338,36 @@ void ui_view_profile_popup()
         }
 
         // The server the profile was opened from, when it was opened from one.
-        dguild* g = store::find_guild(g_ui.active_guild);
+        // The guild the open call named wins over whatever is being read:
+        // voice channel rows open profiles for their own server while the
+        // reader sits in another one (or in direct messages).
+        snowflake profile_guild = g_ui.profile_guild ? g_ui.profile_guild
+                                                      : g_ui.active_guild;
+        dguild* g = store::find_guild(profile_guild);
         if (g)
         {
             dmember* mem = store::find_member(g, u->id);
+
+            // Voice rows name people the member list never loaded: fetch this
+            // one by id (once per opening, then at most every 20 s). The
+            // member lands in the store with roles and the section draws.
+            if (!mem)
+            {
+                static snowflake asked_guild = 0;
+                static snowflake asked_user = 0;
+                static unsigned long long asked_at = 0;
+
+                unsigned long long now = GetTickCount64();
+                if (asked_guild != g->id || asked_user != u->id || now - asked_at > 20000ULL)
+                {
+                    asked_guild = g->id;
+                    asked_user = u->id;
+                    asked_at = now;
+                    api::fetch_guild_member(g->id, u->id);
+                }
+
+                ui_text_muted(tr("Загружаем данные участника..."));
+            }
 
             if (mem && mem->joined_at)
             {
@@ -1223,6 +1379,57 @@ void ui_view_profile_popup()
                     cnprint(line, sizeof(line), tr("На сервере с: %s"), joined);
                     ui_text_muted(line);
                     any = true;
+                }
+            }
+
+            // Roles the user has on this server, in descending hierarchy order
+            // (highest role first, then descending by position).
+            if (mem)
+            {
+                const drole* roles[32];
+                int role_count = 0;
+                for (unsigned int i = 0; i < mem->roles.count; i++)
+                {
+                    const drole* r = store::find_role(g, mem->roles[i]);
+                    if (r && role_count < 32)
+                        roles[role_count++] = r;
+                }
+
+                // Sort by position descending (highest role first)
+                for (int i = 1; i < role_count; i++)
+                {
+                    const drole* moving = roles[i];
+                    int k = i;
+                    while (k > 0 && roles[k - 1]->position < moving->position)
+                    {
+                        roles[k] = roles[k - 1];
+                        k--;
+                    }
+                    roles[k] = moving;
+                }
+
+                if (role_count > 0)
+                {
+                    ImGui::Dummy(ImVec2(0, 8));
+                    ImGui::Separator();
+                    ImGui::Dummy(ImVec2(0, 4));
+
+                    char label[64];
+                    cnprint(label, sizeof(label), tr("Роли (%d)"), role_count);
+                    ui_text_muted(label);
+                    ImGui::Dummy(ImVec2(0, 4));
+
+                    for (int i = 0; i < role_count; i++)
+                    {
+                        const drole* r = roles[i];
+                        ImU32 color = r->color ? IM_COL32((r->color >> 16) & 0xFF,
+                                                          (r->color >> 8) & 0xFF,
+                                                          r->color & 0xFF, 255)
+                                                     : col::text_muted;
+                        ImGui::PushStyleColor(ImGuiCol_Text, color);
+                        ImGui::TextUnformatted(r->name);
+                        ImGui::PopStyleColor();
+                    }
                 }
             }
         }
@@ -1356,7 +1563,7 @@ void ui_view_profile_popup()
         else if (rel == REL_INCOMING)
         {
             if (ui_icon_button(tr("Принять заявку"), ImVec2(150, 32), col::green, col::green))
-                api::accept_friend_request(u->id);
+                ui_open_friend_accept(u->id);
             ImGui::SameLine();
             if (ui_icon_button(tr("Отклонить"), ImVec2(110, 32), col::bg_input, col::red))
                 api::remove_relationship(u->id);

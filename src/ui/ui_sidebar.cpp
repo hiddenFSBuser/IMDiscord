@@ -7,6 +7,7 @@
 #include "core/app.h"
 #include "core/log.h"
 #include "core/storage.h"
+#include "net/tlsconn.h"
 #include "discord/store.h"
 #include "system/io/ufile.h"
 #include "discord/exporter.h"
@@ -22,6 +23,7 @@
 #include "discord/science.h"
 #include "video/screenshare.h"
 #include "video/streamview.h"
+#include "video/streampreview.h"
 
 // ---------------------------------------------------------------------------
 // guild rail
@@ -853,9 +855,21 @@ namespace
                 const dvoice_state* vs = store::find_voice_state(u->id);
                 bool mic_off = vs && (vs->self_mute || vs->mute);
                 bool ears_off = vs && (vs->self_deaf || vs->deaf);
+                bool self = u->id == store::self_id();
+
+                // The same two pictures a server voice channel offers: a
+                // camera and a Go Live stream. A call in a direct message is
+                // an ordinary voice connection to the channel itself, so both
+                // work exactly the way they do on a server.
+                bool shows_cam = voice::camera_on(u->id);
+                bool shows_live = vs && vs->self_stream && !self;
 
                 float reserve = 0.0f;
                 if (mic_off || ears_off) reserve = 6.0f + ((mic_off && ears_off) ? 30.0f : 14.0f);
+                if (shows_cam)
+                    reserve += 6.0f + ImGui::CalcTextSize("CAM").x + 10.0f;
+                if (shows_live)
+                    reserve += 6.0f + ImGui::CalcTextSize("LIVE").x + 10.0f;
 
                 float avail = ImGui::GetContentRegionAvail().x - reserve;
                 if (avail < 20.0f) avail = 20.0f;
@@ -870,6 +884,59 @@ namespace
 
                 if (ImGui::IsItemClicked()) ui_open_profile(u->id, 0);
 
+                if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen("##dmvctx"))
+                {
+                    if (shown != u->display_name())
+                        ImGui::SetTooltip("%s\n%s", u->display_name(), tr("ЛКМ - профиль, ПКМ - звук"));
+                    else
+                        ImGui::SetTooltip("%s", tr("ЛКМ - профиль, ПКМ - звук"));
+                }
+
+                // Right click menu on somebody sitting in a direct-message
+                // call. Local sound only: a direct message has no server to
+                // send a mute to, so unlike the guild menu there is nothing
+                // below the line.
+                if (ImGui::BeginPopupContextItem("##dmvctx"))
+                {
+                    ImGui::TextUnformatted(u->display_name());
+                    ImGui::Separator();
+
+                    if (ImGui::MenuItem(tr("Профиль"))) ui_open_profile(u->id, 0);
+
+                    if (!self)
+                    {
+                        bool muted = voice::user_muted(u->id);
+                        if (ImGui::MenuItem(muted ? tr("Вернуть звук") : tr("Заглушить"), 0, muted))
+                            voice::set_user_muted(u->id, !muted);
+
+                        ImGui::Separator();
+
+                        float volume = voice::user_volume(u->id);
+                        int percent = (int)(volume * 100.0f + 0.5f);
+
+                        ImGui::TextUnformatted(tr("Громкость"));
+                        ImGui::SetNextItemWidth(200.0f);
+
+                        if (ImGui::SliderInt("##dmvol", &percent, 0, 1000, "%d%%",
+                                             ImGuiSliderFlags_Logarithmic))
+                            voice::set_user_volume(u->id, (float)percent / 100.0f);
+
+                        if (percent > 200)
+                        {
+                            ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+                            ImGui::TextUnformatted(tr("Ограничитель срежет часть прибавки"));
+                            ImGui::PopStyleColor();
+                        }
+
+                        if (percent != 100 && ImGui::MenuItem(tr("Сбросить на 100%")))
+                            voice::set_user_volume(u->id, 1.0f);
+                    }
+
+                    ImGui::Separator();
+                    ui_copy_id_item(u->id, tr("Скопировать ID пользователя"));
+                    ImGui::EndPopup();
+                }
+
                 if (mic_off || ears_off)
                 {
                     ImGui::SameLine(0, 6);
@@ -877,6 +944,66 @@ namespace
                     ui_draw_muted_marks(dl, ImVec2(mark.x, mark.y + 2.0f), 13.0f,
                                         mic_off, ears_off);
                     ImGui::Dummy(ImVec2((mic_off && ears_off) ? 30.0f : 14.0f, 13.0f));
+                }
+
+                // A camera, when they have one on. Same badge as on a server.
+                if (shows_cam)
+                {
+                    bool watching = voice::watched_camera() == u->id;
+
+                    ImGui::SameLine(0, 6);
+                    ImGui::PushStyleColor(ImGuiCol_Button, watching ? col::accent : col::bg_panel);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, watching ? col::accent : col::bg_hover);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, col::bg_active);
+                    ImGui::PushStyleColor(ImGuiCol_Text, col::text_normal);
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5, 1));
+
+                    if (ImGui::SmallButton("CAM"))
+                    {
+                        // The decoder is one instance, so opening a
+                        // camera closes whatever else was using it.
+                        if (watching) voice::watch_camera(0);
+                        else
+                        {
+                            if (streamview::watching_user()) streamview::stop();
+                            voice::watch_camera(u->id);
+                        }
+                    }
+
+                    ImGui::PopStyleVar();
+                    ImGui::PopStyleColor(4);
+
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(watching ? tr("Закрыть камеру")
+                                                   : tr("Смотреть камеру"));
+                }
+
+                // Anybody sharing their screen gets a badge that opens it.
+                // A direct-message call has no guild, so the stream key is
+                // the call one - channel and person, nothing else.
+                if (shows_live)
+                {
+                    bool watching = streamview::watching_user() == u->id;
+
+                    ImGui::SameLine(0, 6);
+                    ImGui::PushStyleColor(ImGuiCol_Button, watching ? col::green : col::bg_panel);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, watching ? col::green : col::bg_hover);
+                    ImGui::PushStyleColor(ImGuiCol_ButtonActive, col::bg_active);
+                    ImGui::PushStyleColor(ImGuiCol_Text, watching ? col::text_normal : col::red);
+                    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(5, 1));
+
+                    if (ImGui::SmallButton("LIVE"))
+                    {
+                        if (watching) streamview::stop();
+                        else          streamview::watch(0, c->id, u->id);
+                    }
+
+                    ImGui::PopStyleVar();
+                    ImGui::PopStyleColor(4);
+
+                    if (ImGui::IsItemHovered())
+                        streampreview::tooltip(0, c->id, u->id, watching,
+                                               u->display_name());
                 }
 
                 ImGui::Unindent(18.0f);
@@ -1331,8 +1458,8 @@ void ui_view_channel_list(float width, float height)
                                 ImGui::PopStyleColor(4);
 
                                 if (ImGui::IsItemHovered())
-                                    ImGui::SetTooltip(watching ? tr("Закрыть демонстрацию")
-                                                               : tr("Смотреть демонстрацию"));
+                                    streampreview::tooltip(g->id, c->id, u->id, watching,
+                                                           u->display_name());
                             }
 
                             ImGui::Unindent(18.0f);
@@ -1714,7 +1841,11 @@ void ui_view_settings_popup()
 
     export_attachments attach_mode = save_files ? EXPORT_SAVE_FILES : EXPORT_LINKS_ONLY;
 
-    if (ImGui::Button(tr("Экспортировать этот канал"), ImVec2(-1, 0)) && g_ui.active_channel)
+    if (exporter::exporting())
+    {
+        ui_text_muted(exporter::export_status());
+    }
+    else if (ImGui::Button(tr("Экспортировать этот канал"), ImVec2(-1, 0)) && g_ui.active_channel)
     {
         wchar_t suggested[64];
         chartowcs("chat.html", suggested, 64);
@@ -1722,10 +1853,9 @@ void ui_view_settings_popup()
         wchar_t chosen[MAX_PATH];
         if (ufile::save_dialog(suggested, chosen, MAX_PATH))
         {
-            if (exporter::channel_to_html(g_ui.active_channel, chosen, attach_mode))
-                api::set_last_error(tr("Экспорт готов"));
-            else
-                api::set_last_error(tr("Экспортировать не удалось"));
+            // Warmed first on a worker thread: a channel nobody scrolled to
+            // the start of exports its whole history, not the last page.
+            exporter::export_channel_async(g_ui.active_channel, chosen, attach_mode);
         }
     }
 
@@ -2447,6 +2577,44 @@ void ui_view_settings_popup()
     ImGui::Text(tr("Шлюз: %s"), gateway::status_text());
     ImGui::Text(tr("Текстур в памяти: %u КБ"), tex::memory_used() / 1024);
     ImGui::Text(tr("Загрузок в очереди: %d"), tex::pending_downloads());
+
+    ImGui::Dummy(ImVec2(0, 10));
+    ImGui::TextUnformatted(tr("Дамп пакетов"));
+    ImGui::Separator();
+
+    static char dbg_types[256];
+    static bool dbg_types_loaded = false;
+    if (!dbg_types_loaded)
+    {
+        gateway::dispatch_debug_filter(dbg_types, sizeof(dbg_types));
+        dbg_types_loaded = true;
+    }
+
+    bool dbg = gateway::dispatch_debug();
+    if (ImGui::Checkbox(tr("Писать dispatch-пакеты в лог"), &dbg))
+    {
+        storage::settings_set_int("gw_dump", dbg ? 1 : 0);
+        storage::settings_save();
+        gateway::set_dispatch_debug(dbg, dbg_types);
+        gateway::dispatch_debug_filter(dbg_types, sizeof(dbg_types));
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip(tr("Сырые пакеты шлюза в imdiscord.log (READY целиком - в gateway_ready.json "
+                          "рядом). Осторожно: на оживлённом аккаунте лог растёт быстро, "
+                          "включай с фильтром."));
+
+    ImGui::SetNextItemWidth(-1);
+    if (ImGui::InputTextWithHint("##gwdbgtypes", tr("Типы через запятую, пусто - все"),
+                                 dbg_types, sizeof(dbg_types)))
+    {
+        // Applied live while typing; saved when done.
+        gateway::set_dispatch_debug(gateway::dispatch_debug(), dbg_types);
+    }
+    if (ImGui::IsItemDeactivatedAfterEdit())
+    {
+        storage::settings_set("gw_dump_types", dbg_types);
+        storage::settings_save();
+    }
 
     ImGui::EndChild();
 

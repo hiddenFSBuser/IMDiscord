@@ -12448,6 +12448,29 @@ int SSL_set_io(struct TLSContext *context, SOCKET_RECV_CALLBACK recv_cb, SOCKET_
 
 #ifdef TLS_SRTP
 
+struct srtp_stream_state {
+    unsigned int ssrc;
+    unsigned int roc;
+    unsigned short seq;
+    unsigned int touched;   // zero means the slot is empty
+};
+
+// One rollover counter per SSRC. RFC 3711 keeps the ROC per stream, and a
+// voice call multiplexes one RTP stream per speaker plus one per camera on
+// the same UDP socket and the same SRTP session, each with its own sequence
+// numbering. A single shared counter mistakes another speaker's sequence
+// space for a rollover: the first packet from a second SSRC whose number is
+// lower than the last one seen bumps the ROC, the HMAC is then computed over
+// the wrong counter, and every packet but the winner's fails integrity and
+// is dropped. The symptom is hearing only some of the people in the channel.
+#define SRTP_SSRC_SLOTS 24
+// How many counters to try for a stream never seen. A speaker that has been
+// talking for a while is already past zero, so joining mid-call would
+// otherwise never sync: a wrong counter fails every packet and so never
+// advances. Each candidate is verified by the tag before anything is
+// decrypted with it, so guessing is safe.
+#define SRTP_NEW_ROC_PROBES 32
+
 struct SRTPContext {
     symmetric_CTR aes;
     unsigned int salt[4];
@@ -12458,8 +12481,9 @@ struct SRTPContext {
     unsigned char rtcp_mac[TLS_SHA1_MAC_SIZE];
 
     unsigned int tag_size;
-    unsigned int roc;
-    unsigned short seq;
+
+    struct srtp_stream_state streams[SRTP_SSRC_SLOTS];
+    unsigned int stream_clock;
 
     unsigned char mode;
     unsigned char auth_mode;
@@ -12594,6 +12618,82 @@ int srtp_inline(struct SRTPContext *context, const char *b64, int tag_bits) {
     return TLS_GENERIC_ERROR;
 }
 
+// Finds the rollover state for an SSRC, allocating a slot for a new one.
+// A slot whose touched is zero is empty and stays that way until the first
+// packet that verifies: a newcomer whose counter is still unknown must
+// neither evict real state nor be treated as known at ROC 0. When every slot
+// is taken the stalest one is reused.
+static struct srtp_stream_state *srtp_stream_slot(struct SRTPContext *context, unsigned int ssrc) {
+    struct srtp_stream_state *empty = NULL;
+    struct srtp_stream_state *oldest = NULL;
+    int i;
+    for (i = 0; i < SRTP_SSRC_SLOTS; i++) {
+        struct srtp_stream_state *st = &context->streams[i];
+        if (st->touched && st->ssrc == ssrc)
+            return st;
+        if (!st->touched) {
+            if (!empty)
+                empty = st;
+        } else if (!oldest || st->touched < oldest->touched) {
+            oldest = st;
+        }
+    }
+    if (empty) {
+        empty->ssrc = ssrc;
+        empty->roc = 0;
+        empty->seq = 0;
+        return empty;
+    }
+    oldest->ssrc = ssrc;
+    oldest->roc = 0;
+    oldest->seq = 0;
+    oldest->touched = 0;
+    return oldest;
+}
+
+// Marks a slot freshly used. The clock never holds zero, so zero keeps
+// meaning empty even when the counter wraps.
+static void srtp_stream_touch(struct SRTPContext *context, struct srtp_stream_state *st) {
+    context->stream_clock++;
+    if (!context->stream_clock)
+        context->stream_clock = 1;
+    st->touched = context->stream_clock;
+}
+
+// Checks the tag against HMAC(header || ciphertext || roc). Returns 0 when
+// it matches, so a counter can be tried before anything is decrypted with it.
+static int srtp_check_tag(struct SRTPContext *context, unsigned char rtcp,
+                          const unsigned char *pt_header, int pt_len,
+                          const unsigned char *cipher, unsigned int cipher_len,
+                          unsigned int roc) {
+    unsigned char digest_out[TLS_SHA1_MAC_SIZE];
+    unsigned long dlen = TLS_SHA1_MAC_SIZE;
+    hmac_state hmac;
+    int err;
+    unsigned int roc_be = htonl(roc);
+    if (rtcp)
+        err = hmac_init(&hmac, find_hash("sha1"), context->rtcp_mac, sizeof(context->rtcp_mac));
+    else
+        err = hmac_init(&hmac, find_hash("sha1"), context->mac, sizeof(context->mac));
+    if (!err) {
+        if (pt_len)
+            err = hmac_process(&hmac, pt_header, pt_len);
+        if (!err && cipher_len)
+            err = hmac_process(&hmac, cipher, cipher_len);
+        if (!err)
+            err = hmac_process(&hmac, (unsigned char *)&roc_be, 4);
+        if (!err)
+            err = hmac_done(&hmac, digest_out, &dlen);
+    }
+    if (err)
+        return TLS_GENERIC_ERROR;
+    if (dlen > context->tag_size)
+        dlen = context->tag_size;
+    if (memcmp(digest_out, cipher + cipher_len, dlen))
+        return TLS_INTEGRITY_FAILED;
+    return 0;
+}
+
 int srtp_encrypt(struct SRTPContext *context, unsigned char rtcp, const unsigned char *pt_header, int pt_len, const unsigned char *payload, unsigned int payload_len, unsigned char *out, int *out_buffer_len) {
     if ((!context) || (!out) || (!out_buffer_len) || (*out_buffer_len < payload_len))
         return TLS_GENERIC_ERROR;
@@ -12601,16 +12701,27 @@ int srtp_encrypt(struct SRTPContext *context, unsigned char rtcp, const unsigned
     int out_len = payload_len;
 
     unsigned short seq = 0;
-    unsigned int roc = context->roc;
+    unsigned int roc = 0;
     unsigned int ssrc = 0;
 
     if ((pt_header) && (pt_len >= 12)) {
         seq = ntohs(*((unsigned short *)&pt_header[2]));
         ssrc = ntohl(*((unsigned long *)&pt_header[8]));
-    }
 
-    if (seq < context->seq)
-        roc++;
+        // Our own numbering runs monotonically per SSRC, so the counter only
+        // moves on a wrap - tracked per stream, the same as on receive.
+        {
+            struct srtp_stream_state *st = srtp_stream_slot(context, ssrc);
+            if (st->touched) {
+                roc = st->roc;
+                if (seq < st->seq)
+                    roc++;
+            }
+            st->roc = roc;
+            st->seq = seq;
+            srtp_stream_touch(context, st);
+        }
+    }
 
     unsigned int roc_be = htonl(roc);
     if (context->mode) {
@@ -12663,83 +12774,107 @@ int srtp_encrypt(struct SRTPContext *context, unsigned char rtcp, const unsigned
         *out_buffer_len += dlen;
         memcpy(out + out_len, digest_out, dlen);
     }
-    context->roc = roc;
-    context->seq = seq;
     return 0;
 }
 
 int srtp_decrypt(struct SRTPContext *context, unsigned char rtcp, const unsigned char *pt_header, int pt_len, const unsigned char *payload, unsigned int payload_len, unsigned char *out, int *out_buffer_len) {
+    unsigned short seq;
+    unsigned int ssrc;
+    struct srtp_stream_state *st;
+    unsigned int candidates[SRTP_NEW_ROC_PROBES + 2];
+    int ncand = 0;
+    int i;
+
     if ((!context) || (!out) || (!out_buffer_len) || (*out_buffer_len < payload_len) || (payload_len < context->tag_size) || (!pt_header) || ((pt_len < 12) && (!rtcp)) || ((pt_len < 8) && (rtcp)))
         return TLS_GENERIC_ERROR;
 
-    int out_len = payload_len;
+    seq = ntohs(*((unsigned short *)&pt_header[2]));
+    if (rtcp)
+        ssrc = ntohl(*((unsigned long *)&pt_header[4]));
+    else
+        ssrc = ntohl(*((unsigned long *)&pt_header[8]));
 
-    unsigned short seq = ntohs(*((unsigned short *)&pt_header[2]));
-    unsigned int roc = context->roc;
-    unsigned int ssrc = rtcp ? ntohl(*((unsigned long *)&pt_header[4])) : ntohl(*((unsigned long *)&pt_header[8]));
+    st = srtp_stream_slot(context, ssrc);
 
-    if (seq < context->seq)
-        roc++;
+    if (st->touched) {
+        // The counter this stream was left at first: the common case, one
+        // tag computation, exactly as before.
+        candidates[ncand++] = st->roc;
+        // Then the next one up, for a rollover that happened since.
+        candidates[ncand++] = st->roc + 1;
+        // Then the one below, for a packet held back from before the last
+        // rollover. An older packet verifies here and still decodes; only
+        // the stored counter is left alone, because the stream has moved on.
+        if (st->roc > 0)
+            candidates[ncand++] = st->roc - 1;
+    } else if (context->auth_mode == SRTP_AUTH_HMAC_SHA1) {
+        // Never seen: probe the first counters in order. The right one is
+        // the one the tag verifies with.
+        for (i = 0; i < SRTP_NEW_ROC_PROBES; i++)
+            candidates[ncand++] = (unsigned int)i;
+    } else {
+        // No authentication to verify against, so there is nothing to probe
+        // with: assume the stream starts at zero like our own transmissions.
+        candidates[ncand++] = 0;
+    }
 
-    unsigned int roc_be = htonl(roc);
-    if (context->mode) {
+    for (i = 0; i < ncand; i++) {
+        unsigned int roc = candidates[i];
+        unsigned int roc_be = htonl(roc);
         unsigned int counter[4];
+        unsigned int cipher_len = payload_len - context->tag_size;
+
         counter[0] = context->salt[0];
         counter[1] = context->salt[1] ^ htonl (ssrc);
         counter[2] = context->salt[2] ^ roc_be;
-        if (rtcp) {
-            uint32_t srtcp_index = ntohl(*(uint32_t *)&payload[payload_len - context->tag_size - 4]) & 0x7FFFFFFF;
-            counter[3] = context->salt[3] ^ htonl (srtcp_index);
-            // ((unsigned cscrhar *)payload)[payload_len - context->tag_size - 4] &= 0x7F;
-            // DEBUG_DUMP_HEX_LABEL("MODIFIED PACKET", payload, payload_len);
-            ctr_setiv((unsigned char *)&counter, 16, &context->rtcp_aes);
-            if (payload_len - context->tag_size - 4 < 0)
-                return TLS_GENERIC_ERROR;
-            if (ctr_decrypt(payload, out, payload_len - context->tag_size - 4, &context->rtcp_aes))
-                return TLS_GENERIC_ERROR;
-        } else {
-            counter[3] = context->salt[3] ^ htonl (seq << 16);
-            ctr_setiv((unsigned char *)&counter, 16, &context->aes);
-            if (ctr_decrypt(payload, out, payload_len - context->tag_size, &context->aes))
-                return TLS_GENERIC_ERROR;
+        if (context->mode) {
+            if (rtcp) {
+                uint32_t srtcp_index;
+                if (payload_len < context->tag_size + 4)
+                    return TLS_GENERIC_ERROR;
+                srtcp_index = ntohl(*(uint32_t *)&payload[payload_len - context->tag_size - 4]) & 0x7FFFFFFF;
+                counter[3] = context->salt[3] ^ htonl (srtcp_index);
+            } else {
+                counter[3] = context->salt[3] ^ htonl (seq << 16);
+            }
         }
 
+        // Verified before anything is decrypted with it: a wrong counter
+        // only costs the next candidate, never a dropped packet.
         if (context->auth_mode == SRTP_AUTH_HMAC_SHA1) {
-            unsigned char digest_out[TLS_SHA1_MAC_SIZE];
-            unsigned long dlen = TLS_SHA1_MAC_SIZE;
-            hmac_state hmac;
-            int err;
-            if (rtcp)
-                err = hmac_init(&hmac, find_hash("sha1"), context->rtcp_mac, sizeof(context->rtcp_mac));
-            else
-                err = hmac_init(&hmac, find_hash("sha1"), context->mac, sizeof(context->mac));
-            if (!err) {
-                if (pt_len)
-                    err = hmac_process(&hmac, pt_header, pt_len);
-                if ((payload_len - context->tag_size) > 0)
-                    err = hmac_process(&hmac, payload, payload_len - context->tag_size);
-                err = hmac_process(&hmac, (unsigned char *)&roc_be, 4);
-                if (!err)
-                    err = hmac_done(&hmac, digest_out, &dlen);
-            }
-            if (err)
-                return TLS_GENERIC_ERROR;
-            if (dlen > context->tag_size)
-                dlen = context->tag_size;
-
-            if (memcmp(digest_out, payload + payload_len - context->tag_size, dlen)) {
-                DEBUG_DUMP_HEX_LABEL("SRTP INTEGRITY FAILED (computed)", digest_out, dlen);
-                DEBUG_DUMP_HEX_LABEL("SRTP INTEGRITY FAILED (expected)", payload + payload_len - context->tag_size, dlen);
-                return TLS_INTEGRITY_FAILED;
-            }
+            if (srtp_check_tag(context, rtcp, pt_header, pt_len,
+                               payload, cipher_len, roc))
+                continue;
         }
-    } else {
-        memcpy(out, payload, payload_len - context->tag_size);
+
+        if (context->mode) {
+            if (rtcp) {
+                ctr_setiv((unsigned char *)&counter, 16, &context->rtcp_aes);
+                if (ctr_decrypt(payload, out, payload_len - context->tag_size - 4, &context->rtcp_aes))
+                    return TLS_GENERIC_ERROR;
+            } else {
+                ctr_setiv((unsigned char *)&counter, 16, &context->aes);
+                if (ctr_decrypt(payload, out, payload_len - context->tag_size, &context->aes))
+                    return TLS_GENERIC_ERROR;
+            }
+        } else {
+            memcpy(out, payload, payload_len - context->tag_size);
+        }
+
+        // Only a packet newer than everything stored moves the stream
+        // forward. The subtraction is in 16-bit wrap arithmetic, so a
+        // rollover still reads as forward and a late duplicate as back.
+        if (!st->touched || (short)(unsigned short)(seq - st->seq) > 0) {
+            st->roc = roc;
+            st->seq = seq;
+        }
+        srtp_stream_touch(context, st);
+
+        *out_buffer_len = payload_len - context->tag_size;
+        return 0;
     }
-    context->seq = seq;
-    context->roc = roc;
-    *out_buffer_len = payload_len - context->tag_size;
-    return 0;
+
+    return TLS_INTEGRITY_FAILED;
 }
 
 void srtp_destroy(struct SRTPContext *context) {

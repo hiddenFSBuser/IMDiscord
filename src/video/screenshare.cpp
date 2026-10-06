@@ -1459,8 +1459,9 @@ namespace
 
         // Here rather than at start(): this is the moment there is actually
         // something going out, and a chime for a share that then failed to
-        // negotiate would be a lie.
-        sounds::play(SOUND_STREAM_START);
+        // negotiate would be a lie. Quiet during a 4014 recovery: an
+        // auto-restored share is one rotation, not a new event.
+        if (!voice::hushed()) sounds::play(SOUND_STREAM_START);
 
         // A viewer joining later needs an IDR to start from.
         for (int i = 0; i < g_layer_count; i++) venc::request_keyframe(&g_layers[i].enc);
@@ -1889,6 +1890,28 @@ namespace
             g_pump_thread = CreateThread(0, 0, pump_thread, 0, 0, 0);
     }
 
+    // What was being shared when the connection went.
+    //
+    // Same story as watching somebody else: a replaced gateway session takes
+    // the share with it, and the call comes back a few seconds later without
+    // it. The settings are all still in the globals the share was started
+    // with, so there is nothing to remember except that it was running and
+    // when.
+    bool g_again = false;
+    unsigned long long g_again_at = 0;
+
+    // Stops a share whose socket died underneath it, on a thread of its own:
+    // stopping waits for the websocket thread, which is the one asking. The
+    // share is remembered afterwards, so restore_if_pending brings it back -
+    // stop() itself always forgets.
+    DWORD WINAPI share_died_thread(LPVOID)
+    {
+        screenshare::stop();
+        g_again = true;
+        g_again_at = GetTickCount64();
+        return 0;
+    }
+
     DWORD WINAPI ws_thread(LPVOID)
     {
         CoInitializeEx(0, COINIT_MULTITHREADED);
@@ -1978,6 +2001,19 @@ namespace
 
         msg.free_buffer();
         log_line("share: websocket loop ended (close %u)", g_ws.close_status);
+
+        // Involuntary death (the server hung up on us): the machinery stops,
+        // but the share is remembered for restore_if_pending. A stop the
+        // person asked for already cleared g_running, so this never
+        // resurrects one - and stopping here would wait on this very thread.
+        if (g_running)
+        {
+            log_line("share: связь оборвалась - вернём демонстрацию после переподключения");
+            HANDLE h = CreateThread(0, 0, share_died_thread, 0, 0, 0);
+            if (h) CloseHandle(h);
+            else log_line("share: нет потока на остановку, демонстрация повисла до ручной");
+        }
+
         CoUninitialize();
         return 0;
     }
@@ -2022,15 +2058,6 @@ void screenshare::set_audio(bool on)
 
 bool screenshare::audio_running() { return loopback::running(); }
 const char* screenshare::audio_error() { return loopback::last_error(); }
-
-// What was being shared when the connection went.
-//
-// Same story as watching somebody else: a replaced gateway session takes the
-// share with it, and the call comes back a few seconds later without it. The
-// settings are all still in the globals the share was started with, so there
-// is nothing to remember except that it was running and when.
-static bool g_again = false;
-static unsigned long long g_again_at = 0;
 
 bool screenshare::start(int monitor_index, int max_width, int max_height, int fps,
                         int bitrate_kbps, bool with_audio, int method)
@@ -2147,8 +2174,9 @@ void screenshare::stop()
 
     // Our own share. The voice state dispatch that announces it names us, and
     // the handler there deliberately skips ourselves - a client chiming at its
-    // own actions twice is worse than not chiming at all.
-    sounds::play(SOUND_STREAM_STOP);
+    // own actions twice is worse than not chiming at all. Quiet during a 4014
+    // recovery for the same reason.
+    if (!voice::hushed()) sounds::play(SOUND_STREAM_STOP);
 
     InterlockedExchange(&g_running, 0);
 
@@ -2255,6 +2283,25 @@ void screenshare::restore_if_pending()
 
     if (voice::state() != VOICE_CONNECTED) return;
     if (g_running) { g_again = false; return; }
+
+    // Auto-restore is for one outage, not for a server that keeps hanging
+    // up: three restarts inside five minutes means something restarting will
+    // not fix, and looping capture restarts is worse than a stream staying
+    // down until a person asks for it.
+    {
+        static int tries = 0;
+        static unsigned long long window = 0;
+
+        unsigned long long now = GetTickCount64();
+        if (now - window > 300000ULL) { tries = 0; window = now; }
+
+        if (++tries > 3)
+        {
+            g_again = false;
+            log_line("share: обрывы слишком частые, автовозврат выключен - запусти вручную");
+            return;
+        }
+    }
 
     g_again = false;
 

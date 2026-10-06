@@ -878,10 +878,38 @@ void tex::collect()
 
 bool tex::fetch_blob(const char* url, ubuffer* out)
 {
+    if (!g_ready || !url || !url[0] || !out) return false;
+
+    // The bytes on disk first. A picture that rendered did so from these,
+    // and the address they came from may be long dead - attachment urls
+    // expire, so a fresh request for an old picture is refused while the
+    // copy on disk is still exactly the file. Copy and download both go
+    // through here, which is why a picture could be seen but neither copied
+    // nor saved.
+    if ((int)g_cache_hours > 0)
+    {
+        wchar_t path[MAX_PATH];
+        cache_path(ccscrc64(url), path, MAX_PATH);
+
+        if (path[0])
+        {
+            ubuffer blob;
+            blob.init();
+            if (ufile::read_all(path, &blob) && blob.size > 16)
+            {
+                out->append(blob.data, blob.size);
+                blob.free_buffer();
+                return true;
+            }
+            blob.free_buffer();
+        }
+    }
+
     http_response res;
     res.init();
     bool ok = http::get(url, &res) && res.ok();
     if (ok) out->append(res.body.data, res.body.size);
+    else log_line("tex: fetch_blob %s -> http %d", url, res.status);
     res.free_response();
     return ok;
 }

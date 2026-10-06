@@ -69,11 +69,20 @@ namespace voice
     const char* last_stop_reason();
     unsigned short last_close_code();
 
+    // Quiets the notification sounds for a while. A 4014 is discord rotating
+    // the voice server, not anybody leaving: the call drops and comes back
+    // within seconds, and chiming every leave, join and stream stop/start in
+    // between is noise about nothing. Manual actions clear it first, so
+    // something the person did themselves still sounds.
+    void hush(unsigned long long ms);
+    bool hushed();
+
     // ---- cameras ---------------------------------------------------------
     //
     // Somebody else's webcam. It rides the voice connection already open, on
-    // its own source, so there is nothing to connect to and nothing to request
-    // - a camera simply starts arriving.
+    // its own source. Watching one subscribes to it with op 15
+    // MEDIA_SINK_WANTS first: without the subscription the server forwards
+    // nothing and the window waits forever.
     //
     // One is decoded at a time, and it is the one being watched. The Media
     // Foundation decoder is a single instance shared with the stream viewer,
@@ -91,6 +100,15 @@ namespace voice
     int camera_width();
     int camera_height();
     unsigned int camera_frames();
+
+    // What the camera path has done since the watched camera was opened:
+    // packets heard from every camera, frames the watched one assembled,
+    // frames its reassembler threw away, and the video source subscribed to.
+    // The window shows these, because a picture that never arrives is
+    // otherwise indistinguishable from a window that never asked.
+    unsigned int camera_packets();
+    unsigned int camera_dropped();
+    unsigned int camera_video_ssrc();
 
     bool is_speaking(snowflake user_id);
     float speaking_level(snowflake user_id);

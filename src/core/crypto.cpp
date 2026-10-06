@@ -1,13 +1,8 @@
 #include "pch.h"
 #include "crypto.h"
 #include "log.h"
-#include <bcrypt.h>
 
-#pragma comment(lib, "bcrypt.lib")
-
-#ifndef STATUS_SUCCESS
-#define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
-#endif
+extern "C" unsigned char __stdcall SystemFunction036(void* buffer, unsigned long length);
 
 namespace crypto
 {
@@ -18,10 +13,11 @@ namespace crypto
 
 void random_bytes(void* out, unsigned int len)
 {
-    if (BCryptGenRandom(0, (PUCHAR)out, len, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == STATUS_SUCCESS)
+    // RtlGenRandom out of advapi32, which is linked anyway. No bcrypt involved.
+    if (len && SystemFunction036(out, (unsigned long)len))
         return;
 
-    // Fall back to a time/counter mix; only reached if bcrypt is unavailable.
+    // Fall back to a time/counter mix; only reached if the system RNG fails.
     unsigned char* p = (unsigned char*)out;
     LARGE_INTEGER qpc;
     QueryPerformanceCounter(&qpc);
@@ -154,6 +150,105 @@ void sha256(const void* data, unsigned int len, unsigned char out[32])
 }
 
 // ---------------------------------------------------------------------------
+// sha1 (FIPS 180-4; the websocket handshake is its only user)
+// ---------------------------------------------------------------------------
+
+static inline unsigned int rotl32(unsigned int x, int n) { return (x << n) | (x >> (32 - n)); }
+
+static void sha1_compress(unsigned int state[5], const unsigned char block[64])
+{
+    unsigned int w[80];
+    for (int i = 0; i < 16; i++)
+    {
+        w[i] = ((unsigned int)block[i * 4 + 0] << 24) | ((unsigned int)block[i * 4 + 1] << 16) |
+               ((unsigned int)block[i * 4 + 2] << 8) | ((unsigned int)block[i * 4 + 3]);
+    }
+    for (int i = 16; i < 80; i++)
+        w[i] = rotl32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+
+    unsigned int a = state[0], b = state[1], c = state[2], d = state[3], e = state[4];
+
+    for (int i = 0; i < 80; i++)
+    {
+        unsigned int f, k;
+        if (i < 20)      { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+        else if (i < 40) { f = b ^ c ^ d;            k = 0x6ED9EBA1; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+        else             { f = b ^ c ^ d;            k = 0xCA62C1D6; }
+
+        unsigned int t = rotl32(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = rotl32(b, 30); b = a; a = t;
+    }
+
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d; state[4] += e;
+}
+
+void sha1_init(sha1_ctx* ctx)
+{
+    ctx->state[0] = 0x67452301; ctx->state[1] = 0xEFCDAB89;
+    ctx->state[2] = 0x98BADCFE; ctx->state[3] = 0x10325476;
+    ctx->state[4] = 0xC3D2E1F0;
+    ctx->length = 0;
+    ctx->block_len = 0;
+}
+
+void sha1_update(sha1_ctx* ctx, const void* data, unsigned int len)
+{
+    const unsigned char* p = (const unsigned char*)data;
+    ctx->length += len;
+
+    while (len > 0)
+    {
+        unsigned int space = 64 - ctx->block_len;
+        unsigned int take = len < space ? len : space;
+        ccpy(ctx->block + ctx->block_len, p, take);
+        ctx->block_len += take;
+        p += take;
+        len -= take;
+
+        if (ctx->block_len == 64)
+        {
+            sha1_compress(ctx->state, ctx->block);
+            ctx->block_len = 0;
+        }
+    }
+}
+
+void sha1_final(sha1_ctx* ctx, unsigned char out[20])
+{
+    unsigned long long bits = ctx->length * 8;
+
+    unsigned char pad = 0x80;
+    sha1_update(ctx, &pad, 1);
+
+    unsigned char zero = 0;
+    while (ctx->block_len != 56) sha1_update(ctx, &zero, 1);
+
+    unsigned char tail[8];
+    for (int i = 0; i < 8; i++) tail[i] = (unsigned char)(bits >> (56 - i * 8));
+    // Length bytes must not re-enter the counter, so write them directly.
+    ccpy(ctx->block + 56, tail, 8);
+    sha1_compress(ctx->state, ctx->block);
+    ctx->block_len = 0;
+
+    for (int i = 0; i < 5; i++)
+    {
+        out[i * 4 + 0] = (unsigned char)(ctx->state[i] >> 24);
+        out[i * 4 + 1] = (unsigned char)(ctx->state[i] >> 16);
+        out[i * 4 + 2] = (unsigned char)(ctx->state[i] >> 8);
+        out[i * 4 + 3] = (unsigned char)(ctx->state[i]);
+    }
+}
+
+void sha1(const void* data, unsigned int len, unsigned char out[20])
+{
+    sha1_ctx ctx;
+    sha1_init(&ctx);
+    sha1_update(&ctx, data, len);
+    sha1_final(&ctx, out);
+}
+
+// ---------------------------------------------------------------------------
 // base64
 // ---------------------------------------------------------------------------
 
@@ -233,7 +328,6 @@ bool base64_decode(const char* text, int len, ubuffer* out)
 // chacha20 / poly1305
 // ---------------------------------------------------------------------------
 
-static inline unsigned int rotl32(unsigned int x, int n) { return (x << n) | (x >> (32 - n)); }
 static inline unsigned int load32_le(const unsigned char* p)
 {
     return (unsigned int)p[0] | ((unsigned int)p[1] << 8) | ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
@@ -737,9 +831,189 @@ bool mls_derive_secret(const unsigned char secret[32], const char* label,
 // aes-gcm with a caller-chosen key and tag size
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// aes-gcm with a caller-chosen key and tag size.
+//
+// No system crypto: the FIPS 197 block cipher (encryption half only, which is
+// all GCM's CTR mode needs) plus the GHASH construction, written here by hand.
+// ---------------------------------------------------------------------------
+
 namespace
 {
-    BCRYPT_ALG_HANDLE aes_alg();
+    static const unsigned char AES_SBOX[256] = {
+        0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+        0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+        0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+        0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+        0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+        0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+        0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+        0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+        0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+        0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+        0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+        0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+        0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+        0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+        0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+        0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16 };
+
+    static const unsigned char AES_RCON[10] =
+        { 0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36 };
+
+    struct aes_round_keys
+    {
+        unsigned char rk[240];   // 14 rounds + 1, the 256 bit worst case
+        int rounds;
+    };
+
+    static inline unsigned char aes_xtime(unsigned char x)
+    {
+        return (unsigned char)((x << 1) ^ ((x & 0x80) ? 0x1B : 0x00));
+    }
+
+    bool aes_expand(const unsigned char* key, unsigned int key_len, aes_round_keys* out)
+    {
+        int nk;
+        if (key_len == 16)      { nk = 4; out->rounds = 10; }
+        else if (key_len == 24) { nk = 6; out->rounds = 12; }
+        else if (key_len == 32) { nk = 8; out->rounds = 14; }
+        else return false;
+
+        ccpy(out->rk, key, key_len);
+        unsigned int total = (unsigned int)(out->rounds + 1) * 16;
+        for (unsigned int i = key_len; i < total; i += 4)
+        {
+            unsigned char t[4];
+            t[0] = out->rk[i - 4]; t[1] = out->rk[i - 3];
+            t[2] = out->rk[i - 2]; t[3] = out->rk[i - 1];
+
+            unsigned int word = i / 4;
+            if (word % (unsigned int)nk == 0)
+            {
+                unsigned char u = t[0];
+                t[0] = (unsigned char)(AES_SBOX[t[1]] ^ AES_RCON[word / (unsigned int)nk - 1]);
+                t[1] = AES_SBOX[t[2]];
+                t[2] = AES_SBOX[t[3]];
+                t[3] = AES_SBOX[u];
+            }
+            else if (nk > 6 && word % (unsigned int)nk == 4)
+            {
+                t[0] = AES_SBOX[t[0]]; t[1] = AES_SBOX[t[1]];
+                t[2] = AES_SBOX[t[2]]; t[3] = AES_SBOX[t[3]];
+            }
+
+            out->rk[i + 0] = (unsigned char)(out->rk[i - key_len + 0] ^ t[0]);
+            out->rk[i + 1] = (unsigned char)(out->rk[i - key_len + 1] ^ t[1]);
+            out->rk[i + 2] = (unsigned char)(out->rk[i - key_len + 2] ^ t[2]);
+            out->rk[i + 3] = (unsigned char)(out->rk[i - key_len + 3] ^ t[3]);
+        }
+        return true;
+    }
+
+    void aes_encrypt_block(const aes_round_keys* k, const unsigned char in[16], unsigned char out[16])
+    {
+        unsigned char s[16];
+        for (int i = 0; i < 16; i++) s[i] = (unsigned char)(in[i] ^ k->rk[i]);
+
+        for (int round = 1; round <= k->rounds; round++)
+        {
+            for (int i = 0; i < 16; i++) s[i] = AES_SBOX[s[i]];
+
+            // ShiftRows through a copy: row r rotates left by r.
+            unsigned char t[16];
+            ccpy(t, s, 16);
+            s[0] = t[0];  s[4] = t[4];  s[8]  = t[8];  s[12] = t[12];
+            s[1] = t[5];  s[5] = t[9];  s[9]  = t[13]; s[13] = t[1];
+            s[2] = t[10]; s[6] = t[14]; s[10] = t[2];  s[14] = t[6];
+            s[3] = t[15]; s[7] = t[3];  s[11] = t[7];  s[15] = t[11];
+
+            if (round != k->rounds)
+            {
+                for (int c = 0; c < 4; c++)
+                {
+                    unsigned char a0 = s[c * 4 + 0], a1 = s[c * 4 + 1];
+                    unsigned char a2 = s[c * 4 + 2], a3 = s[c * 4 + 3];
+                    s[c * 4 + 0] = (unsigned char)(aes_xtime(a0) ^ (aes_xtime(a1) ^ a1) ^ a2 ^ a3);
+                    s[c * 4 + 1] = (unsigned char)(a0 ^ aes_xtime(a1) ^ (aes_xtime(a2) ^ a2) ^ a3);
+                    s[c * 4 + 2] = (unsigned char)(a0 ^ a1 ^ aes_xtime(a2) ^ (aes_xtime(a3) ^ a3));
+                    s[c * 4 + 3] = (unsigned char)((aes_xtime(a0) ^ a0) ^ a1 ^ a2 ^ aes_xtime(a3));
+                }
+            }
+
+            const unsigned char* rk = k->rk + (unsigned int)round * 16;
+            for (int i = 0; i < 16; i++) s[i] ^= rk[i];
+        }
+
+        ccpy(out, s, 16);
+    }
+
+    // GHASH multiply in GF(2^128): Z = X * H, blocks big endian, the reduction
+    // constant is 0xE1 followed by zeros.
+    void ghash_mul(const unsigned char x[16], const unsigned char h[16], unsigned char z[16])
+    {
+        unsigned char v[16];
+        ccpy(v, h, 16);
+        ccfset(z, 0, 16);
+
+        for (int i = 0; i < 16; i++)
+        {
+            for (int bit = 7; bit >= 0; bit--)
+            {
+                if ((x[i] >> bit) & 1)
+                    for (int j = 0; j < 16; j++) z[j] ^= v[j];
+
+                unsigned char lsb = (unsigned char)(v[15] & 1);
+                for (int j = 15; j > 0; j--) v[j] = (unsigned char)((v[j] >> 1) | (v[j - 1] << 7));
+                v[0] >>= 1;
+                if (lsb) v[0] ^= 0xE1;
+            }
+        }
+    }
+
+    // S = (S xor pad(data)) * H streamed over whole and partial blocks.
+    void ghash_absorb(const unsigned char h[16], unsigned char s[16],
+                      const void* data, unsigned int len)
+    {
+        const unsigned char* p = (const unsigned char*)data;
+        while (len >= 16)
+        {
+            for (int i = 0; i < 16; i++) s[i] ^= p[i];
+            unsigned char t[16];
+            ghash_mul(s, h, t);
+            ccpy(s, t, 16);
+            p += 16;
+            len -= 16;
+        }
+        if (len)
+        {
+            for (unsigned int i = 0; i < len; i++) s[i] ^= p[i];
+            unsigned char t[16];
+            ghash_mul(s, h, t);
+            ccpy(s, t, 16);
+        }
+    }
+
+    void ghash_lengths(const unsigned char h[16], unsigned char s[16],
+                       unsigned long long aad_bits, unsigned long long text_bits)
+    {
+        unsigned char blk[16];
+        for (int i = 0; i < 8; i++) blk[i] = (unsigned char)(aad_bits >> (56 - i * 8));
+        for (int i = 0; i < 8; i++) blk[8 + i] = (unsigned char)(text_bits >> (56 - i * 8));
+        for (int i = 0; i < 16; i++) s[i] ^= blk[i];
+        unsigned char t[16];
+        ghash_mul(s, h, t);
+        ccpy(s, t, 16);
+    }
+
+    void gcm_next_counter(unsigned char ctr[16])
+    {
+        for (int i = 15; i >= 12; i--)
+        {
+            ctr[i]++;
+            if (ctr[i]) break;
+        }
+    }
 
     bool aesgcm_run(bool encrypt,
                     const unsigned char* key, unsigned int key_len,
@@ -749,51 +1023,83 @@ namespace
                     unsigned char* output,
                     unsigned char* tag, unsigned int tag_len)
     {
-        BCRYPT_ALG_HANDLE alg = aes_alg();
-        if (!alg) return false;
+        if (tag_len > 16) return false;
 
-        BCRYPT_KEY_HANDLE hkey = 0;
-        if (BCryptGenerateSymmetricKey(alg, &hkey, 0, 0, (PUCHAR)key, key_len, 0) != STATUS_SUCCESS)
-            return false;
+        aes_round_keys k;
+        if (!aes_expand(key, key_len, &k)) return false;
 
-        // CNG validates the tag length against the algorithm's supported set,
-        // so a truncated tag has to be produced at full size and cut down.
-        unsigned char full_tag[16];
-        if (encrypt) ccfset(full_tag, 0, sizeof(full_tag));
+        unsigned char zero[16];
+        ccfset(zero, 0, sizeof(zero));
+        unsigned char H[16];
+        aes_encrypt_block(&k, zero, H);
+
+        unsigned char j0[16];
+        if (nonce_len == 12)
+        {
+            ccpy(j0, nonce, 12);
+            j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
+        }
         else
         {
-            ccfset(full_tag, 0, sizeof(full_tag));
-            ccpy(full_tag, tag, tag_len < 16 ? tag_len : 16);
+            unsigned char s[16];
+            ccfset(s, 0, sizeof(s));
+            ghash_absorb(H, s, nonce, nonce_len);
+            ghash_lengths(H, s, 0, (unsigned long long)nonce_len * 8);
+            ccpy(j0, s, 16);
         }
 
-        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
-        BCRYPT_INIT_AUTH_MODE_INFO(info);
-        info.pbNonce = (PUCHAR)nonce;
-        info.cbNonce = nonce_len;
-        info.pbAuthData = (PUCHAR)aad;
-        info.cbAuthData = aad_len;
-        info.pbTag = full_tag;
-        info.cbTag = 16;
+        const unsigned char* in = (const unsigned char*)input;
 
-        ULONG done = 0;
-        NTSTATUS st;
+        if (!encrypt)
+        {
+            // Verify first: the tag covers the aad and the ciphertext as given.
+            unsigned char s[16];
+            ccfset(s, 0, sizeof(s));
+            if (aad_len) ghash_absorb(H, s, aad, aad_len);
+            if (input_len) ghash_absorb(H, s, in, input_len);
+            ghash_lengths(H, s, (unsigned long long)aad_len * 8,
+                          (unsigned long long)input_len * 8);
+
+            unsigned char mask[16];
+            aes_encrypt_block(&k, j0, mask);
+
+            unsigned char diff = 0;
+            for (unsigned int i = 0; i < tag_len; i++)
+                diff |= (unsigned char)(s[i] ^ mask[i] ^ tag[i]);
+            if (diff) return false;
+        }
+
+        unsigned char ctr[16];
+        ccpy(ctr, j0, 16);
+        unsigned int at = 0;
+        while (at < input_len)
+        {
+            gcm_next_counter(ctr);
+            unsigned char pad[16];
+            aes_encrypt_block(&k, ctr, pad);
+
+            unsigned int n = input_len - at;
+            if (n > 16) n = 16;
+            for (unsigned int i = 0; i < n; i++)
+                output[at + i] = (unsigned char)(in[at + i] ^ pad[i]);
+            at += n;
+        }
 
         if (encrypt)
         {
-            st = BCryptEncrypt(hkey, (PUCHAR)input, input_len, &info, 0, 0,
-                               output, input_len, &done, 0);
-            if (st == STATUS_SUCCESS) ccpy(tag, full_tag, tag_len);
-        }
-        else
-        {
-            // Verifying a truncated tag means recomputing the full one, so the
-            // decrypt is done as an encrypt of the ciphertext's counterpart.
-            st = BCryptDecrypt(hkey, (PUCHAR)input, input_len, &info, 0, 0,
-                               output, input_len, &done, 0);
-        }
+            unsigned char s[16];
+            ccfset(s, 0, sizeof(s));
+            if (aad_len) ghash_absorb(H, s, aad, aad_len);
+            if (input_len) ghash_absorb(H, s, output, input_len);
+            ghash_lengths(H, s, (unsigned long long)aad_len * 8,
+                          (unsigned long long)input_len * 8);
 
-        BCryptDestroyKey(hkey);
-        return st == STATUS_SUCCESS;
+            unsigned char mask[16];
+            aes_encrypt_block(&k, j0, mask);
+            for (unsigned int i = 0; i < tag_len; i++)
+                tag[i] = (unsigned char)(s[i] ^ mask[i]);
+        }
+        return true;
     }
 }
 
@@ -817,115 +1123,16 @@ bool aesgcm_decrypt(const unsigned char* key, unsigned int key_len,
                     unsigned char* plain)
 {
     if (tag_len > 16) return false;
-
-    if (tag_len == 16)
-    {
-        return aesgcm_run(false, key, key_len, nonce, nonce_len, aad, aad_len,
-                          cipher, cipher_len, plain, (unsigned char*)tag, tag_len);
-    }
-
-    // CNG will not verify a truncated tag, so do it in two steps. GCM is a
-    // stream cipher: encrypting the ciphertext recovers the plaintext (step 1),
-    // and encrypting that plaintext reproduces the ciphertext together with the
-    // genuine full tag (step 2), whose prefix is what gets compared.
-    unsigned char ignored[16];
-    if (!aesgcm_run(true, key, key_len, nonce, nonce_len, aad, aad_len,
-                    cipher, cipher_len, plain, ignored, 16))
-        return false;
-
-    unsigned char* scratch = (unsigned char*)memalloc((int)(cipher_len ? cipher_len : 1));
-    if (!scratch) return false;
-
-    unsigned char real_tag[16];
-    bool ok = aesgcm_run(true, key, key_len, nonce, nonce_len, aad, aad_len,
-                         plain, cipher_len, scratch, real_tag, 16);
-    memfree(scratch);
-    if (!ok) return false;
-
-    unsigned char diff = 0;
-    for (unsigned int i = 0; i < tag_len; i++) diff |= (unsigned char)(real_tag[i] ^ tag[i]);
-    return diff == 0;
+    // A truncated tag verifies directly: the full tag is recomputed and only
+    // the requested prefix is compared.
+    return aesgcm_run(false, key, key_len, nonce, nonce_len, aad, aad_len,
+                      cipher, cipher_len, plain, (unsigned char*)tag, tag_len);
 }
 
 // ---------------------------------------------------------------------------
-// NIST P-256 through CNG
+// NIST P-256: key layout helpers and ECDH (the arithmetic, including ECDSA,
+// lives in p256.cpp)
 // ---------------------------------------------------------------------------
-
-namespace
-{
-    const unsigned int ECDH_PRIVATE_P256_MAGIC = 0x324B4345;
-    const unsigned int ECDH_PUBLIC_P256_MAGIC = 0x314B4345;
-    const unsigned int ECDSA_PRIVATE_P256_MAGIC = 0x32534345;
-    const unsigned int ECDSA_PUBLIC_P256_MAGIC = 0x31534345;
-
-    struct ecc_blob_header
-    {
-        unsigned int magic;
-        unsigned int key_bytes;
-    };
-
-    // Builds BCRYPT_ECC{PUBLIC,PRIVATE}_BLOB in place. Returns the total size.
-    unsigned int build_public_blob(unsigned char* out, unsigned int magic, const unsigned char pub[65])
-    {
-        ecc_blob_header* h = (ecc_blob_header*)out;
-        h->magic = magic;
-        h->key_bytes = 32;
-        ccpy(out + sizeof(ecc_blob_header), pub + 1, 64);   // skip the 0x04 tag
-        return (unsigned int)sizeof(ecc_blob_header) + 64;
-    }
-
-    unsigned int build_private_blob(unsigned char* out, unsigned int magic, const unsigned char priv[96])
-    {
-        ecc_blob_header* h = (ecc_blob_header*)out;
-        h->magic = magic;
-        h->key_bytes = 32;
-        ccpy(out + sizeof(ecc_blob_header), priv, 96);      // X || Y || d
-        return (unsigned int)sizeof(ecc_blob_header) + 96;
-    }
-
-    BCRYPT_ALG_HANDLE g_ecdh_alg = 0;
-    BCRYPT_ALG_HANDLE g_ecdsa_alg = 0;
-
-    BCRYPT_ALG_HANDLE ecdh_alg()
-    {
-        if (!g_ecdh_alg)
-            BCryptOpenAlgorithmProvider(&g_ecdh_alg, BCRYPT_ECDH_P256_ALGORITHM, 0, 0);
-        return g_ecdh_alg;
-    }
-
-    BCRYPT_ALG_HANDLE ecdsa_alg()
-    {
-        if (!g_ecdsa_alg)
-            BCryptOpenAlgorithmProvider(&g_ecdsa_alg, BCRYPT_ECDSA_P256_ALGORITHM, 0, 0);
-        return g_ecdsa_alg;
-    }
-}
-
-bool p256_generate(unsigned char public_key[65], unsigned char private_key[96])
-{
-    BCRYPT_ALG_HANDLE alg = ecdh_alg();
-    if (!alg) return false;
-
-    BCRYPT_KEY_HANDLE key = 0;
-    if (BCryptGenerateKeyPair(alg, &key, 256, 0) != STATUS_SUCCESS) return false;
-    if (BCryptFinalizeKeyPair(key, 0) != STATUS_SUCCESS)
-    {
-        BCryptDestroyKey(key);
-        return false;
-    }
-
-    unsigned char blob[sizeof(ecc_blob_header) + 96];
-    ULONG written = 0;
-    NTSTATUS st = BCryptExportKey(key, 0, BCRYPT_ECCPRIVATE_BLOB, blob, sizeof(blob), &written, 0);
-    BCryptDestroyKey(key);
-
-    if (st != STATUS_SUCCESS || written < sizeof(blob)) return false;
-
-    ccpy(private_key, blob + sizeof(ecc_blob_header), 96);
-    public_key[0] = 0x04;
-    ccpy(public_key + 1, private_key, 64);
-    return true;
-}
 
 void p256_public_from_private(const unsigned char private_key[96], unsigned char public_key[65])
 {
@@ -1019,134 +1226,14 @@ bool der_decode_signature(const unsigned char* der, unsigned int der_len, unsign
     return pos == der_len;
 }
 
-bool p256_sign(const unsigned char private_key[96],
-               const void* data, unsigned int data_len,
-               unsigned char* signature, unsigned int* signature_len)
-{
-    BCRYPT_ALG_HANDLE alg = ecdsa_alg();
-    if (!alg) return false;
-
-    unsigned char digest[32];
-    sha256(data, data_len, digest);
-
-    unsigned char priv_blob[sizeof(ecc_blob_header) + 96];
-    unsigned int priv_size = build_private_blob(priv_blob, ECDSA_PRIVATE_P256_MAGIC, private_key);
-
-    BCRYPT_KEY_HANDLE key = 0;
-    bool ok = false;
-
-    if (BCryptImportKeyPair(alg, 0, BCRYPT_ECCPRIVATE_BLOB, &key, priv_blob, priv_size, 0) == STATUS_SUCCESS)
-    {
-        unsigned char raw[64];
-        ULONG written = 0;
-        if (BCryptSignHash(key, 0, digest, 32, raw, 64, &written, 0) == STATUS_SUCCESS && written == 64)
-        {
-            *signature_len = der_encode_signature(raw, signature);
-            ok = true;
-        }
-        BCryptDestroyKey(key);
-    }
-
-    ccfset(priv_blob, 0, sizeof(priv_blob));
-    return ok;
-}
-
-bool p256_verify(const unsigned char public_key[65],
-                 const void* data, unsigned int data_len,
-                 const unsigned char* signature, unsigned int signature_len)
-{
-    BCRYPT_ALG_HANDLE alg = ecdsa_alg();
-    if (!alg || public_key[0] != 0x04) return false;
-
-    unsigned char raw[64];
-    if (!der_decode_signature(signature, signature_len, raw)) return false;
-
-    unsigned char digest[32];
-    sha256(data, data_len, digest);
-
-    unsigned char pub_blob[sizeof(ecc_blob_header) + 64];
-    unsigned int pub_size = build_public_blob(pub_blob, ECDSA_PUBLIC_P256_MAGIC, public_key);
-
-    BCRYPT_KEY_HANDLE key = 0;
-    if (BCryptImportKeyPair(alg, 0, BCRYPT_ECCPUBLIC_BLOB, &key, pub_blob, pub_size, 0) != STATUS_SUCCESS)
-        return false;
-
-    bool ok = BCryptVerifySignature(key, 0, digest, 32, raw, 64, 0) == STATUS_SUCCESS;
-    BCryptDestroyKey(key);
-    return ok;
-}
-
 // ---------------------------------------------------------------------------
-// aes-256-gcm through bcrypt
+// aes-256-gcm: the same construction, fixed to the voice mode's parameters
 // ---------------------------------------------------------------------------
-
-namespace
-{
-    BCRYPT_ALG_HANDLE g_aes_alg = 0;
-    bool g_aes_tried = false;
-
-    BCRYPT_ALG_HANDLE aes_alg()
-    {
-        if (g_aes_tried) return g_aes_alg;
-        g_aes_tried = true;
-
-        if (BCryptOpenAlgorithmProvider(&g_aes_alg, BCRYPT_AES_ALGORITHM, 0, 0) != STATUS_SUCCESS)
-        {
-            g_aes_alg = 0;
-            return 0;
-        }
-        if (BCryptSetProperty(g_aes_alg, BCRYPT_CHAINING_MODE,
-                              (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0) != STATUS_SUCCESS)
-        {
-            BCryptCloseAlgorithmProvider(g_aes_alg, 0);
-            g_aes_alg = 0;
-        }
-        return g_aes_alg;
-    }
-
-    bool aes_gcm_run(bool encrypt,
-                     const unsigned char key[32], const unsigned char nonce[12],
-                     const void* aad, unsigned int aad_len,
-                     const void* input, unsigned int input_len,
-                     unsigned char* output, unsigned char* tag)
-    {
-        BCRYPT_ALG_HANDLE alg = aes_alg();
-        if (!alg) return false;
-
-        BCRYPT_KEY_HANDLE hkey = 0;
-        if (BCryptGenerateSymmetricKey(alg, &hkey, 0, 0, (PUCHAR)key, 32, 0) != STATUS_SUCCESS)
-            return false;
-
-        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
-        BCRYPT_INIT_AUTH_MODE_INFO(info);
-        info.pbNonce = (PUCHAR)nonce;
-        info.cbNonce = 12;
-        info.pbAuthData = (PUCHAR)aad;
-        info.cbAuthData = aad_len;
-        info.pbTag = (PUCHAR)tag;
-        info.cbTag = 16;
-
-        ULONG done = 0;
-        NTSTATUS st;
-        if (encrypt)
-        {
-            st = BCryptEncrypt(hkey, (PUCHAR)input, input_len, &info, 0, 0,
-                               output, input_len, &done, 0);
-        }
-        else
-        {
-            st = BCryptDecrypt(hkey, (PUCHAR)input, input_len, &info, 0, 0,
-                               output, input_len, &done, 0);
-        }
-
-        BCryptDestroyKey(hkey);
-        return st == STATUS_SUCCESS;
-    }
-}
 
 bool aes256gcm_available()
 {
-    return aes_alg() != 0;
+    // Hand written above, so always.
+    return true;
 }
 
 bool aes256gcm_encrypt(const unsigned char key[32], const unsigned char nonce[12],
@@ -1154,7 +1241,8 @@ bool aes256gcm_encrypt(const unsigned char key[32], const unsigned char nonce[12
                        const void* plain, unsigned int plain_len,
                        unsigned char* cipher, unsigned char tag[16])
 {
-    return aes_gcm_run(true, key, nonce, aad, aad_len, plain, plain_len, cipher, tag);
+    return aesgcm_run(true, key, 32, nonce, 12, aad, aad_len,
+                      plain, plain_len, cipher, tag, 16);
 }
 
 bool aes256gcm_decrypt(const unsigned char key[32], const unsigned char nonce[12],
@@ -1163,7 +1251,8 @@ bool aes256gcm_decrypt(const unsigned char key[32], const unsigned char nonce[12
                        const unsigned char tag[16],
                        unsigned char* plain)
 {
-    return aes_gcm_run(false, key, nonce, aad, aad_len, cipher, cipher_len, plain, (unsigned char*)tag);
+    return aesgcm_run(false, key, 32, nonce, 12, aad, aad_len,
+                      cipher, cipher_len, plain, (unsigned char*)tag, 16);
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,6 +1294,27 @@ namespace
         }
         return ok;
     }
+
+    // Test vectors are written as hex; this parses them into a fixed buffer.
+    bool hex_parse(const char* hex, unsigned char* out, unsigned int out_len)
+    {
+        for (unsigned int i = 0; i < out_len; i++)
+        {
+            int v = 0;
+            for (int k = 0; k < 2; k++)
+            {
+                char c = hex[i * 2 + k];
+                int d;
+                if (c >= '0' && c <= '9') d = c - '0';
+                else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+                else return false;
+                v = (v << 4) | d;
+            }
+            out[i] = (unsigned char)v;
+        }
+        return hex[out_len * 2] == 0;
+    }
 }
 
 bool self_test()
@@ -1217,6 +1327,14 @@ bool self_test()
         sha256("abc", 3, out);
         check("sha256(abc)", hex_equals(out, 32,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), &failures);
+    }
+
+    // SHA-1 of "abc", FIPS 180-4. The websocket handshake is its only user.
+    {
+        unsigned char out[20];
+        sha1("abc", 3, out);
+        check("sha1(abc)", hex_equals(out, 20,
+            "a9993e364706816aba3e25717850c26c9cd0d89d"), &failures);
     }
 
     // HMAC-SHA256, RFC 4231 test case 1.
@@ -1278,10 +1396,82 @@ bool self_test()
               &failures);
     }
 
-    // Scalar multiplication against CNG. Every key CNG hands out comes with
-    // both the scalar and the point it belongs to, which makes an endless
-    // supply of test vectors for the one piece of curve arithmetic written
-    // here by hand.
+    // AES-GCM, NIST GCMVS vectors: K is FEFFE992.../67308308, the IV is
+    // CAFEBABE/FACEDBAD/DECAF888. These pin the block cipher, the counter
+    // mode and GHASH together, including the empty-input GMAC corner.
+    {
+        unsigned char key128[16], key256[32], iv[12];
+        unsigned char pt[64], ct[64], tag[16], aad[64], back[64], dummy = 0;
+        hex_parse("FEFFE9928665731C6D6A8F9467308308", key128, 16);
+        hex_parse("FEFFE9928665731C6D6A8F9467308308FEFFE9928665731C6D6A8F9467308308",
+                  key256, 32);
+        hex_parse("CAFEBABE" "FACEDBAD" "DECAF888", iv, 12);
+        hex_parse("D9313225F88406E5A55909C5AFF5269A86A7A9531534F7DA2E4C303D8A318A72"
+                  "1C3C0C95956809532FCF0E2449A6B525B16AEDF5AA0DE657BA637B391AAFD255",
+                  pt, 64);
+        hex_parse("3AD77BB40D7A3660A89ECAF32466EF97F5D3D58503B9699DE785895A96FDBAAF"
+                  "43B1CD7F598ECE23881B00E3ED0306887B0C785E27E8AD3F8223207104725DD4",
+                  aad, 64);
+
+        // AES-128, empty plaintext and aad.
+        bool ok = aesgcm_encrypt(key128, 16, iv, 12, 0, 0, &dummy, 0, &dummy, tag, 16);
+        check("aes128gcm nist empty", ok &&
+            hex_equals(tag, 16, "3247184B3C4F69A44DBCD22887BBB418"), &failures);
+
+        // AES-128, 64 bytes of plaintext, no aad.
+        ok = aesgcm_encrypt(key128, 16, iv, 12, 0, 0, pt, 64, ct, tag, 16);
+        check("aes128gcm nist pt64", ok &&
+            hex_equals(ct, 64, "42831EC2217774244B7221B784D0D49CE3AA212F2C02A4E035C17E2329ACA12E"
+                               "21D514B25466931C7D8F6A5AAC84AA051BA30B396A0AAC973D58E091473F5985") &&
+            hex_equals(tag, 16, "4D5C2AF327CD64A62CF35ABD2BA6FAB4"), &failures);
+
+        // AES-128, 64 bytes of aad plus the same plaintext.
+        ok = aesgcm_encrypt(key128, 16, iv, 12, aad, 64, pt, 64, ct, tag, 16);
+        check("aes128gcm nist aad64+pt64", ok &&
+            hex_equals(tag, 16, "64C0232904AF398A5B67C10B53A5024D"), &failures);
+
+        // The 8 byte truncation DAVE uses is the tag's prefix, byte for byte.
+        unsigned char short_tag[8];
+        ok = aesgcm_encrypt(key128, 16, iv, 12, 0, 0, pt, 64, ct, short_tag, 8);
+        check("aes128gcm nist truncated prefix", ok &&
+            hex_equals(short_tag, 8, "4D5C2AF327CD64A6"), &failures);
+        ok = ok && aesgcm_decrypt(key128, 16, iv, 12, 0, 0, ct, 64, short_tag, 8, back);
+        bool same = ok;
+        for (int i = 0; i < 64 && same; i++) same = back[i] == pt[i];
+        check("aes128gcm nist truncated round trip", same, &failures);
+
+        // AES-256, empty plaintext and aad.
+        ok = aesgcm_encrypt(key256, 32, iv, 12, 0, 0, &dummy, 0, &dummy, tag, 16);
+        check("aes256gcm nist empty", ok &&
+            hex_equals(tag, 16, "FD2CAA16A5832E76AA132C1453EEDA7E"), &failures);
+
+        // AES-256, 64 bytes of plaintext, no aad, then back.
+        ok = aesgcm_encrypt(key256, 32, iv, 12, 0, 0, pt, 64, ct, tag, 16);
+        check("aes256gcm nist pt64", ok &&
+            hex_equals(ct, 64, "522DC1F099567D07F47F37A32A84427D643A8CDCBFE5C0C97598A2BD2555D1AA"
+                               "8CB08E48590DBB3DA7B08B1056828838C5F61E6393BA7A0ABCC9F662898015AD") &&
+            hex_equals(tag, 16, "B094DAC5D93471BDEC1A502270E3CC6C"), &failures);
+        ok = ok && aesgcm_decrypt(key256, 32, iv, 12, 0, 0, ct, 64, tag, 16, back);
+        same = ok;
+        for (int i = 0; i < 64 && same; i++) same = back[i] == pt[i];
+        check("aes256gcm nist round trip", same, &failures);
+
+        // AES-256 through its own entry points, with aad.
+        unsigned char tag256[16];
+        ok = aes256gcm_encrypt(key256, iv, aad, 64, pt, 64, ct, tag256);
+        ok = ok && aes256gcm_decrypt(key256, iv, aad, 64, ct, 64, tag256, back);
+        same = ok;
+        for (int i = 0; i < 64 && same; i++) same = back[i] == pt[i];
+        check("aes256gcm entry round trip", same, &failures);
+        tag256[15] ^= 0x01;
+        check("aes256gcm rejects a bad tag",
+              !aes256gcm_decrypt(key256, iv, aad, 64, ct, 64, tag256, back), &failures);
+    }
+
+    // Scalar multiplication cross-checked against key generation. Every key
+    // the generator hands out comes with both the scalar and the point it
+    // belongs to, which makes an endless supply of test vectors for the
+    // base-point multiplication written here by hand.
     {
         bool all = true;
         for (int round = 0; round < 8 && all; round++)

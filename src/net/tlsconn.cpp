@@ -24,6 +24,18 @@ namespace
         log_line("tls: %s", what);
     }
 
+    bool send_all(SOCKET sock, const unsigned char* data, unsigned int len)
+    {
+        unsigned int done = 0;
+        while (done < len)
+        {
+            int put = send(sock, (const char*)data + done, (int)(len - done), 0);
+            if (put <= 0) return false;
+            done += (unsigned int)put;
+        }
+        return true;
+    }
+
     // Everything tlse wants to say goes out through the socket here. It never
     // touches the socket itself, which is what lets the same code run over a
     // proxy tunnel without knowing about one.
@@ -33,16 +45,9 @@ namespace
         const unsigned char* out = tls_get_write_buffer((TLSContext*)s->ctx, &len);
         if (!out || !len) return true;
 
-        int done = 0;
-        while (done < (int)len)
-        {
-            int put = send(s->sock, (const char*)out + done, (int)len - done, 0);
-            if (put <= 0) return false;
-            done += put;
-        }
-
-        tls_buffer_clear((TLSContext*)s->ctx);
-        return true;
+        bool ok = send_all(s->sock, out, len);
+        if (ok) tls_buffer_clear((TLSContext*)s->ctx);
+        return ok;
     }
 
     bool wait_readable(SOCKET sock, unsigned int timeout_ms)
@@ -61,8 +66,7 @@ namespace
 
 void tlsnet::init()
 {
-    if (g_roots_loaded) return;
-    g_roots_loaded = true;
+    if (g_roots_loaded) return;    g_roots_loaded = true;
 
     // The trust store ships with tlse as one PEM bundle. Baking it in rather
     // than reading the system store keeps this identical on every windows

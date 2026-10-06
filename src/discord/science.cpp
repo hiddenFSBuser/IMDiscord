@@ -159,6 +159,43 @@ namespace
             api::launch_signature(), voice ? "RTC_CONNECTED" : "DISCONNECTED",
             view_w, view_h, g_client_uuid, now);
 
+        // The plain heartbeat the official client sends beside the ad one,
+        // version 31 with the idle flags. At most once a minute, riding a
+        // batch that goes out anyway - and never under a call's identity.
+        static unsigned long long last_hb = 0;
+        if (!voice && now - last_hb >= 60000)
+        {
+            last_hb = now;
+
+            at += cnprint(body + at, (int)sizeof(body) - at,
+                ",{\"type\":\"client_heartbeat\",\"properties\":{"
+                "\"client_track_timestamp\":%llu,"
+                "\"client_heartbeat_session_id\":\"%s\","
+                "\"event_sequence_number\":%d,"
+                "\"client_heartbeat_initialization_timestamp\":%llu,"
+                "\"client_heartbeat_version\":31,"
+                "\"is_idle\":false,"
+                "\"idle_duration_ms\":%llu,"
+                "\"is_afk\":false,"
+                "\"is_system_suspended\":false,"
+                "\"is_system_locked\":false,"
+                "\"client_performance_memory\":0,"
+                "\"accessibility_features\":524416,"
+                "\"rendered_locale\":\"en-US\","
+                "\"uptime_app\":%llu,"
+                "\"launch_signature\":\"%s\","
+                "\"client_rtc_state\":\"%s\","
+                "\"client_app_state\":\"focused\","
+                "\"client_viewport_width\":%d,"
+                "\"client_viewport_height\":%d,"
+                "\"client_uuid\":\"%s\","
+                "\"client_send_timestamp\":%llu}}",
+                now, api::heartbeat_session_id(), (int)InterlockedIncrement(&g_sequence),
+                g_started_ms, now, (now - g_started_ms) / 1000,
+                api::launch_signature(), voice ? "RTC_CONNECTED" : "DISCONNECTED",
+                view_w, view_h, g_client_uuid, now);
+        }
+
         int taken = 0;
 
         EnterCriticalSection(&g_lock);
@@ -570,6 +607,18 @@ void science::add_friend_input_clicked()
     // field carries no event of its own. Matching that matters more than
     // inventing one would.
     if ((int)science::mode() >= (int)TIER_ESSENTIAL) heartbeat_only();
+}
+
+void science::captcha_verified(const char* sitekey, const char* flow_key)
+{
+    jwriter p;
+    p.init();
+    common(&p);
+    p.kv_str("captcha_event_name", "verify");
+    p.kv_str("captcha_service", "hcaptcha");
+    p.kv_str("sitekey", sitekey ? sitekey : "");
+    p.kv_str("captcha_flow_key", flow_key ? flow_key : "");
+    emit("captcha_event", TIER_ESSENTIAL, &p);
 }
 
 // ---- the invite chain -----------------------------------------------------

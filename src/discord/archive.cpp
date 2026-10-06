@@ -83,6 +83,15 @@ namespace
         h = hash_text(m->content, h);
         h = hash_text(m->edited_timestamp, h);
         h = h * 16777619u ^ (unsigned int)m->attachments.count;
+        for (unsigned int i = 0; i < m->attachments.count; i++)
+        {
+            // The address is part of the identity: a refetch hands over the
+            // same file under a fresh one (attachment urls expire), and
+            // without it in the stamp the archive keeps the dead address
+            // forever while believing nothing changed.
+            h = hash_text(m->attachments[i].url, h);
+            h = h * 16777619u ^ (unsigned int)m->attachments[i].id;
+        }
         h = h * 16777619u ^ (unsigned int)(m->pending ? 1 : 0);
         return h;
     }
@@ -629,6 +638,7 @@ bool archive::snapshot_save()
             w.kv_i64("type", rels[i].type);
             if (rels[i].nickname) w.kv_str("nickname", rels[i].nickname);
             if (rels[i].since) w.kv_str("since", rels[i].since);
+            if (rels[i].note) w.kv_str("note", rels[i].note);
             w.end_obj();
         }
         w.end_arr();
@@ -730,7 +740,7 @@ bool archive::snapshot_load()
         {
             const jval* r = rels->at(i);
             store::set_relationship(r->sf("id"), (int)r->i64("type", 0), r->str("nickname", 0),
-                                    r->str("since", 0));
+                                    r->str("since", 0), r->str("note", 0));
         }
 
         const jval* guilds = root->arr("guilds");

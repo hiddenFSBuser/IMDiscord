@@ -947,6 +947,148 @@ namespace
         copy_field(c->emoji_name, sizeof(c->emoji_name), e, "name");
     }
 
+    // Components V2: containers and sections unwrap inline, so what is drawn
+    // is a flat run of text, rules, pictures and accessory buttons. Rows,
+    // buttons and menus are not handled here; read_components owns those.
+    void read_v2_media(dv2node* n, const jval* media)
+    {
+        if (!media || media->type != JTYPE_OBJ) return;
+        n->media_url = store::intern(media->str("proxy_url", 0));
+        if (!n->media_url) n->media_url = store::intern(media->str("url", 0));
+        n->media_desc = store::intern(media->str("description", 0));
+    }
+
+    void read_v2_node(dmessage* m, const jval* node, unsigned int accent)
+    {
+        if (!node || node->type != JTYPE_OBJ) return;
+        int type = node->i32("type", 0);
+
+        if (type == V2_CONTAINER)
+        {
+            unsigned int child_accent = (unsigned int)node->i64("accent_color", 0);
+            if (!child_accent) child_accent = accent;
+
+            const jval* kids = node->arr("components");
+            for (unsigned int i = 0; i < kids->count; i++)
+                read_v2_node(m, kids->at(i), child_accent);
+            return;
+        }
+
+        if (type == V2_SECTION)
+        {
+            const jval* kids = node->arr("components");
+            for (unsigned int i = 0; i < kids->count; i++)
+                read_v2_node(m, kids->at(i), accent);
+
+            const jval* acc = node->obj("accessory");
+            if (acc->type == JTYPE_OBJ)
+            {
+                int atype = acc->i32("type", 0);
+                if (atype == COMP_BUTTON)
+                {
+                    dv2node n;
+                    ccfset(&n, 0, sizeof(n));
+                    n.type = V2_SECTION;
+                    n.accent = accent;
+                    n.has_accessory = true;
+
+                    dcomponent* c = &n.accessory;
+                    c->type = COMP_BUTTON;
+                    c->disabled = acc->boolean("disabled", false);
+                    copy_field(c->label, sizeof(c->label), acc, "label");
+                    copy_field(c->custom_id, sizeof(c->custom_id), acc, "custom_id");
+                    c->style = acc->i32("style", BTN_SECONDARY);
+                    copy_field(c->url, sizeof(c->url), acc, "url");
+                    read_component_emoji(c, acc);
+
+                    m->v2.push(n);
+                }
+                else if (atype == V2_THUMBNAIL)
+                {
+                    dv2node n;
+                    ccfset(&n, 0, sizeof(n));
+                    n.type = V2_THUMBNAIL;
+                    n.accent = accent;
+                    read_v2_media(&n, acc->obj("media"));
+                    if (n.media_url) m->v2.push(n);
+                }
+            }
+            return;
+        }
+
+        if (type == V2_TEXT)
+        {
+            const char* content = node->str("content", 0);
+            if (!content || !content[0]) return;
+
+            dv2node n;
+            ccfset(&n, 0, sizeof(n));
+            n.type = V2_TEXT;
+            n.accent = accent;
+            n.text = store::intern(content);
+            m->v2.push(n);
+            return;
+        }
+
+        if (type == V2_SEPARATOR)
+        {
+            dv2node n;
+            ccfset(&n, 0, sizeof(n));
+            n.type = V2_SEPARATOR;
+            n.divider = node->boolean("divider", true);
+            m->v2.push(n);
+            return;
+        }
+
+        if (type == V2_GALLERY)
+        {
+            const jval* items = node->arr("items");
+            for (unsigned int i = 0; i < items->count; i++)
+            {
+                dv2node n;
+                ccfset(&n, 0, sizeof(n));
+                n.type = V2_GALLERY;
+                n.accent = accent;
+                read_v2_media(&n, items->at(i)->obj("media"));
+                if (n.media_url) m->v2.push(n);
+            }
+            return;
+        }
+
+        if (type == V2_FILE)
+        {
+            dv2node n;
+            ccfset(&n, 0, sizeof(n));
+            n.type = V2_FILE;
+            n.accent = accent;
+            read_v2_media(&n, node->obj("file"));
+            if (n.media_url) m->v2.push(n);
+            return;
+        }
+
+        if (type == V2_THUMBNAIL)
+        {
+            dv2node n;
+            ccfset(&n, 0, sizeof(n));
+            n.type = V2_THUMBNAIL;
+            n.accent = accent;
+            read_v2_media(&n, node->obj("media"));
+            if (n.media_url) m->v2.push(n);
+            return;
+        }
+    }
+
+    void read_v2(dmessage* m, const jval* v)
+    {
+        m->v2.clear_fast();
+
+        const jval* rows = v->arr("components");
+        if (rows->type != JTYPE_ARR) return;
+
+        for (unsigned int r = 0; r < rows->count; r++)
+            read_v2_node(m, rows->at(r), 0);
+    }
+
     // The rows a bot hung under its message, flattened.
     //
     // Rewritten whole rather than merged: an edit that changes a button
@@ -1087,6 +1229,7 @@ dmessage* store::upsert_message(const jval* v)
         fresh.reactions = ulist<dreaction>();
         fresh.components = ulist<dcomponent>();
         fresh.select_options = ulist<dselect_option>();
+        fresh.v2 = ulist<dv2node>();
 
         // Keep the list ordered by id so rendering is a straight walk.
         unsigned int pos = ch->messages.count;
@@ -1105,6 +1248,7 @@ dmessage* store::upsert_message(const jval* v)
     if (v->has("timestamp")) msg->timestamp = intern(v->str("timestamp", ""));
     if (v->has("edited_timestamp")) msg->edited_timestamp = intern(v->str("edited_timestamp", 0));
     msg->type = v->i32("type", msg->type);
+    if (v->has("flags")) msg->flags = v->i32("flags", 0);
     msg->pending = false;
     msg->failed = false;
 
@@ -1119,6 +1263,7 @@ dmessage* store::upsert_message(const jval* v)
     if (id > ch->last_message_id) ch->last_message_id = id;
         // The buttons and menus, and who to talk to about them.
     read_components(msg, v);
+    read_v2(msg, v);
     if (v->has("application_id")) msg->application_id = v->sf("application_id");
 
     // A message that merely carries components has no application_id: discord
@@ -1216,7 +1361,7 @@ void store::apply_presence(const jval* p)
 // ---------------------------------------------------------------------------
 
 void store::set_relationship(snowflake user_id, int type, const char* nickname,
-                             const char* since)
+                             const char* since, const char* note)
 {
     for (unsigned int i = 0; i < g_relationships.count; i++)
     {
@@ -1231,6 +1376,8 @@ void store::set_relationship(snowflake user_id, int type, const char* nickname,
             // created meant it was only ever filled on a first sign-in with
             // no snapshot - which is to say, almost never.
             if (since && since[0]) g_relationships[i].since = intern(since);
+            if (note && note[0]) g_relationships[i].note = intern(note);
+            else if (note) g_relationships[i].note = 0;
 
             bump_revision();
             return;
@@ -1243,8 +1390,17 @@ void store::set_relationship(snowflake user_id, int type, const char* nickname,
     r.type = type;
     r.nickname = nickname ? intern(nickname) : 0;
     r.since = (since && since[0]) ? intern(since) : 0;
+    r.note = (note && note[0]) ? intern(note) : 0;
     g_relationships.push(r);
     bump_revision();
+}
+
+const char* store::relationship_note(snowflake user_id)
+{
+    for (unsigned int i = 0; i < g_relationships.count; i++)
+        if (g_relationships[i].user_id == user_id) return g_relationships[i].note;
+
+    return 0;
 }
 
 const char* store::relationship_since(snowflake user_id)

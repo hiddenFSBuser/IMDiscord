@@ -12,6 +12,7 @@
 #include "core/log.h"
 #include "core/crypto.h"
 #include "core/storage.h"
+#include "system/io/ufile.h"
 #include "net/proxy.h"
 #include "net/websocket.h"
 #include "net/json.h"
@@ -112,6 +113,185 @@ namespace
 
     volatile long g_state = GW_OFFLINE;
     volatile long g_hold_media = 0;
+
+    // Dispatch-packet debugging. Off unless asked: the log flushes on every
+    // line, and a busy account produces a steady stream of dispatches.
+    // g_dbg_types is a comma-separated list of dispatch names; empty (or a
+    // lone "*") means everything.
+    volatile long g_dbg_dispatch = 0;
+    char g_dbg_types[256] = { 0 };
+
+    bool dispatch_type_wanted(const char* type)
+    {
+        if (!type || !type[0]) return true;
+        if (!g_dbg_types[0]) return true;
+
+        const char* p = g_dbg_types;
+        while (*p)
+        {
+            while (*p == ' ' || *p == ',') p++;
+            if (!*p) break;
+
+            const char* end = p;
+            while (*end && *end != ',') end++;
+
+            // Trailing spaces are not part of the name.
+            const char* trim = end;
+            while (trim > p && (trim[-1] == ' ')) trim--;
+
+            if (*p == '*' && trim == p + 1) return true;
+
+            size_t n = (size_t)(trim - p);
+            char name[64];
+            if (n < sizeof(name))
+            {
+                ccpy(name, p, n);
+                name[n] = 0;
+                if (ccscmp(name, type) == 0) return true;
+            }
+
+            p = end;
+        }
+        return false;
+    }
+
+    // Raw payload as it arrived, truncated: a READY is megabytes, and the
+    // shape of the event is in the first screenful. Logged, so it lands in
+    // imdiscord.log next to everything else.
+    void dump_dispatch(const char* type, const char* text, unsigned int len)
+    {
+        const unsigned int CAP = 1500;
+        unsigned int n = len < CAP ? len : CAP;
+
+        char head[1600];
+        ccpy(head, text, n);
+        head[n] = 0;
+        // One log line: embedded newlines would split the entry.
+        for (unsigned int i = 0; i < n; i++)
+            if (head[i] == '\r' || head[i] == '\n') head[i] = ' ';
+
+        if (len > CAP)
+            log_line("gateway: <=> %s (%u bytes, truncated): %s", type ? type : "?", len, head);
+        else
+            log_line("gateway: <=> %s (%u bytes): %s", type ? type : "?", len, head);
+    }
+
+    void indent_to(ubuffer* out, int indent)
+    {
+        if (indent > 64) indent = 64;
+        for (int i = 0; i < indent; i++) out->append("  ", 2);
+    }
+
+    // Layout pass over raw JSON, not a re-serialization: numbers and strings
+    // come out byte-identical, only whitespace is added. String-aware, so
+    // braces inside strings never confuse it and escapes pass through.
+    void write_pretty_json(const char* text, unsigned int len, ubuffer* out)
+    {
+        int indent = 0;
+        bool in_str = false;
+        bool esc = false;
+        bool need_indent = true;   // at a fresh line
+
+        for (unsigned int i = 0; i < len; i++)
+        {
+            char c = text[i];
+
+            if (in_str)
+            {
+                out->append(&c, 1);
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') in_str = false;
+                continue;
+            }
+
+            switch (c)
+            {
+            case '"':
+                if (need_indent) { indent_to(out, indent); need_indent = false; }
+                in_str = true;
+                out->append(&c, 1);
+                break;
+
+            case '{':
+            case '[':
+                if (need_indent) { indent_to(out, indent); need_indent = false; }
+                out->append(&c, 1);
+                {
+                    // An empty object or array stays on one line.
+                    unsigned int k = i + 1;
+                    while (k < len && (text[k] == ' ' || text[k] == '\t' ||
+                                       text[k] == '\r' || text[k] == '\n')) k++;
+                    char closer = (c == '{') ? '}' : ']';
+                    if (k < len && text[k] == closer)
+                    {
+                        out->append(&closer, 1);
+                        i = k;
+                    }
+                    else
+                    {
+                        out->append("\n", 1);
+                        indent++;
+                        need_indent = true;
+                    }
+                }
+                break;
+
+            case '}':
+            case ']':
+                indent--;
+                if (indent < 0) indent = 0;
+                if (!need_indent) out->append("\n", 1);
+                indent_to(out, indent);
+                out->append(&c, 1);
+                need_indent = false;
+                break;
+
+            case ',':
+                out->append(&c, 1);
+                out->append("\n", 1);
+                need_indent = true;
+                break;
+
+            case ':':
+                out->append(": ", 2);
+                break;
+
+            case ' ':
+            case '\t':
+            case '\r':
+            case '\n':
+                // Outside strings the source spacing is redundant.
+                break;
+
+            default:
+                if (need_indent) { indent_to(out, indent); need_indent = false; }
+                out->append(&c, 1);
+                break;
+            }
+        }
+
+        out->append("\n", 1);
+    }
+
+    // A READY never fits the log, so the whole thing - formatted - goes into
+    // gateway_ready.json next to the log, and the log only notes that it did.
+    void dump_ready_file(const char* text, unsigned int len)
+    {
+        ubuffer pretty;
+        pretty.init(len + len / 4 + 64);
+        write_pretty_json(text, len, &pretty);
+
+        wchar_t path[MAX_PATH];
+        if (ufile::app_path(L"gateway_ready.json", path, MAX_PATH))
+        {
+            if (ufile::write_all(path, pretty.data, pretty.size))
+                log_line("gateway: READY (%u bytes) записан в gateway_ready.json", len);
+            else
+                log_line("gateway: READY (%u bytes) не записался", len);
+        }
+        pretty.free_buffer();
+    }
 
     // The voice regions READY offered, in the order it gave them.
     const unsigned int MAX_REGIONS = 8;
@@ -510,7 +690,8 @@ namespace
             const char* since = r->str("since", 0);
             if (since && since[0]) rels_dated++;
 
-            if (uid) store::set_relationship(uid, r->i32("type", 0), r->str("nickname", 0), since);
+            if (uid) store::set_relationship(uid, r->i32("type", 0), r->str("nickname", 0), since,
+                                               r->str("note", 0));
         }
 
         // Initial online states. Without this everyone stays grey until their
@@ -853,21 +1034,12 @@ namespace
             const jval* members = d->arr("members");
             for (unsigned int i = 0; i < members->count; i++)
             {
-                const jval* m = members->at(i);
-                duser* u = store::upsert_user(m->obj("user"));
-                if (!u || !guild) continue;
-
-                bool known = false;
-                for (unsigned int k = 0; k < guild->members.count; k++)
-                    if (guild->members[k].user_id == u->id) { known = true; break; }
-                if (known) continue;
-
-                dmember mem;
-                ccfset(&mem, 0, sizeof(mem));
-                mem.user_id = u->id;
-                mem.nick = m->str("nick", 0) ? store::intern(m->str("nick", 0)) : 0;
-                mem.timeout_until_ms = iso_to_unix_ms(m->str("communication_disabled_until", 0));
-                guild->members.push(mem);
+                // Through the same reader as every other member source: the
+                // inline version used to drop roles and joined_at, so members
+                // that only ever arrived in a chunk had neither. Updating an
+                // existing entry is safe - nick, timeout, roles and joined_at
+                // are only overwritten by fields the chunk actually carries.
+                store::add_guild_member(guild, members->at(i));
             }
             store::bump_revision();
             return;
@@ -880,7 +1052,7 @@ namespace
             snowflake uid = d->sf("id");
             if (!uid && u) uid = u->id;
             if (uid) store::set_relationship(uid, d->i32("type", 0), d->str("nickname", 0),
-                                             d->str("since", 0));
+                                             d->str("since", 0), d->str("note", 0));
             return;
         }
 
@@ -921,8 +1093,12 @@ namespace
 
             // Only about the channel this client is sitting in. Somebody
             // joining a call three servers away is not an event here.
+            //
+            // And silent while a 4014 recovery is running: the leave, the
+            // return and every stream stopping and starting in between is
+            // one server rotation, not a round of events.
             snowflake mine = voice::current_channel();
-            if (mine)
+            if (mine && !voice::hushed())
             {
                 bool here_now = channel == mine;
                 bool here_before = was_in == mine;
@@ -1040,6 +1216,17 @@ namespace
             return;
         }
 
+        // A form opened by a button: the definition rides the socket in
+        // INTERACTION_MODAL_CREATE rather than in the POST response (which is
+        // an empty 204), so this is where it is caught. INTERACTION_CREATE
+        // and INTERACTION_SUCCESS carry only the nonce and the id and need
+        // nothing.
+        if (ccscmp(type, "INTERACTION_MODAL_CREATE") == 0)
+        {
+            api::handle_modal_dispatch(d);
+            return;
+        }
+
         // Everything else is deliberately ignored.
     }
 
@@ -1108,12 +1295,31 @@ namespace
             log_line("gateway: session invalidated");
             c->want_resume = root->get("d")->as_bool(false);
             if (!c->want_resume) c->session_id[0] = 0;
+            // The server said the session is gone, which is an answer rather
+            // than a failure: backing off from it only delays the identify
+            // everything is waiting for.
+            c->backoff_ms = 1000;
             c->ws.close();
             break;
 
         case OP_DISPATCH:
             // Deliberately not logged per event: the log flushes on every line,
             // and a busy account produces a steady stream of dispatches.
+            // The debug switch above is the exception: it logs exactly what
+            // was asked for, raw, so a dispatch can be debugged off the log.
+            if (g_dbg_dispatch)
+            {
+                const char* dtype = root->str("t", 0);
+                if (dispatch_type_wanted(dtype))
+                {
+                    // READY never fits the log: the whole thing, formatted,
+                    // goes into gateway_ready.json instead.
+                    if (dtype && ccscmp(dtype, "READY") == 0)
+                        dump_ready_file(text, len);
+                    else
+                        dump_dispatch(dtype, text, len);
+                }
+            }
             handle_dispatch(c, root->str("t", 0), root->obj("d"));
             break;
 
@@ -1285,6 +1491,22 @@ namespace
     }
 }
 
+void gateway::set_dispatch_debug(bool on, const char* types)
+{
+    InterlockedExchange(&g_dbg_dispatch, on ? 1 : 0);
+    ccfset(g_dbg_types, 0, sizeof(g_dbg_types));
+    if (types) ccstrncpy(g_dbg_types, types, sizeof(g_dbg_types) - 1);
+}
+
+bool gateway::dispatch_debug() { return g_dbg_dispatch != 0; }
+
+void gateway::dispatch_debug_filter(char* out, int cap)
+{
+    if (!out || cap <= 0) return;
+    ccstrncpy(out, g_dbg_types, cap - 1);
+    out[cap - 1] = 0;
+}
+
 void gateway::start()
 {
     gw_conn* c = active();
@@ -1306,6 +1528,25 @@ void gateway::start()
     c->stop_event = CreateEventW(0, TRUE, FALSE, 0);
     c->beat_event = CreateEventW(0, FALSE, FALSE, 0);
     c->running = 1;
+
+    // Dispatch debugging: the environment wins over the stored setting, so a
+    // debug run needs no clicking - and the setting survives a restart.
+    {
+        char env[256];
+        DWORD n = GetEnvironmentVariableA("IMD_GWDUMP", env, sizeof(env));
+        if (n > 0 && n < sizeof(env))
+        {
+            // "1" or "*" means everything; anything else is a type filter.
+            if (ccscmp(env, "1") == 0 || ccscmp(env, "*") == 0) env[0] = 0;
+            set_dispatch_debug(true, env);
+            log_line("gateway: дамп dispatch включён из окружения");
+        }
+        else
+        {
+            set_dispatch_debug(storage::settings_get_int("gw_dump", 0) != 0,
+                               storage::settings_get("gw_dump_types", ""));
+        }
+    }
 
     c->thread = CreateThread(0, 0, gateway_thread, c, 0, 0);
     c->heartbeat_thread = CreateThread(0, 0, heartbeat_thread, c, 0, 0);

@@ -29,6 +29,14 @@ namespace gateway
 
     void update_voice_state(snowflake guild_id, snowflake channel_id, bool self_mute, bool self_deaf);
 
+    // Dispatch-packet debugging: logs raw op-0 payloads into imdiscord.log,
+    // truncated past the first screenful. types_csv is a comma-separated list
+    // of dispatch names (empty or "*" means everything). Also enabled at
+    // startup from the IMD_GWDUMP environment variable.
+    void set_dispatch_debug(bool on, const char* types_csv);
+    bool dispatch_debug();
+    void dispatch_debug_filter(char* out, int cap);
+
     // The voice region discord ranked first for this connection, or an empty
     // string before READY has arrived. A Go Live stream is created against it.
     const char* preferred_region();

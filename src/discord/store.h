@@ -80,9 +80,10 @@ namespace store
 
     // ---- relationships ----
     void set_relationship(snowflake user_id, int type, const char* nickname,
-                          const char* since);
+                          const char* since, const char* note);
     void remove_relationship(snowflake user_id);
     int relationship_type(snowflake user_id);
+    const char* relationship_note(snowflake user_id);
 
     // When the friendship began, as discord wrote it, or null. Kept from the
     // relationship list at sign-in; there is nowhere else to ask for it.

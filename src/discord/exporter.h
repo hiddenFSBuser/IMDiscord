@@ -29,6 +29,15 @@ namespace exporter
     bool channel_to_html(snowflake channel_id, const wchar_t* path,
                          export_attachments files);
 
+    // Same, but warms the channel first on a worker thread: the page then
+    // holds the whole history with fresh attachment addresses instead of
+    // whatever happened to be looked at. Poll exporting()/export_status()
+    // while it runs; starting another one meanwhile is ignored.
+    void export_channel_async(snowflake channel_id, const wchar_t* path,
+                              export_attachments files);
+    bool exporting();
+    const char* export_status();
+
     // Everything the archive holds, one file per channel, into a folder.
     // Returns how many channels were written.
     int everything_to_html(const wchar_t* folder, export_attachments files);

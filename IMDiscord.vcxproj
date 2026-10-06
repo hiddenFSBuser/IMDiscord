@@ -96,7 +96,7 @@
       <StackReserveSize>2097152</StackReserveSize>
       <StackCommitSize>2097152</StackCommitSize>
       <GenerateMapFile>true</GenerateMapFile>
-      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;shell32.lib;ole32.lib;oleaut32.lib;advapi32.lib;comdlg32.lib;winhttp.lib;ws2_32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;imm32.lib;bcrypt.lib;crypt32.lib;avrt.lib;winmm.lib;$(ProjectDir)src\libs\opus\lib\opus.lib;$(ProjectDir)src\libs\rnnoise\rnnoise.lib</AdditionalDependencies>
+      <AdditionalDependencies>kernel32.lib;user32.lib;gdi32.lib;shell32.lib;ole32.lib;oleaut32.lib;advapi32.lib;comdlg32.lib;winhttp.lib;ws2_32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;imm32.lib;crypt32.lib;avrt.lib;winmm.lib;$(ProjectDir)src\libs\opus\lib\opus.lib;$(ProjectDir)src\libs\rnnoise\rnnoise.lib</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
 
@@ -292,6 +292,7 @@
     <ClCompile Include="src\video\rtp_video.cpp" />
     <ClCompile Include="src\video\encoder.cpp" />
     <ClCompile Include="src\video\screenshare.cpp" />
+    <ClCompile Include="src\video\streampreview.cpp" />
     <ClCompile Include="src\ui\theme.cpp" />
     <ClCompile Include="src\ui\ui.cpp" />
     <ClCompile Include="src\ui\ui_chat.cpp" />
@@ -458,6 +459,7 @@
     <ClInclude Include="src\video\rtp_video.h" />
     <ClInclude Include="src\video\encoder.h" />
     <ClInclude Include="src\video\screenshare.h" />
+    <ClInclude Include="src\video\streampreview.h" />
     <ClInclude Include="src\ui\ui.h" />
     <ClInclude Include="src\ui\ui_state.h" />
   </ItemGroup>

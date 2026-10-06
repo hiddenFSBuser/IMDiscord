@@ -276,27 +276,53 @@ extern "C" void __stdcall im_entry()
     }
 
     // "--tlstest" checks the hand written transport against the real thing:
-    // socket, handshake, certificate, one request, one answer.
+    // socket, handshake, certificate, one request, one answer. An optional
+    // host follows after a space ("--tlstest www.google.com") for testing
+    // against servers that are not filtered; without one it is discord.com.
     {
         bool wanted = false;
+        const wchar_t* host_at = 0;
         for (const wchar_t* p = cmdline; *p; p++)
         {
             if (p[0] == L'-' && p[1] == L'-' && p[2] == L't' && p[3] == L'l' && p[4] == L's' &&
                 p[5] == L't' && p[6] == L'e' && p[7] == L's' && p[8] == L't')
             {
                 wanted = true;
+                host_at = p + 9;
                 break;
             }
         }
 
         if (wanted)
         {
+            char host[256];
+            ccstrncpy(host, "discord.com", sizeof(host) - 1);
+
+            if (host_at)
+            {
+                while (*host_at == L' ' || *host_at == L'"') host_at++;
+                if (*host_at && *host_at != L'-')
+                {
+                    int i = 0;
+                    while (host_at[i] && host_at[i] != L' ' && host_at[i] != L'"' &&
+                           i < (int)sizeof(host) - 1)
+                    {
+                        // Host names are ASCII by construction; anything else
+                        // ends the token rather than corrupts it.
+                        if (host_at[i] > 127) break;
+                        host[i] = (char)host_at[i];
+                        i++;
+                    }
+                    if (i > 0) host[i] = 0;
+                }
+            }
+
             // The second half of the test goes through http::, which needs
             // its agent set the same way the client sets it.
             proxy::init();
             http::init("IMDiscord/1.0");
 
-            bool ok = tlsnet::self_test("discord.com");
+            bool ok = tlsnet::self_test(host);
             WSACleanup();
             log_shutdown();
             ExitProcess(ok ? 0 : 1);

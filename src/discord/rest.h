@@ -2,6 +2,8 @@
 #include "types.h"
 #include "net/http.h"
 
+struct jval;
+
 // REST side of the discord API. Every high level call is fire-and-forget: it
 // posts a job, the worker performs the blocking request and folds the result
 // into the store, and the UI notices on its next frame.
@@ -107,6 +109,8 @@ namespace api
     // has never been told about. A bot is told about none of its direct
     // conversations, so for one this is the only way to learn what they are.
     void fetch_channel(snowflake channel_id);
+    // One guild member by id (roles, nickname, join date included).
+    void fetch_guild_member(snowflake guild_id, snowflake user_id);
     void ack_message(snowflake channel_id, snowflake message_id);
     // Writes the presence into the account settings, so it survives a restart
     // and reaches the user's other clients. The socket handles the immediate
@@ -128,7 +132,67 @@ namespace api
     // values are the chosen options and are ignored for a button.
     void use_component(snowflake guild_id, snowflake channel_id, snowflake message_id,
                        snowflake application_id, int component_type,
-                       const char* custom_id, const char* const* values, int value_count);
+                       const char* custom_id, const char* const* values, int value_count,
+                       int message_flags);
+
+    // ---- bot forms (modals) ----
+    // A button whose answer is a type-9 interaction response: a form the bot
+    // describes on the spot. The worker parses it into this and the interface
+    // shows it; the filled copy comes back through submit_modal.
+    struct modal_option
+    {
+        char label[100];
+        char value[100];
+        char description[100];
+    };
+
+    struct modal_field
+    {
+        int kind;               // 4 text, 3/5/6/7/8 a menu, anything else echoed back untouched
+        char custom_id[128];
+        char label[160];
+        char placeholder[256];
+        bool required;
+        int min_len;
+        int max_len;
+        int style;              // text only: 1 one line, 2 paragraph
+
+        char text[4096];        // the answer being typed
+
+        modal_option options[25];
+        int option_count;
+        int selected;           // menu choice, -1 for none
+        int min_values;
+        int max_values;
+    };
+
+    struct modal_form
+    {
+        char title[160];
+        char custom_id[128];
+        // data.id from the interaction response, when it carries one. A
+        // string in the protocol, not a number; empty means the submit
+        // carries no id at all.
+        char submit_id[32];
+
+        snowflake guild_id;
+        snowflake channel_id;
+        snowflake application_id;
+
+        modal_field fields[12];
+        int field_count;
+    };
+
+    // Takes a form the worker parsed, if one arrived. True when out was
+    // filled and a popup should open for it.
+    bool take_pending_modal(modal_form* out);
+    // Sends the filled form back (interaction type 5).
+    void submit_modal(const modal_form* form);
+    // A form that arrived over the gateway (INTERACTION_MODAL_CREATE) rather
+    // than in a POST response. Opens it only when its nonce matches a click
+    // this client sent: the same account in a browser must not pop a window
+    // over here.
+    void handle_modal_dispatch(const jval* d);
 
     void delete_message(snowflake channel_id, snowflake message_id);
     // Rings the other side of a direct-message call. Joining the voice channel
@@ -142,7 +206,7 @@ namespace api
     // a captcha. Solving one is the person's job, not this client's: the token
     // they come back with is passed through here and nothing more.
     void send_friend_request(const char* username, const char* captcha_key = 0,
-                             const char* captcha_rqtoken = 0);
+                             const char* captcha_rqtoken = 0, const char* note = 0);
 
     // What the last refusal asked for. Empty when nothing is pending.
     // The identifiers this run of the client reports in its properties.
@@ -153,8 +217,12 @@ namespace api
 
     const char* captcha_sitekey();
     const char* captcha_rqtoken();
+    const char* captcha_session();
     void clear_captcha();
-    void accept_friend_request(snowflake user_id);
+    // Accepts an incoming request. confirm answers the "is this a stranger"
+    // question discord asks about people it does not recognise: without it
+    // the accept comes back 400/80013.
+    void accept_friend_request(snowflake user_id, bool confirm);
     // Declines an incoming request, cancels an outgoing one, or removes a friend.
     void remove_relationship(snowflake user_id);
     void block_user(snowflake user_id);

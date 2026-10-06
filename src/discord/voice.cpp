@@ -59,6 +59,12 @@ enum
     VOP_VIDEO = 12,
     VOP_CLIENT_DISCONNECT = 13,
 
+    // What this side wants to be sent: a quality per video source, plus an
+    // "any" fallback for sources not named yet. Nothing video arrives without
+    // it - opening a camera window without subscribing is a window that waits
+    // forever, which is exactly what it did before this opcode was sent.
+    VOP_MEDIA_SINK_WANTS = 15,
+
     // DAVE. Ops 21-24 arrive as JSON, 25-31 as binary frames shaped
     // [uint16 seq][uint8 opcode][payload].
     VOP_DAVE_PREPARE_TRANSITION = 21,
@@ -298,6 +304,12 @@ namespace
     // outside has cost several rounds already.
     const char* g_stop_reason = "";
     unsigned short g_last_close = 0;
+
+    // Until when the notification sounds stay off. Set when a 4014 schedules
+    // a rejoin: everything that chimes in the next seconds - our leave, our
+    // return, the stream stopping and starting again - is one server rotation,
+    // not four events. Cleared by manual actions (leave() first of all).
+    volatile unsigned long long g_hush_until_ms = 0;
 
     unsigned long long g_tick = 0;
 
@@ -1321,6 +1333,35 @@ namespace
         w.free_writer();
     }
 
+    // Asks the server to forward one camera's video to this side. The shape
+    // mirrors the stream viewer's: an "any" fallback plus the source named
+    // by its video ssrc at full quality. With no source named the payload is
+    // just the fallback, which drops the previous subscription.
+    void send_sink_wants(unsigned int video_ssrc)
+    {
+        if (!g_ws.is_open()) return;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_i64("op", VOP_MEDIA_SINK_WANTS);
+        w.key("d");
+        w.begin_obj();
+        w.kv_i64("any", 100);
+
+        if (video_ssrc)
+        {
+            char key[24];
+            cnprint(key, sizeof(key), "%u", video_ssrc);
+            w.kv_i64(key, 100);
+        }
+        w.end_obj();
+        w.end_obj();
+
+        send_json(&w);
+        w.free_writer();
+    }
+
     void send_heartbeat_now()
     {
         if (!g_ws.is_open()) return;
@@ -1413,6 +1454,14 @@ namespace
         // switches the socket to non-blocking right after.
         DWORD timeout = 250;
         setsockopt(g_udp, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
+
+        // A video keyframe arrives as a burst of packets - and cameras ride
+        // this socket, not the stream one. The default receive buffer drops
+        // the tail of the burst, the frame is then unrecoverable (a protected
+        // frame with a hole does not decrypt), and voice interleaved with it
+        // loses packets too. Same megabyte as the stream viewer keeps.
+        int rcvbuf = 1 << 20;
+        setsockopt(g_udp, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
         return true;
     }
 
@@ -1467,6 +1516,15 @@ namespace
     unsigned long long g_stat_at = 0;
 
     // ---- rtp -----------------------------------------------------------
+
+    // Two bytes the server ignores, keeping a silent call's NAT mapping
+    // alive. Called from the tick, so only while the session is up.
+    void send_keepalive()
+    {
+        if (g_udp == INVALID_SOCKET) return;
+        const unsigned char ping[2] = { 0x13, 0x37 };
+        proxy::udp_send(&g_udp_route, ping, sizeof(ping));
+    }
 
     int send_audio(const unsigned char* opus_data, int opus_len)
     {
@@ -1686,6 +1744,20 @@ namespace
     volatile long g_camera_packets = 0;
     bool g_camera_decoding = false;
 
+    // One-shot diagnostics for the camera being watched: first packet, first
+    // assembled frame, decoder start failure. Reset whenever the watched
+    // camera changes, so opening the same window again reports again.
+    bool g_cam_logged_packet = false;
+    bool g_cam_logged_frame = false;
+    bool g_cam_logged_decfail = false;
+
+    // Video sources heard from that match no known camera: simulcast layers
+    // the server forwards under a source op 12 never announced, or a source
+    // that changed without one. The first few are logged so a window that
+    // waits forever can be told apart from one with nothing arriving at all.
+    unsigned int g_cam_unknown_ssrc[8];
+    int g_cam_unknown_count = 0;
+
     camera* find_camera(snowflake user_id)
     {
         for (unsigned int i = 0; i < g_cameras.count; i++)
@@ -1723,15 +1795,43 @@ namespace
     // one being watched is decoded: the rest are tracked so the badge stays
     // honest without paying for pictures nobody is looking at.
     void feed_camera(unsigned int ssrc, const unsigned char* media, int len,
-                     bool marker, unsigned short seq, unsigned int timestamp)
+                     bool marker, unsigned short seq, unsigned int timestamp,
+                     unsigned int pt)
     {
         camera* cam = find_camera_by_ssrc(ssrc);
-        if (!cam) return;
+        if (!cam)
+        {
+            // Retransmissions ride under their own source and are answered
+            // from the originals, so they are not evidence of anything.
+            for (unsigned int i = 0; i < g_cameras.count; i++)
+                if (g_cameras[i].rtx_ssrc && g_cameras[i].rtx_ssrc == ssrc) return;
+
+            if (g_cam_unknown_count < 8)
+            {
+                bool seen = false;
+                for (int i = 0; i < g_cam_unknown_count; i++)
+                    if (g_cam_unknown_ssrc[i] == ssrc) { seen = true; break; }
+
+                if (!seen)
+                {
+                    g_cam_unknown_ssrc[g_cam_unknown_count++] = ssrc;
+                    log_line("voice: видеопакеты (pt %u) от неизвестного источника %u - "
+                             "op 12 его не объявлял", pt, ssrc);
+                }
+            }
+            return;
+        }
 
         cam->last_packet_tick = g_tick;
         InterlockedIncrement(&g_camera_packets);
 
         if (cam->user_id != g_watched_camera) return;
+
+        if (!g_cam_logged_packet)
+        {
+            g_cam_logged_packet = true;
+            log_line("voice: пошли пакеты камеры %llu (ssrc %u)", cam->user_id, ssrc);
+        }
 
         if (!cam->rx_ready)
         {
@@ -1745,9 +1845,25 @@ namespace
                              &frame, &frame_len))
             return;
 
+        if (!g_cam_logged_frame)
+        {
+            g_cam_logged_frame = true;
+            log_line("voice: первый кадр камеры %llu собран (%u байт)", cam->user_id, frame_len);
+        }
+
         if (!g_camera_decoding)
         {
-            if (!vdec::start()) return;
+            if (!vdec::start())
+            {
+                if (!g_cam_logged_decfail)
+                {
+                    g_cam_logged_decfail = true;
+                    const char* why = vdec::last_error();
+                    log_line("voice: декодер камеры не стартовал: %s",
+                             why && why[0] ? why : "без причины");
+                }
+                return;
+            }
             g_camera_decoding = true;
         }
 
@@ -1765,6 +1881,30 @@ namespace
         g_cameras = ulist<camera>();
         g_watched_camera = 0;
         if (g_camera_decoding) { vdec::stop(); g_camera_decoding = false; }
+    }
+
+    // (Re)subscribes to whatever camera is being watched, if any and if the
+    // session is up. The server forgets subscriptions on a new voice session,
+    // and a camera restarted with a new source needs a new one too - so this
+    // runs on watch, on (re)connect and on source changes alike.
+    void resubscribe_camera()
+    {
+        if (!g_locks_ready) return;
+        if (!g_session_ready || !g_ws.is_open()) return;
+
+        unsigned int video_ssrc = 0;
+        snowflake watched = 0;
+
+        EnterCriticalSection(&g_speakers_lock);
+        watched = g_watched_camera;
+        camera* cam = find_camera(watched);
+        if (cam) video_ssrc = cam->video_ssrc;
+        LeaveCriticalSection(&g_speakers_lock);
+
+        if (!watched) return;
+
+        send_sink_wants(video_ssrc);
+        log_line("voice: подписка на камеру %llu (video ssrc %u)", watched, video_ssrc);
     }
 
     // ---- per-speaker pcm rings ------------------------------------------
@@ -2334,7 +2474,11 @@ namespace
         media_stats_tick();
         control_tick();
 
-        for (int i = 0; i < 32; i++)
+        // Sixty-four packets per 20 ms tick: a video keyframe burst is tens
+        // of packets at once, and draining it in ones would leave the tail
+        // sitting through several frames. The per-packet work is decrypt and
+        // decode dispatch, microseconds each - nowhere near the tick budget.
+        for (int i = 0; i < 64; i++)
         {
             int got = proxy::udp_recv(&g_udp_route, packet, (int)sizeof(packet));
             if (got <= 0) break;
@@ -2455,7 +2599,7 @@ namespace
                     ((unsigned int)packet[6] << 8) | packet[7];
 
                 EnterCriticalSection(&g_speakers_lock);
-                feed_camera(ssrc, media, len, marker, seq, timestamp);
+                feed_camera(ssrc, media, len, marker, seq, timestamp, packet_pt);
                 LeaveCriticalSection(&g_speakers_lock);
                 continue;
             }
@@ -2706,6 +2850,11 @@ namespace
             // thread straight out of the speaker rings, at the device's pace.
             report_stats();
 
+            // NAT keepalive after abaddon: two bytes the server ignores,
+            // every ten seconds, so a silent call (muted microphone, no RTCP
+            // on webrtc) does not let the home router forget the mapping.
+            if ((g_tick % 500) == 0) send_keepalive();
+
             // Connected, but with no group there is nothing to encrypt to and
             // nothing to unwrap with: the call is silent in both directions
             // and nothing on screen says why. Rejoining does not always help,
@@ -2743,6 +2892,16 @@ namespace
             else if (remain_ms < -200)
             {
                 // Fell far behind (suspend/resume); resync the schedule.
+                // Logged, throttled: a tick that cannot keep its 20 ms means
+                // the machine - not the network - is dropping media, and that
+                // is otherwise indistinguishable from packet loss.
+                static unsigned long long last_logged = 0;
+                unsigned long long now_ms = GetTickCount64();
+                if (now_ms - last_logged > 5000)
+                {
+                    last_logged = now_ms;
+                    log_line("voice: тик отстал на %d мс, догоняю", (int)-remain_ms);
+                }
                 QueryPerformanceCounter(&start);
                 ticks_done = 0;
             }
@@ -2871,10 +3030,15 @@ namespace
         g_logged_decrypt_fail = false;
         g_logged_no_capture = false;
         g_logged_dave_frame = false;
+        g_cam_unknown_count = 0;
 
         InterlockedExchange(&g_session_ready, 1);
         set_status(VOICE_CONNECTED, g_dave_active ? tr("В канале, согласование E2EE...") : tr("В голосовом канале"));
         log_line("voice: session established");
+
+        // A new voice session forgets subscriptions: whatever camera was
+        // being watched needs asking for again.
+        resubscribe_camera();
     }
 
     void handle_webrtc_description(const jval* d)
@@ -3056,6 +3220,7 @@ namespace
             log_line("voice: сессия восстановлена");
             set_status(VOICE_CONNECTED, g_dave_active ? tr("В канале, согласование E2EE...")
                                                       : tr("В голосовом канале"));
+            resubscribe_camera();
             break;
 
         case VOP_SESSION_DESCRIPTION:
@@ -3135,6 +3300,11 @@ namespace
 
             if (!uid) break;
 
+            // A restarted camera comes back under a new source, and the
+            // subscription names the source - so a change under the camera
+            // being watched needs a new one. Sent after the lock below.
+            bool resub_needed = false;
+
             EnterCriticalSection(&g_speakers_lock);
 
             // The audio ssrc comes with it, and it is often the first place a
@@ -3159,19 +3329,25 @@ namespace
                     fresh.user_id = uid;
                     g_cameras.push(fresh);
                     cam = &g_cameras[g_cameras.count - 1];
+                    resub_needed = true;
                 }
 
                 if (cam->video_ssrc != video_ssrc)
                 {
                     if (cam->rx_ready) rtpvid::rx_reset(&cam->rx);
                     cam->video_ssrc = video_ssrc;
+                    resub_needed = true;
                 }
                 cam->rtx_ssrc = rtx_ssrc;
 
                 log_line("voice: камера включена у %llu (video ssrc %u)", uid, video_ssrc);
             }
 
+            if (resub_needed && uid != g_watched_camera) resub_needed = false;
+
             LeaveCriticalSection(&g_speakers_lock);
+
+            if (resub_needed) resubscribe_camera();
             break;
         }
 
@@ -3233,6 +3409,11 @@ namespace
 
     unsigned long long g_last_rejoin_ms = 0;
     int g_rejoins = 0;
+
+    // A light 4014 recovery in flight. The death of one socket cannot be
+    // reported twice (the reporter is the socket), so a taken flag here
+    // means crossed wires - back off rather than pile a second recovery on.
+    volatile long g_rejoining = 0;
 
     // Coming back is worth trying once or twice. A channel that hangs up on
     // every attempt is refusing us for a reason this client cannot see, and
@@ -3412,6 +3593,11 @@ namespace
                      "возвращаемся в канал %llu (попытка %d)", g_channel_id, g_rejoins);
             set_status(VOICE_CONNECTING, tr("Связь потеряна, возвращаюсь в канал..."));
 
+            // A rotation, not an event: mute the leave chime, the rejoin
+            // chime and the stream stopping and starting again. Manual
+            // actions clear this first.
+            voice::hush(30000);
+
             rejoin_request* r = (rejoin_request*)memalloc(sizeof(rejoin_request));
             if (r)
             {
@@ -3530,25 +3716,72 @@ namespace
         g_mode = MODE_NONE;
         ccfset(g_secret_key, 0, sizeof(g_secret_key));
     }
+    // Rebuilds only the connection below a live call after discord ended
+    // the session on its own (4014): a fresh voice websocket + handshake on
+    // the new session, with capture, render, encoder, speakers, cameras and
+    // volumes untouched. Called with the fresh state+server already in hand.
+    void rehandshake_voice()
+    {
+        // Crypto belongs to the dead session: the same key material must
+        // never wrap again, and the old epoch is gone with it. Media state
+        // (who talks, how loud, what was half-decoded) stays - it is still
+        // true, and keeping the speaker mapping is what lets audio resume on
+        // the first frames instead of waiting for everyone to speak again.
+        g_dave_active = false;
+        g_group_ready = false;
+        g_media_ready = false;
+        g_key_package_ready = false;
+        g_dave_nonce = 0;
+        g_dave_version = 0;
+        g_dave_version_next = 0;
+        g_dave_downgraded = false;
+        g_last_transition_done = 0xFFFFFFFF;
+        g_last_reinit_tick = 0;
+        g_have_pending_commit = false;
+        g_pending_transition = 0;
+        g_own_commit_ready = false;
+        g_own_commit_won = false;
+        dave::reset_ratchets();
+        g_mode = MODE_NONE;
+        ccfset(g_secret_key, 0, sizeof(g_secret_key));
+
+        // The socket still points at the dead server. The tick idles on the
+        // missing session flag, so nothing races this.
+        proxy::close_udp(&g_udp_route);
+        if (g_udp != INVALID_SOCKET) { closesocket(g_udp); g_udp = INVALID_SOCKET; }
+
+        // Reap the thread that reported the death (it has exited by now),
+        // then open a new socket on the new session. Heartbeat and tick
+        // threads never stopped.
+        if (g_ws_thread) { WaitForSingleObject(g_ws_thread, 4000); CloseHandle(g_ws_thread); g_ws_thread = 0; }
+        g_ws_thread = CreateThread(0, 0, voice_ws_thread, 0, 0, 0);
+
+        log_line("voice: сокет пересоздан, жду рукопожатие новой сессии");
+    }
+
     // Rebuilds the session after discord ended it on its own.
     //
     // On a thread of its own because the one that noticed cannot do this:
     // stopping the session waits for the websocket thread to finish, and the
     // websocket thread is the one asking. It would wait for itself.
+    //
+    // Light path first, after abaddon: the media below never stopped, so the
+    // call is re-announced in place (no goodbye first - leaving drops our
+    // stream registrations and flashes a leave+join to everyone else) and
+    // only the socket is rebuilt off the fresh state+server. The heavy path
+    // below stays for when the server never answers: then leaving for real
+    // is what makes the next join a transition again.
     DWORD WINAPI rejoin_thread(LPVOID param)
     {
         rejoin_request* r = (rejoin_request*)param;
 
-        // Everything the dead session left behind - the thread handles, the
-        // udp socket, the encoder, the speaker rings - goes here, on a thread
-        // that is allowed to wait for all of it. Skipping this is what used
-        // to leave the client believing it was still in the channel: a join
-        // back into it did nothing at all, and the only way in was to leave
-        // and walk in again by hand.
-        g_stop_reason = "4014, возвращаемся";
+        if (InterlockedCompareExchange(&g_rejoining, 1, 0) != 0)
+        {
+            memfree(r);
+            return 0;
+        }
 
         long era = g_generation;
-        stop_voice_connection();
 
         // The gateway is usually down at this exact moment: a voice 4014
         // almost always means its session went first, and the voice server
@@ -3556,11 +3789,111 @@ namespace
         // shouting into a closed door - the log showed both announcements
         // going out while the gateway was between sessions, and neither of
         // them arriving anywhere.
-        for (int i = 0; i < 100 && g_running == 0; i++)
+        for (int i = 0; i < 100; i++)
         {
+            if (!g_running) break;
             if (gateway::state() == GW_READY) break;
             Sleep(100);
         }
+
+        // Hung up or moved elsewhere while the gateway was coming back.
+        if (!g_running || g_channel_id != r->channel || g_generation != era)
+        {
+            log_line("voice: возврат отменён - за это время всё изменилось");
+            InterlockedExchange(&g_rejoining, 0);
+            memfree(r);
+            return 0;
+        }
+
+        // Same channel, no goodbye first. The pair the gateway answers with -
+        // a fresh voice session id and a server - is what the socket below is
+        // rebuilt off. The flags are cleared first so a stale pair cannot
+        // pass for a fresh one.
+        g_have_server = false;
+        g_have_state = false;
+        gateway::update_voice_state(r->guild, r->channel, g_muted, g_deafened);
+
+        bool pair = false;
+        bool moved_on = false;
+        for (int i = 0; i < 100; i++)
+        {
+            if (!g_running || g_channel_id != r->channel || g_generation != era)
+            {
+                moved_on = true;
+                break;
+            }
+            if (g_have_server && g_have_state) { pair = true; break; }
+            Sleep(100);
+        }
+
+        if (!moved_on && pair)
+        {
+            log_line("voice: 4014 - пересобираю сокет без разбора медиа");
+            rehandshake_voice();
+
+            // The socket rebuilds below; media resumes when the new
+            // session handshakes. If it never does, fall through to the
+            // heavy path rather than sit connected to nothing.
+            bool up = false;
+            for (int i = 0; i < 300; i++)
+            {
+                if (!g_running || g_channel_id != r->channel || g_generation != era)
+                {
+                    moved_on = true;
+                    break;
+                }
+                if (g_session_ready) { up = true; break; }
+                Sleep(100);
+            }
+
+            InterlockedExchange(&g_rejoining, 0);
+            if (up)
+            {
+                log_line("voice: 4014 - сессия восстановлена без разбора медиа");
+                memfree(r);
+                return 0;
+            }
+            if (moved_on)
+            {
+                log_line("voice: возврат отменён - за это время всё изменилось");
+                memfree(r);
+                return 0;
+            }
+
+            log_line("voice: 4014 - новая сессия не поднялась, ухожу и захожу заново");
+        }
+        else if (!moved_on)
+        {
+            log_line("voice: 4014 - сервер не выдал новую сессию, ухожу и захожу заново");
+        }
+        else
+        {
+            log_line("voice: возврат отменён - за это время всё изменилось");
+            InterlockedExchange(&g_rejoining, 0);
+            memfree(r);
+            return 0;
+        }
+
+        // Re-checked before touching anything: the waits above may have ended
+        // because the call moved on, and announcing a leave for a call that
+        // is being rebuilt by hand would kill it.
+        if (!g_running || g_channel_id != r->channel || g_generation != era)
+        {
+            log_line("voice: возврат отменён - за это время всё изменилось");
+            InterlockedExchange(&g_rejoining, 0);
+            memfree(r);
+            return 0;
+        }
+
+        // Heavy fallback: the announcement was not answered (or the call
+        // moved on while it was in flight). Everything the dead session left
+        // behind - the thread handles, the udp socket, the encoder, the
+        // speaker rings - goes here, on a thread that is allowed to wait for
+        // all of it. Skipping this is what used to leave the client believing
+        // it was still in the channel: a join back into it did nothing at
+        // all, and the only way in was to leave and walk in again by hand.
+        g_stop_reason = "4014, возвращаемся";
+        stop_voice_connection();
 
         // Discord still has us in the channel, so asking to join the channel
         // we are already in is not a change and brings no new voice server.
@@ -3580,11 +3913,13 @@ namespace
         if (g_generation != era + 1 || g_channel_id != r->channel)
         {
             log_line("voice: возврат отменён - за это время всё изменилось");
+            InterlockedExchange(&g_rejoining, 0);
             memfree(r);
             return 0;
         }
 
         voice::join(r->guild, r->channel);
+        InterlockedExchange(&g_rejoining, 0);
         memfree(r);
         return 0;
     }
@@ -3678,6 +4013,10 @@ void voice::join(snowflake guild_id, snowflake channel_id)
 
 void voice::leave()
 {
+    // Deliberate, so any quiet recovery in progress ends here: something the
+    // person did themselves sounds.
+    hush(0);
+
     // Played here rather than left to the gateway: by the time the dispatch
     // announcing our own departure arrives the channel has been forgotten,
     // and the handler there has nothing left to compare against.
@@ -3744,7 +4083,18 @@ void voice::set_deafened(bool d)
 bool voice::deafened() { return g_deafened; }
 
 const char* voice::last_stop_reason() { return g_stop_reason; }
-unsigned short voice::last_close_code() { return g_last_close; }
+
+void voice::hush(unsigned long long ms)
+{
+    g_hush_until_ms = ms ? GetTickCount64() + ms : 0;
+}
+
+bool voice::hushed()
+{
+    if (!g_hush_until_ms) return false;
+    if (GetTickCount64() >= g_hush_until_ms) { g_hush_until_ms = 0; return false; }
+    return true;
+}unsigned short voice::last_close_code() { return g_last_close; }
 
 bool voice::is_speaking(snowflake user_id)
 {
@@ -3826,10 +4176,23 @@ void voice::watch_camera(snowflake user_id)
         camera* now = find_camera(user_id);
         if (now && now->rx_ready) rtpvid::rx_reset(&now->rx);
 
+        // Counters and one-shot diagnostics run per viewing: the window
+        // shows them, and a second opening should report from zero.
+        InterlockedExchange(&g_camera_packets, 0);
+        InterlockedExchange(&g_camera_frames, 0);
+        g_cam_logged_packet = false;
+        g_cam_logged_frame = false;
+        g_cam_logged_decfail = false;
+
         log_line(user_id ? "voice: смотрю камеру %llu" : "voice: камера закрыта", user_id);
     }
 
     LeaveCriticalSection(&g_speakers_lock);
+
+    // Outside the lock: sending takes the socket's own lock, and the watch
+    // is what the subscription follows, in both directions.
+    resubscribe_camera();
+    if (!user_id) send_sink_wants(0);
 }
 
 bool voice::take_camera_frame(const unsigned char** rgba, int* width, int* height)
@@ -3841,6 +4204,31 @@ bool voice::take_camera_frame(const unsigned char** rgba, int* width, int* heigh
 int voice::camera_width() { return g_camera_decoding ? vdec::width() : 0; }
 int voice::camera_height() { return g_camera_decoding ? vdec::height() : 0; }
 unsigned int voice::camera_frames() { return (unsigned int)g_camera_frames; }
+unsigned int voice::camera_packets() { return (unsigned int)g_camera_packets; }
+
+unsigned int voice::camera_dropped()
+{
+    if (!g_locks_ready) return 0;
+
+    EnterCriticalSection(&g_speakers_lock);
+    unsigned int dropped = 0;
+    camera* cam = find_camera(g_watched_camera);
+    if (cam && cam->rx_ready) dropped = cam->rx.dropped;
+    LeaveCriticalSection(&g_speakers_lock);
+    return dropped;
+}
+
+unsigned int voice::camera_video_ssrc()
+{
+    if (!g_locks_ready) return 0;
+
+    EnterCriticalSection(&g_speakers_lock);
+    unsigned int ssrc = 0;
+    camera* cam = find_camera(g_watched_camera);
+    if (cam) ssrc = cam->video_ssrc;
+    LeaveCriticalSection(&g_speakers_lock);
+    return ssrc;
+}
 
 float voice::user_volume(snowflake user_id)
 {
@@ -4032,6 +4420,16 @@ void voice::on_gateway_voice_server(const jval* d)
 
 void voice::on_gateway_disconnected()
 {
+    // A 4014 recovery already owns this outage: it is waiting on the fresh
+    // READY that called this, and tearing the session down underneath it
+    // would turn a socket rebuild into a full one - or cancel it outright
+    // when the generation guard trips over the extra stop.
+    if (g_running && g_channel_id && !g_session_ready)
+    {
+        g_stop_reason = "гейтвей отключился";
+        return;
+    }
+
     g_stop_reason = "гейтвей отключился";
     stop_voice_connection();
     if (g_channel_id) set_status(VOICE_IDLE, tr("Соединение потеряно"));

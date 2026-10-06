@@ -197,7 +197,7 @@ rem ---- link -----------------------------------------------------------------
 echo [build] linking
 rem mfplat/mfuuid are the Media Foundation imports the H.264 encoder needs. Like
 rem winhttp and d3d11 they are plain system DLLs, so no CRT comes with them.
-set LIBS=kernel32.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib comdlg32.lib ws2_32.lib dwmapi.lib imm32.lib bcrypt.lib crypt32.lib avrt.lib winmm.lib mfplat.lib mfuuid.lib mmdevapi.lib iphlpapi.lib "%SRC%\libs\rnnoise\rnnoise.lib"
+set LIBS=kernel32.lib user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib comdlg32.lib ws2_32.lib dwmapi.lib imm32.lib crypt32.lib avrt.lib winmm.lib mfplat.lib mfuuid.lib mmdevapi.lib iphlpapi.lib "%SRC%\libs\rnnoise\rnnoise.lib"
 
 link /NOLOGO %LFLAGS% /MAP:"%BIN%\IMDiscord.map" /NODEFAULTLIB /ENTRY:im_entry /SUBSYSTEM:WINDOWS /MACHINE:X64 /STACK:0x200000,0x200000 /INCREMENTAL:NO /MANIFEST:NO /OUT:"%BIN%\IMDiscord.exe" @"%RSP%" %LIBS%
 if errorlevel 1 goto :fail

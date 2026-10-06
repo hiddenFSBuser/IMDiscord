@@ -211,21 +211,28 @@ namespace
                             got.free_response();
                         }
 
-                        char rel[200];
-                        cnprint(rel, sizeof(rel), "%s/%s", save_leaf, leaf);
+                        // A copy that never downloaded (an expired address, a
+                        // dead link) must not become a link to a file that is
+                        // not there: fall back to the original address, which
+                        // at least says where the file used to live.
+                        if (ufile::exists(target))
+                        {
+                            char rel[200];
+                            cnprint(rel, sizeof(rel), "%s/%s", save_leaf, leaf);
 
-                        char local[600];
-                        if (a->is_image())
-                            cnprint(local, sizeof(local),
-                                    "<a href=\"%s\"><img src=\"%s\" alt=\"\" loading=\"lazy\"></a>",
-                                    rel, rel);
-                        else
-                            cnprint(local, sizeof(local), "<a href=\"%s\">%s</a>", rel,
-                                    a->filename ? a->filename : tr("файл"));
+                            char local[600];
+                            if (a->is_image())
+                                cnprint(local, sizeof(local),
+                                        "<a href=\"%s\"><img src=\"%s\" alt=\"\" loading=\"lazy\"></a>",
+                                        rel, rel);
+                            else
+                                cnprint(local, sizeof(local), "<a href=\"%s\">%s</a>", rel,
+                                        a->filename ? a->filename : tr("файл"));
 
-                        put_line(&markup, local);
-                        put(&markup, "</div>");
-                        continue;
+                            put_line(&markup, local);
+                            put(&markup, "</div>");
+                            continue;
+                        }
                     }
 
                     char line[1400];
@@ -592,6 +599,13 @@ unsigned int exporter::warm_planned_count()
 
 namespace
 {
+    // Single-channel export in flight. Warm-up below is a shared loop
+    // condition, so a manual warm and an export never fight over it - either
+    // one keeps the pages coming.
+    volatile long g_exporting = 0;
+    char g_export_status[192];
+    HANDLE g_export_thread = 0;
+
     // Pulls one channel back to its beginning, fifty at a time, which is
     // discord's own page size. The archive takes every page as it lands, so a
     // run that is interrupted is not a run that was wasted.
@@ -600,7 +614,7 @@ namespace
         snowflake before = 0;
         unsigned int total = 0;
 
-        for (int page = 0; page < 400 && g_warming; page++)
+        for (int page = 0; page < 400 && (g_warming || g_exporting); page++)
         {
             char path[256];
             if (before)
@@ -711,6 +725,68 @@ void exporter::warm_stop()
 {
     InterlockedExchange(&g_warming, 0);
 }
+
+namespace
+{
+    struct export_job
+    {
+        snowflake channel;
+        wchar_t path[MAX_PATH];
+        export_attachments files;
+    };
+
+    DWORD WINAPI export_thread(LPVOID param)
+    {
+        export_job* j = (export_job*)param;
+
+        // Full history first, so the page holds the channel rather than
+        // whatever happened to be looked at: fresh attachment addresses and
+        // recorded ranges come along with it, which is what makes the media
+        // download and the gap markers go quiet.
+        cnprint(g_export_status, sizeof(g_export_status), tr("Докачиваем историю..."));
+        warm_channel(j->channel);
+
+        cnprint(g_export_status, sizeof(g_export_status), tr("Пишем файл..."));
+        bool ok = exporter::channel_to_html(j->channel, j->path, j->files);
+        cnprint(g_export_status, sizeof(g_export_status),
+                ok ? tr("Экспорт готов") : tr("Экспортировать не удалось"));
+        api::set_last_error(g_export_status);
+
+        memfree(j);
+        InterlockedExchange(&g_exporting, 0);
+        return 0;
+    }
+}
+
+void exporter::export_channel_async(snowflake channel_id, const wchar_t* path,
+                                    export_attachments files)
+{
+    if (InterlockedCompareExchange(&g_exporting, 1, 0) != 0) return;
+    if (!channel_id || !path || !path[0]) { InterlockedExchange(&g_exporting, 0); return; }
+
+    export_job* j = (export_job*)memalloc(sizeof(export_job));
+    if (!j) { InterlockedExchange(&g_exporting, 0); return; }
+    ccfset(j, 0, sizeof(*j));
+    j->channel = channel_id;
+    j->files = files;
+
+    int i = 0;
+    while (path[i] && i < MAX_PATH - 1) { j->path[i] = path[i]; i++; }
+    j->path[i] = 0;
+
+    cnprint(g_export_status, sizeof(g_export_status), tr("Начинаем..."));
+
+    if (g_export_thread) { CloseHandle(g_export_thread); g_export_thread = 0; }
+    g_export_thread = CreateThread(0, 0, export_thread, j, 0, 0);
+    if (!g_export_thread)
+    {
+        memfree(j);
+        InterlockedExchange(&g_exporting, 0);
+    }
+}
+
+bool exporter::exporting() { return g_exporting != 0; }
+const char* exporter::export_status() { return g_export_status; }
 
 bool exporter::warming() { return g_warming != 0; }
 const char* exporter::warm_status() { return g_warm_status; }

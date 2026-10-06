@@ -138,6 +138,11 @@ struct ui_state
     bool open_profile_popup;
     bool open_server_info_popup;
 
+    // Confirming an incoming friend request. The accept button on this one
+    // sends confirm_stranger_request:true; without it discord answers 400.
+    snowflake friend_accept_id;
+    bool open_friend_accept_popup;
+
     // The share setup box, which doubles as the censor picker while a stream
     // is already running.
     bool open_share_popup;
@@ -175,10 +180,15 @@ struct ui_state
     char login_error[256];
     char message_input[3800];
     char friend_input[128];
+    // An optional note attached to a friend request. The recipient sees it
+    // small with the request.
+    char friend_note[256];
 
-    // Held while a friend request is waiting on a captcha: who it was for,
-    // and the token the person brings back. Tokens are long.
+    // Held while a friend request is waiting on a captcha: who it was for
+    // and with what note, and the token the person brings back. Tokens are
+    // long.
     char captcha_for[128];
+    char captcha_note[256];
     char captcha_token[2048];
     char invite_input[192];
     char new_guild_name[128];
@@ -187,6 +197,7 @@ struct ui_state
     ulist<upload_file> pending_files;
 
     // Full-size preview of a chat image.
+    char viewer_save_url[700];
     char viewer_url[512];
     bool viewer_open;
 
@@ -286,6 +297,7 @@ void ui_view_login();
 void ui_view_guild_rail(float width, float height);
 void ui_view_channel_list(float width, float height);
 void ui_view_chat(float width, float height);
+void ui_view_modal_popup();
 void ui_view_members(float width, float height);
 void ui_view_friends(float width, float height);
 const int PROXY_SLOT_DEFAULT = -2;
@@ -307,6 +319,8 @@ void ui_save_guild_order();
 void ui_apply_saved_guild_order();
 
 void ui_view_profile_popup();
+void ui_open_friend_accept(snowflake user_id);
+void ui_view_friend_accept_popup();
 void ui_view_server_info_popup();
 void ui_view_roles_popup();
 void ui_view_invites_popup();
@@ -409,7 +423,13 @@ void ui_view_image_viewer();
 
 // Opens the viewer on one picture. `name` is what a saved copy is called, and
 // may be null to take the last part of the address.
-void ui_open_image_viewer(const char* url, const char* name);
+// save_url is where the bytes to write to disk come from, when that is not
+// the address being shown. A video is displayed as a still frame rendered by
+// discord's proxy, and downloading what is on screen writes a png under the
+// original name - a picture in a file called .mp4. Null means the two are the
+// same, which is the ordinary case.
+void ui_open_image_viewer(const char* url, const char* name,
+                          const char* save_url = 0);
 // Somebody else's screen. Draws nothing while no stream is being watched.
 void ui_view_stream_window();
 void ui_view_camera_window();

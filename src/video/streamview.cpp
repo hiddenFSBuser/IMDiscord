@@ -1618,6 +1618,19 @@ namespace
     // stop itself, so it asks another one to.
     void stop_later(bool notify);
 
+    // What was being watched when the connection went, so it can be picked up
+    // again when the call comes back. Declared up here because the websocket
+    // thread below is what fills it in.
+    //
+    // A gateway session being replaced takes the stream with it, and until now
+    // that was the end of it: the call returned a few seconds later and the
+    // picture did not. Nobody asked for it to stop, so it should not stay
+    // stopped.
+    snowflake g_again_guild = 0;
+    snowflake g_again_channel = 0;
+    snowflake g_again_user = 0;
+    unsigned long long g_again_at = 0;
+
     DWORD WINAPI ws_thread(LPVOID)
     {
         CoInitializeEx(0, COINIT_MULTITHREADED);
@@ -1689,22 +1702,21 @@ namespace
 
         // The socket died while we still thought we were watching.
         //
-        // This is what happens when the person streaming restarts their
-        // client: discord keeps their stream alive for half a minute, so no
-        // STREAM_DELETE arrives, and only the connection to the old stream
-        // server goes. Nothing here noticed - the flag stayed up, the badge
-        // stayed lit, and discord went on counting us as a viewer of a stream
-        // we were no longer receiving. The next press was then read as "stop
-        // watching", and the one after it asked to watch something discord
-        // thought we were already watching.
-        //
-        // Ended properly instead, and discord told about it, so the next press
-        // is a fresh subscription. On a thread of its own because stopping
-        // waits for this one.
+        // The stream is not over, only the connection to it - the gateway
+        // dropping its session takes every stream socket with it, and the
+        // call comes back seconds later without the picture. Remembered for
+        // restore_if_pending, the same as on a gateway drop: a deliberate
+        // stop (the window's own close button) clears this, an involuntary
+        // one must not.
         if (g_running)
         {
-            log_line("watch: связь с трансляцией оборвалась - прекращаю смотреть");
-            stop_later(true);
+            g_again_guild = g_guild_id;
+            g_again_channel = g_channel_id;
+            g_again_user = g_user_id;
+            g_again_at = GetTickCount64();
+
+            log_line("watch: связь с трансляцией оборвалась - вернёмся, когда будет куда");
+            stop_later(false);
         }
 
         CoUninitialize();
@@ -1870,20 +1882,7 @@ bool streamview::watch(snowflake guild_id, snowflake channel_id, snowflake user_
     return true;
 }
 
-// What was being watched when the connection went, so it can be picked up
-// again when the call comes back.
-//
-// A gateway session being replaced takes the stream with it, and until now
-// that was the end of it: the call returned a few seconds later and the
-// picture did not. Nobody asked for it to stop, so it should not stay
-// stopped.
-namespace
-{
-    snowflake g_again_guild = 0;
-    snowflake g_again_channel = 0;
-    snowflake g_again_user = 0;
-    unsigned long long g_again_at = 0;
-}
+// ---------------------------------------------------------------------------
 
 void streamview::stop()
 {
@@ -2052,6 +2051,9 @@ void streamview::on_stream_delete(const jval* d)
     if (key && g_stream_key[0] && ccscmp(key, g_stream_key) != 0) return;
 
     log_line("watch: поток закрыт с той стороны");
+    // The stream is definitively gone - rewatching it would fail - so unlike
+    // every other involuntary stop this one forgets.
+    g_again_user = 0;
     // The stream is already gone, so there is nothing to unsubscribe from.
     stop_later(false);
 }
@@ -2084,6 +2086,23 @@ void streamview::restore_if_pending()
     // something is being watched already.
     if (voice::state() != VOICE_CONNECTED) return;
     if (g_running) { g_again_user = 0; return; }
+
+    // Three rewatch attempts inside five minutes is a server saying no, not
+    // a connection blinking: further attempts would hammer it for nothing.
+    {
+        static int tries = 0;
+        static unsigned long long window = 0;
+
+        unsigned long long now = GetTickCount64();
+        if (now - window > 300000ULL) { tries = 0; window = now; }
+
+        if (++tries > 3)
+        {
+            g_again_user = 0;
+            log_line("watch: сервер не отдаёт трансляцию, автовозврат выключен");
+            return;
+        }
+    }
 
     snowflake guild = g_again_guild;
     snowflake channel = g_again_channel;

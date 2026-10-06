@@ -27,6 +27,13 @@ namespace
     const float MAX_IMAGE_WIDTH = 420.0f;
     const float MAX_IMAGE_HEIGHT = 340.0f;
 
+    // The cursor sits on a picture, a file card, a video or an embed image
+    // rather than on message text. Set while the row draws, read where the
+    // row opens its menu: a right click there belongs to the media menu, and
+    // the message menu opening on top of it is what buried every picture menu
+    // until now.
+    bool g_media_hovered = false;
+
     struct download_job
     {
         char url[600];
@@ -37,11 +44,33 @@ namespace
     {
         download_job* j = (download_job*)user;
 
-        http_response res;
-        res.init();
-        if (http::get(j->url, &res) && res.ok() && res.body.size)
+        // Through the texture cache: a picture that was already looked at is
+        // read off the disk, which survives the address expiring. A fresh
+        // download is the fallback, not the only try.
+        ubuffer blob;
+        blob.init();
+        bool ok = tex::fetch_blob(j->url, &blob) && blob.size;
+
+        if (!ok)
         {
-            if (ufile::write_all(j->path, res.body.data, res.body.size))
+            // The address likely expired. The frame loop sends the refresh
+            // cdnfix queued on the ask above, so wait for it rather than
+            // failing at once.
+            blob.clear();
+            for (int i = 0; i < 20 && !ok; i++)
+            {
+                Sleep(500);
+                const char* live = cdnfix::usable(j->url);
+                if (!live) continue;
+                if (live == j->url) break;   // not expirable: tried already
+                blob.clear();
+                ok = tex::fetch_blob(live, &blob) && blob.size;
+            }
+        }
+
+        if (ok)
+        {
+            if (ufile::write_all(j->path, blob.data, blob.size))
             {
                 char name[MAX_PATH];
                 wcstochar(j->path, name, sizeof(name));
@@ -59,7 +88,7 @@ namespace
             api::set_last_error(tr("Скачивание не удалось"));
         }
 
-        res.free_response();
+        blob.free_buffer();
         memfree(j);
     }
 
@@ -75,11 +104,25 @@ namespace
         blob.init();
 
         // Already on disk in the ordinary case - it is being looked at.
-        if (!tex::fetch_blob(url, &blob) || !blob.size)
+        if ((!tex::fetch_blob(url, &blob) || !blob.size))
         {
-            blob.free_buffer();
-            api::set_last_error(tr("Картинка не загрузилась"));
-            return false;
+            blob.clear();
+
+            // The address likely expired: queue a refresh and try the living
+            // one if it is already known. Copying cannot wait for the round
+            // trip, so a queued refresh reads as "try again".
+            const char* live = cdnfix::usable(url);
+            if (live && live != url && tex::fetch_blob(live, &blob) && blob.size)
+            {
+                // Falls through to decoding below.
+            }
+            else
+            {
+                blob.free_buffer();
+                api::set_last_error(live ? tr("Картинка не загрузилась")
+                                          : tr("Ссылка обновляется, попробуй ещё раз"));
+                return false;
+            }
         }
 
         int w = 0, h = 0, comp = 0;
@@ -269,6 +312,39 @@ namespace
 
         ccstrncpy(out + len, suffix, cap - len - 1);
         out[cap - 1] = 0;
+    }
+
+    // Copies a link, preferring a refreshed one: attachment addresses expire,
+    // and the one stored with an old message opens nowhere. Asking cdnfix
+    // queues a refresh when the stored one is dead, so the next copy gets
+    // the living address; right now the best known one goes.
+    void copy_link_url(const char* url)
+    {
+        if (!url || !url[0]) return;
+        const char* live = cdnfix::usable(url);
+        ImGui::SetClipboardText(live && live[0] ? live : url);
+    }
+
+    // A usable file name for something that has only an address: the tail of
+    // the path, without the query. Falls back to a plain name when the
+    // address carries none.
+    void url_filename(const char* url, const char* fallback, char* out, int cap)
+    {
+        out[0] = 0;
+        if (url && url[0])
+        {
+            const char* tail = url;
+            for (const char* p = url; *p; p++) if (*p == '/') tail = p + 1;
+
+            int i = 0;
+            while (tail[i] && tail[i] != '?' && tail[i] != '&' && i < cap - 1)
+            {
+                out[i] = tail[i];
+                i++;
+            }
+            out[i] = 0;
+        }
+        if (!out[0]) ccstrncpy(out, fallback, cap - 1);
     }
 
     // Whether what is about to be drawn is worth downloading yet.
@@ -713,6 +789,14 @@ namespace
         // Clicking the picture is play and pause, the way it is everywhere.
         ImGui::InvisibleButton("##video", ImVec2(card_w, card_h));
         bool hovered = ImGui::IsItemHovered();
+        if (hovered) g_media_hovered = true;
+
+        if (ImGui::BeginPopupContextItem("##vidctx"))
+        {
+            if (ImGui::MenuItem(tr("Копировать ссылку"))) copy_link_url(a->url);
+            if (ImGui::MenuItem(tr("Скачать"))) start_download(a->url, a->filename);
+            ImGui::EndPopup();
+        }
 
         if (ImGui::IsItemClicked())
         {
@@ -992,7 +1076,243 @@ namespace
     // tags have to be separate items. Wrapping is done here for the same
     // reason: the wrapping a text call does is inside the string it was given,
     // and these are no longer one string.
-    void draw_message_text(const char* text, snowflake guild_id, ImU32 colour)
+    // ---- selecting text with the mouse -------------------------------------
+    //
+    // The message body is laid out by hand, one imgui item per word, so there
+    // is no widget to inherit selection from. What there is instead is better
+    // suited to it: every word already knows its rectangle on screen and its
+    // offset in the message it came from.
+    //
+    // So each word drawn in a frame is written down, and afterwards the two
+    // ends of the drag are turned back into offsets. Copying then takes the
+    // original text between them rather than re-joining the words, which is
+    // what keeps the spacing, the newlines and the emoji shortcodes exactly as
+    // they were typed.
+
+    struct text_span
+    {
+        snowflake message;
+        int from;              // byte offsets into that message's content
+        int to;
+        ImVec2 a, b;           // where it landed on screen
+        const char* text;      // the message body, for measuring inside a word
+    };
+
+    const int MAX_SPANS = 8000;
+
+    text_span g_spans[MAX_SPANS];
+    int g_span_count = 0;
+
+    // Where a selection ends, said in terms that survive a frame: which
+    // message and how far into its text. Span indices would be simpler and
+    // wrong - they shift the moment the list scrolls or a message arrives, and
+    // the selection would quietly slide onto other words.
+    struct text_pos
+    {
+        snowflake message;
+        int offset;
+
+        bool valid() const { return message != 0; }
+
+        bool before(const text_pos& o) const
+        {
+            return message != o.message ? message < o.message : offset < o.offset;
+        }
+    };
+
+    bool g_selecting = false;
+    text_pos g_sel_from = { 0, 0 };
+    text_pos g_sel_to = { 0, 0 };
+
+    void note_span(snowflake message, const char* text, int from, int to)
+    {
+        if (g_span_count >= MAX_SPANS) return;
+
+        text_span& s = g_spans[g_span_count++];
+        s.message = message;
+        s.from = from;
+        s.to = to;
+        s.a = ImGui::GetItemRectMin();
+        s.b = ImGui::GetItemRectMax();
+        s.text = text;
+    }
+
+    // Which character of a word the pointer is nearest. Measured rather than
+    // divided: a proportional font makes every character a different width, and
+    // dividing by an average puts the caret in the wrong place in every word
+    // that is not all the same letter.
+    int offset_in_span(const text_span& s, float x)
+    {
+        int len = s.to - s.from;
+        if (len <= 0) return 0;
+
+        const char* start = s.text + s.from;
+        float best_d = 1e9f;
+        int best = 0;
+
+        for (int i = 0; i <= len; i++)
+        {
+            float d = (s.a.x + ImGui::CalcTextSize(start, start + i).x) - x;
+            if (d < 0) d = -d;
+
+            if (d < best_d) { best_d = d; best = i; }
+        }
+
+        return best;
+    }
+
+    // The word under the pointer, or the nearest one on the closest line. A
+    // drag that leaves the text has to keep meaning something, or selecting to
+    // the end of a message would mean landing exactly on its last letter.
+    bool locate(ImVec2 mouse, text_pos* out)
+    {
+        int best = -1;
+        float best_d = 1e9f;
+
+        for (int i = 0; i < g_span_count; i++)
+        {
+            const text_span& s = g_spans[i];
+
+            float dy = 0.0f;
+            if (mouse.y < s.a.y) dy = s.a.y - mouse.y;
+            else if (mouse.y > s.b.y) dy = mouse.y - s.b.y;
+
+            float dx = 0.0f;
+            if (mouse.x < s.a.x) dx = s.a.x - mouse.x;
+            else if (mouse.x > s.b.x) dx = mouse.x - s.b.x;
+
+            // Lines count for far more than columns: the word beside the
+            // pointer is the right answer, the word above it almost never is.
+            float d = dy * 8.0f + dx;
+
+            if (d < best_d) { best_d = d; best = i; }
+        }
+
+        if (best < 0) return false;
+
+        out->message = g_spans[best].message;
+        out->offset = g_spans[best].from + offset_in_span(g_spans[best], mouse.x);
+        return true;
+    }
+
+    bool have_selection()
+    {
+        return g_sel_from.valid() && g_sel_to.valid() &&
+               (g_sel_from.message != g_sel_to.message ||
+                g_sel_from.offset != g_sel_to.offset);
+    }
+
+    void ordered(text_pos* a, text_pos* b)
+    {
+        *a = g_sel_from;
+        *b = g_sel_to;
+
+        if (b->before(*a)) { text_pos t = *a; *a = *b; *b = t; }
+    }
+
+    // How much of one word falls inside the selection, as byte offsets into
+    // the message. Empty when none of it does.
+    bool span_range(const text_span& s, const text_pos& a, const text_pos& b,
+                    int* lo, int* hi)
+    {
+        if (s.message < a.message || s.message > b.message) return false;
+
+        *lo = s.from;
+        *hi = s.to;
+
+        if (s.message == a.message && a.offset > *lo) *lo = a.offset;
+        if (s.message == b.message && b.offset < *hi) *hi = b.offset;
+
+        return *hi > *lo;
+    }
+
+    void copy_selection()
+    {
+        if (!have_selection()) return;
+
+        text_pos a, b;
+        ordered(&a, &b);
+
+        ubuffer out;
+        out.init(1024);
+
+        // Message by message. Within one, the whole stretch of the original
+        // between the two ends is taken - not the words put back together -
+        // so spaces, line breaks and shortcodes come out as they were typed.
+        int i = 0;
+
+        while (i < g_span_count)
+        {
+            const text_span& s = g_spans[i];
+
+            int lo, hi;
+            if (!span_range(s, a, b, &lo, &hi)) { i++; continue; }
+
+            snowflake message = s.message;
+            const char* text = s.text;
+            int from = lo;
+            int to = hi;
+
+            while (i < g_span_count && g_spans[i].message == message)
+            {
+                int l, h;
+                if (span_range(g_spans[i], a, b, &l, &h))
+                {
+                    if (l < from) from = l;
+                    if (h > to) to = h;
+                }
+                i++;
+            }
+
+            if (to > from)
+            {
+                if (out.size) out.append("\n", 1);
+                out.append(text + from, (unsigned int)(to - from));
+            }
+        }
+
+        if (out.size)
+        {
+            out.append("", 1);
+            ImGui::SetClipboardText((const char*)out.data);
+        }
+
+        out.free_buffer();
+    }
+
+    void draw_selection()
+    {
+        if (!have_selection()) return;
+
+        text_pos a, b;
+        ordered(&a, &b);
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+
+        for (int i = 0; i < g_span_count; i++)
+        {
+            const text_span& s = g_spans[i];
+
+            int lo, hi;
+            if (!span_range(s, a, b, &lo, &hi)) continue;
+
+            const char* start = s.text + s.from;
+
+            float x0 = s.a.x + ImGui::CalcTextSize(start, s.text + lo).x;
+            float x1 = s.a.x + ImGui::CalcTextSize(start, s.text + hi).x;
+
+            if (x1 <= x0) continue;
+
+            // Painted over rather than behind. Splitting the draw list into
+            // channels for one tint would mean threading the split through
+            // every message, and at this alpha the words read through it.
+            dl->AddRectFilled(ImVec2(x0, s.a.y), ImVec2(x1, s.b.y),
+                              IM_COL32(88, 133, 224, 90));
+        }
+    }
+
+    void draw_message_text(const char* text, snowflake message_id,
+                           snowflake guild_id, ImU32 colour)
     {
         float start_x = ImGui::GetCursorPosX();
         float wrap_x = start_x + ImGui::GetContentRegionAvail().x - 20.0f;
@@ -1107,6 +1427,8 @@ namespace
                 ImGui::PushStyleColor(ImGuiCol_Text, colour);
                 ImGui::TextUnformatted(label);
                 ImGui::PopStyleColor();
+
+                note_span(message_id, text, (int)(p - text), (int)(p - text) + taken);
             }
 
             on_line = true;
@@ -1134,14 +1456,18 @@ namespace
 
             if (draw_image(image_url, a->width, a->height))
             {
-                ui_open_image_viewer(image_url, a->filename);
+                // What is shown may be a still the proxy rendered - that is
+                // what a video looks like down this path - so the address of
+                // the real file goes along with it.
+                ui_open_image_viewer(image_url, a->filename, a->url);
             }
+            if (ImGui::IsItemHovered()) g_media_hovered = true;
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", a->filename);
 
             if (ImGui::BeginPopupContextItem("##imgctx"))
             {
                 if (ImGui::MenuItem(tr("Копировать картинку"))) copy_image_to_clipboard(image_url);
-                if (ImGui::MenuItem(tr("Копировать ссылку"))) ImGui::SetClipboardText(a->url);
+                if (ImGui::MenuItem(tr("Копировать ссылку"))) copy_link_url(a->url);
                 if (ImGui::MenuItem(tr("Скачать"))) start_download(a->url, a->filename);
                 ImGui::EndPopup();
             }
@@ -1153,6 +1479,19 @@ namespace
 
             ImVec2 p = ImGui::GetCursorScreenPos();
             float w = 340.0f, h = 52.0f;
+
+            // Background item so the whole card answers right click. Drawn
+            // first, so the download button on top of it keeps its own click.
+            ImGui::InvisibleButton("##attcard", ImVec2(w, h));
+            if (ImGui::IsItemHovered()) g_media_hovered = true;
+            if (ImGui::BeginPopupContextItem("##attctx"))
+            {
+                if (ImGui::MenuItem(tr("Копировать ссылку"))) copy_link_url(a->url);
+                if (ImGui::MenuItem(tr("Скачать"))) start_download(a->url, a->filename);
+                ImGui::EndPopup();
+            }
+            ImGui::SetCursorScreenPos(p);
+
             ImGui::GetWindowDrawList()->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col::bg_panel, 6.0f);
             ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 12, p.y + 8), col::text_link, a->filename);
             ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + 12, p.y + 28), col::text_muted, size_text);
@@ -1201,9 +1540,28 @@ namespace
                             image_url, sizeof(image_url));
             if (draw_image(image_url, e->image_w, e->image_h))
             {
-                ccstrncpy(g_ui.viewer_url, image_url, sizeof(g_ui.viewer_url) - 1);
-                g_ui.viewer_open = true;
+                // Through the same door as everything else, so the name and
+                // the address a download uses are set rather than left over
+                // from whatever was opened before.
+                ui_open_image_viewer(image_url, 0);
             }
+            if (ImGui::IsItemHovered()) g_media_hovered = true;
+
+            ImGui::PushID((const void*)e);
+            if (ImGui::BeginPopupContextItem("##embctx"))
+            {
+                const char* src = (e->image_src && e->image_src[0]) ? e->image_src : image_url;
+                if (ImGui::MenuItem(tr("Копировать картинку"))) copy_image_to_clipboard(image_url);
+                if (ImGui::MenuItem(tr("Копировать ссылку"))) copy_link_url(src);
+                if (ImGui::MenuItem(tr("Скачать")))
+                {
+                    char name[128];
+                    url_filename(src, "image.png", name, sizeof(name));
+                    start_download(src, name);
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
         }
         else if (e->thumbnail_url)
         {
@@ -1211,6 +1569,23 @@ namespace
             build_image_url(e->thumbnail_url, embed_origin(e->thumbnail_url, e->thumbnail_src),
                             image_url, sizeof(image_url));
             draw_image(image_url, 0, 0);
+            if (ImGui::IsItemHovered()) g_media_hovered = true;
+
+            ImGui::PushID((const void*)e);
+            if (ImGui::BeginPopupContextItem("##embctx"))
+            {
+                const char* src = (e->thumbnail_src && e->thumbnail_src[0]) ? e->thumbnail_src : image_url;
+                if (ImGui::MenuItem(tr("Копировать картинку"))) copy_image_to_clipboard(image_url);
+                if (ImGui::MenuItem(tr("Копировать ссылку"))) copy_link_url(src);
+                if (ImGui::MenuItem(tr("Скачать")))
+                {
+                    char name[128];
+                    url_filename(src, "image.png", name, sizeof(name));
+                    start_download(src, name);
+                }
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
         }
         else if (e->url)
         {
@@ -1468,7 +1843,7 @@ namespace
             }
             else
                 api::use_component(m->guild_id, m->channel_id, m->id, m->application_id,
-                                   COMP_BUTTON, c->custom_id, 0, 0);
+                                   COMP_BUTTON, c->custom_id, 0, 0, m->flags);
         }
 
         ImGui::PopStyleColor(3);
@@ -1506,7 +1881,7 @@ namespace
                     const char* values[1] = { o->value };
                     api::use_component(m->guild_id, m->channel_id, m->id,
                                        m->application_id, COMP_SELECT, c->custom_id,
-                                       values, 1);
+                                       values, 1, m->flags);
                 }
 
                 if (o->description[0])
@@ -1521,6 +1896,68 @@ namespace
         }
 
         if (c->disabled) ImGui::EndDisabled();
+    }
+
+    // ---- Components-V2 message blocks ------------------------------------
+
+    void draw_v2node(dmessage* m, const dv2node* n, float indent)
+    {
+        ImVec2 top(0.0f, 0.0f);
+        if (n->accent) top = ImGui::GetCursorScreenPos();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
+
+        switch (n->type)
+        {
+        case V2_TEXT:
+            if (n->text && n->text[0])
+                draw_message_text(n->text, m->id, m->guild_id, col::text_normal);
+            break;
+
+        case V2_SEPARATOR:
+            if (n->divider) ImGui::Separator();
+            else ImGui::Dummy(ImVec2(0, 6));
+            break;
+
+        case V2_GALLERY:
+        case V2_THUMBNAIL:
+            if (n->media_url && n->media_url[0])
+            {
+                if (draw_image(n->media_url, 0, 0)) ui_open_image_viewer(n->media_url, 0);
+                if (ImGui::IsItemHovered()) g_media_hovered = true;
+            }
+            break;
+
+        case V2_FILE:
+            if (n->media_url && n->media_url[0])
+            {
+                char name[128];
+                url_filename(n->media_url, "file", name, sizeof(name));
+                if (ImGui::Button(name)) start_download(n->media_url, name);
+            }
+            break;
+
+        case V2_SECTION:
+            // The texts arrived as their own nodes just above; the accessory
+            // button lands here, under them rather than beside.
+            if (n->has_accessory) draw_button(m, &n->accessory);
+            break;
+        }
+
+        // A container's accent, drawn as the same left bar embeds use.
+        if (n->accent)
+        {
+            ImVec2 end = ImGui::GetItemRectMax();
+            ImU32 bar = IM_COL32((n->accent >> 16) & 0xFF, (n->accent >> 8) & 0xFF,
+                                 n->accent & 0xFF, 255);
+            ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(top.x, top.y),
+                                                      ImVec2(top.x + 4, end.y), bar, 2.0f);
+        }
+    }
+
+    void draw_v2(dmessage* m, float indent)
+    {
+        for (unsigned int i = 0; i < m->v2.count; i++)
+            draw_v2node(m, &m->v2[i], indent);
     }
 
     void draw_components(dmessage* m, float indent)
@@ -1789,6 +2226,8 @@ namespace
 
     void draw_message(dmessage* m, bool grouped)
     {
+        g_media_hovered = false;
+
         // Anything with no body of its own is an event, and reads better as
         // one line than as an empty message from somebody.
         const char* system_text = (m->content && m->content[0]) ? 0
@@ -1796,6 +2235,15 @@ namespace
         if (system_text)
         {
             draw_system_message(m, system_text);
+            return;
+        }
+
+        // A friend request note (type 67): the small line the official client
+        // shows at the top of the fresh DM. Drawn as one muted line rather
+        // than a full message, which is what it kept being confused with.
+        if (m->type == 67 && m->content && m->content[0])
+        {
+            draw_system_message(m, m->content);
             return;
         }
 
@@ -1875,9 +2323,13 @@ namespace
         if (!draw_editor(m, text_indent) && m->content && m->content[0])
         {
             ImGui::SetCursorPosX(ImGui::GetCursorPosX() + text_indent);
-            draw_message_text(m->content, m->guild_id,
+            draw_message_text(m->content, m->id, m->guild_id,
                               m->failed ? col::red : col::text_normal);
         }
+
+        // Components-V2 text blocks: what newer bot messages carry instead
+        // of content. Without these the message is just its button.
+        draw_v2(m, text_indent);
 
         for (unsigned int i = 0; i < m->attachments.count; i++)
         {
@@ -1959,7 +2411,9 @@ namespace
         ImVec2 row_end = ImGui::GetCursorScreenPos();
         bool hovered = ImGui::IsMouseHoveringRect(row_start, ImVec2(row_start.x + row_width, row_end.y), false);
 
-        if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
+        // Not over media: a right click on a picture, a file, a video or an
+        // embed belongs to their menus, which opened this same frame.
+        if (hovered && !g_media_hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
             ImGui::OpenPopup("##msgctx");
 
         if (ImGui::BeginPopup("##msgctx"))
@@ -2255,6 +2709,198 @@ namespace
         if (!shown) ui_text_muted(tr("никого не нашлось"));
         ImGui::EndChild();
     }
+
+    // ---- bot forms (modals) ------------------------------------------------
+    //
+    // A form arrives from a worker thread, parsed out of a type-9 interaction
+    // response, and is shown here on the ui thread. The buffers below are the
+    // form on screen: text fields edit in place, and the filled copy goes
+    // back through api::submit_modal.
+    api::modal_form g_modal;
+    bool g_modal_open = false;
+    char g_modal_error[256];
+
+    // Length in code points, which is what the server's min/max lengths
+    // count - not bytes and not graphemes.
+    int modal_text_len(const char* s)
+    {
+        int n = 0;
+        for (const unsigned char* p = (const unsigned char*)s; *p; p++)
+            if ((*p & 0xC0) != 0x80) n++;
+        return n;
+    }
+
+    // Keeps the answer within max_length while it is being typed, the way
+    // the official client does. Without this the server answers the submit
+    // with "Invalid Form Body" and nothing says which field overflowed.
+    static int modal_length_filter(ImGuiInputTextCallbackData* d)
+    {
+        if (!(d->EventFlag & ImGuiInputTextFlags_CallbackCharFilter)) return 0;
+
+        int max = d->UserData ? *(const int*)d->UserData : 0;
+        if (max <= 0) return 0;
+
+        int n = 0;
+        for (const char* p = d->Buf; p < d->Buf + d->BufTextLen; p++)
+            if (((unsigned char)*p & 0xC0) != 0x80) n++;
+        return n >= max ? 1 : 0;
+    }
+
+    void draw_modal_field(api::modal_field* f)
+    {
+        const char* label = f->label[0] ? f->label
+            : (f->placeholder[0] ? f->placeholder : f->custom_id);
+        ImGui::TextUnformatted(label);
+        if (f->required)
+        {
+            ImGui::SameLine();
+            ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+            ImGui::TextUnformatted("*");
+            ImGui::PopStyleColor();
+        }
+        if (f->kind == COMP_TEXTINPUT && f->max_len > 0 && f->max_len < 4000)
+        {
+            ImGui::SameLine();
+            char hint[48];
+            cnprint(hint, sizeof(hint), tr("не длиннее %d"), f->max_len);
+            ui_text_muted(hint);
+        }
+
+        if (f->kind == COMP_TEXTINPUT)
+        {
+            ImGuiInputTextFlags flags = 0;
+            if (f->max_len > 0)
+                flags |= ImGuiInputTextFlags_CallbackCharFilter;
+
+            ImGui::SetNextItemWidth(-1.0f);
+            if (f->style == 2)
+                ImGui::InputTextMultiline("##in", f->text, sizeof(f->text), ImVec2(-1.0f, 90.0f),
+                                          flags, modal_length_filter, &f->max_len);
+            else
+                ImGui::InputTextWithHint("##in", f->placeholder, f->text, sizeof(f->text),
+                                         flags, modal_length_filter, &f->max_len);
+        }
+        else if (f->option_count > 0)
+        {
+            const char* shown = f->placeholder[0] ? f->placeholder : tr("выбрать...");
+            if (f->selected >= 0 && f->selected < f->option_count)
+                shown = f->options[f->selected].label;
+
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::BeginCombo("##sel", shown))
+            {
+                for (int o = 0; o < f->option_count; o++)
+                {
+                    ImGui::PushID(o);
+                    bool sel = f->selected == o;
+                    if (ImGui::Selectable(f->options[o].label, sel)) f->selected = o;
+                    if (sel) ImGui::SetItemDefaultFocus();
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+        }
+        else
+        {
+            ui_text_muted(tr("Это поле здесь не заполнить"));
+        }
+
+        ImGui::Dummy(ImVec2(0, 4));
+    }
+}
+
+void ui_view_modal_popup()
+{
+    api::modal_form arrived;
+    if (api::take_pending_modal(&arrived))
+    {
+        g_modal = arrived;
+        g_modal_open = true;
+        ccfset(g_modal_error, 0, sizeof(g_modal_error));
+        ImGui::OpenPopup("##formmodal");
+    }
+
+    if (!g_modal_open) return;
+
+    // Fixed width, automatic height. AlwaysAutoResize feeds back into the
+    // -1-wide multiline inputs and the window melts down to half width a
+    // frame at a time, which is exactly what it looked like.
+    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopupModal("##formmodal", 0, ImGuiWindowFlags_NoResize))
+        return;
+
+    ImGui::TextUnformatted(g_modal.title[0] ? g_modal.title : tr("Форма"));
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 4));
+
+    // Tall forms scroll instead of running off the screen.
+    bool scroll = g_modal.field_count > 6;
+    if (scroll) ImGui::BeginChild("##formfields", ImVec2(0, 420));
+
+    for (int i = 0; i < g_modal.field_count; i++)
+    {
+        ImGui::PushID(i);
+        draw_modal_field(&g_modal.fields[i]);
+        ImGui::PopID();
+    }
+
+    if (scroll) ImGui::EndChild();
+
+    if (g_modal_error[0])
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+        ImGui::TextWrapped("%s", g_modal_error);
+        ImGui::PopStyleColor();
+    }
+
+    if (ImGui::Button(tr("Отправить"), ImVec2(160, 0)))
+    {
+        const api::modal_field* bad = 0;
+        bool missing = false;
+
+        for (int i = 0; i < g_modal.field_count; i++)
+        {
+            const api::modal_field* f = &g_modal.fields[i];
+
+            if (f->kind == COMP_TEXTINPUT)
+            {
+                int len = modal_text_len(f->text);
+                if (!len && f->required) { missing = true; bad = f; break; }
+                if ((f->min_len > 0 && len < f->min_len) ||
+                    (f->max_len > 0 && len > f->max_len)) { bad = f; break; }
+            }
+            else if (f->option_count > 0)
+            {
+                if (f->required && f->selected < 0) { missing = true; bad = f; break; }
+            }
+        }
+
+        if (bad)
+        {
+            if (missing)
+                cnprint(g_modal_error, sizeof(g_modal_error), "%s", tr("Заполните обязательные поля"));
+            else
+            {
+                const char* label = bad->label[0] ? bad->label : bad->custom_id;
+                cnprint(g_modal_error, sizeof(g_modal_error), tr("Поле «%s»: проверьте длину"), label);
+            }
+        }
+        else
+        {
+            api::submit_modal(&g_modal);
+            g_modal_open = false;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Отмена"), ImVec2(120, 0)) ||
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+    {
+        g_modal_open = false;
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
 }
 
 void ui_view_chat(float width, float height)
@@ -2469,6 +3115,10 @@ void ui_view_chat(float width, float height)
         g_win.anchor = first < total ? ch->messages[first].id : 0;
     }
 
+    // Every word drawn this frame is written down again from scratch: the
+    // layout is what decides where they land, and it runs anew each frame.
+    g_span_count = 0;
+
     snowflake prev_author = 0;
     unsigned long long prev_time = 0;
 
@@ -2527,6 +3177,52 @@ void ui_view_chat(float width, float height)
 
         prev_author = m->author_id;
         prev_time = t;
+    }
+
+    // ---- the drag itself --------------------------------------------------
+    //
+    // Done after the list rather than during it, because until the last word
+    // is placed there is nothing to hit test against.
+    {
+        bool over = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+
+        if (over && ImGui::IsMouseClicked(ImGuiMouseButton_Left) && !ImGui::IsAnyItemActive())
+        {
+            text_pos at;
+
+            if (locate(ImGui::GetMousePos(), &at))
+            {
+                g_sel_from = at;
+                g_sel_to = at;
+                g_selecting = true;
+            }
+            else
+            {
+                g_sel_from.message = 0;
+                g_sel_to.message = 0;
+            }
+        }
+
+        if (g_selecting)
+        {
+            if (ImGui::IsMouseDown(ImGuiMouseButton_Left))
+            {
+                text_pos at;
+                if (locate(ImGui::GetMousePos(), &at)) g_sel_to = at;
+            }
+            else
+            {
+                g_selecting = false;
+            }
+        }
+
+        draw_selection();
+
+        // Copying is the point of selecting, and ctrl+c is where every hand
+        // goes for it. The context menu still offers the whole message.
+        if (have_selection() && ImGui::GetIO().KeyCtrl &&
+            ImGui::IsKeyPressed(ImGuiKey_C, false))
+            copy_selection();
     }
 
     ImGui::Unindent(12.0f);
@@ -2809,7 +3505,7 @@ void ui_view_chat(float width, float height)
 // full size image viewer
 // ---------------------------------------------------------------------------
 
-void ui_open_image_viewer(const char* url, const char* name)
+void ui_open_image_viewer(const char* url, const char* name, const char* save_url)
 {
     if (!url || !url[0]) return;
 
@@ -2818,6 +3514,10 @@ void ui_open_image_viewer(const char* url, const char* name)
 
     ccfset(g_ui.viewer_name, 0, sizeof(g_ui.viewer_name));
     if (name && name[0]) ccstrncpy(g_ui.viewer_name, name, sizeof(g_ui.viewer_name) - 1);
+
+    ccfset(g_ui.viewer_save_url, 0, sizeof(g_ui.viewer_save_url));
+    if (save_url && save_url[0])
+        ccstrncpy(g_ui.viewer_save_url, save_url, sizeof(g_ui.viewer_save_url) - 1);
 
     g_ui.viewer_zoom = 1.0f;
     g_ui.viewer_pan = ImVec2(0, 0);
@@ -2958,6 +3658,12 @@ void ui_view_image_viewer()
         if (ImGui::Button(tr("Копировать"), ImVec2(130, 30)))
             copy_image_to_clipboard(g_ui.viewer_url);
 
+        // The original file address when there is one, not the picture on
+        // screen: a link is for opening elsewhere.
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Копировать ссылку"), ImVec2(160, 30)))
+            copy_link_url(g_ui.viewer_save_url[0] ? g_ui.viewer_save_url : g_ui.viewer_url);
+
         ImGui::SameLine();
         if (ImGui::Button(tr("Крупнее"), ImVec2(90, 30))) g_ui.viewer_zoom *= 1.25f;
         ImGui::SameLine();
@@ -2989,7 +3695,10 @@ void ui_view_image_viewer()
                 clean[i] = 0;
             }
 
-            start_download(g_ui.viewer_url, clean);
+            // The original file when there is one, not the picture on screen.
+            const char* from = g_ui.viewer_save_url[0] ? g_ui.viewer_save_url
+                                                       : g_ui.viewer_url;
+            start_download(from, clean);
         }
 
         ImGui::SameLine();

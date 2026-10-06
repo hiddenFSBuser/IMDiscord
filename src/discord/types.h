@@ -171,6 +171,19 @@ enum component_kind
     COMP_ROW = 1,
     COMP_BUTTON = 2,
     COMP_SELECT = 3,        // a menu of text options
+    COMP_TEXTINPUT = 4,     // modal-only: a text field
+
+    // Components V2 (message flags 32768): the text of newer bot messages
+    // lives here instead of content/embeds. Buttons keep type 2 wherever
+    // they sit, including inside a section's accessory.
+    V2_SECTION = 9,
+    V2_TEXT = 10,           // a text display
+    V2_THUMBNAIL = 11,
+    V2_GALLERY = 12,
+    V2_FILE = 13,
+    V2_SEPARATOR = 14,
+    V2_CONTAINER = 15,
+    V2_LABEL = 18,          // modal-only: a label wrapped round one input
 };
 
 enum button_style
@@ -219,6 +232,25 @@ struct dcomponent
     int max_values;
 };
 
+// One block of a Components-V2 message, flattened in draw order. Containers
+// and sections are unwrapped at parse: their children land here inline, each
+// carrying the container's accent with it.
+struct dv2node
+{
+    int type;               // V2_TEXT, V2_SEPARATOR, V2_GALLERY, V2_FILE
+    unsigned int accent;    // container accent_color, 0 for none
+    bool divider;           // separator with a visible rule
+
+    const char* text;       // text display content (interned)
+    const char* media_url;  // gallery item / file / thumbnail (interned)
+    const char* media_desc;
+
+    // A section's accessory when it is a button: drawn and pressed like any
+    // other button. A thumbnail accessory lands in media_url instead.
+    dcomponent accessory;
+    bool has_accessory;
+};
+
 struct dmessage
 {
     snowflake id;
@@ -232,6 +264,10 @@ struct dmessage
     int type;
     bool pending;                // optimistic local echo
     bool failed;
+    // Message flags as discord sent them. 32768 (IS_COMPONENTS_V2) means the
+    // readable text lives in v2 blocks rather than content/embeds, and the
+    // same value is echoed back in message_flags on component interactions.
+    int flags;
     // Taken back by its author. The message is kept and shown struck through
     // rather than removed: seeing what somebody deleted is the point of
     // keeping an archive at all.
@@ -243,6 +279,9 @@ struct dmessage
     // What a bot put under it, and the options of every menu among them.
     ulist<dcomponent> components;
     ulist<dselect_option> select_options;
+
+    // Components-V2 blocks (flags 32768), in draw order.
+    ulist<dv2node> v2;
 
     // Which application to address when one of them is used. A component
     // belongs to the bot that sent the message, and the interaction has to
@@ -438,6 +477,10 @@ struct drelationship
     // not show it anywhere; it costs nothing to keep and it is the only place
     // the answer exists.
     const char* since;
+
+    // The note attached to a friend request, if any. Shown small under the
+    // incoming request and as a one-line message at the top of the fresh DM.
+    const char* note;
 };
 
 struct dvoice_state

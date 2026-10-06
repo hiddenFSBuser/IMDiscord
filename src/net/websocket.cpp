@@ -5,8 +5,6 @@
 #include "core/crypto.h"
 #include "core/log.h"
 
-#include <bcrypt.h>
-
 namespace
 {
     // Opcodes, from the protocol.
@@ -21,24 +19,10 @@ namespace
     // request rather than merely echoing it back.
     const char* ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
-    // Deliberately the long way round. BCryptHash, the one call version, only
-    // exists from Windows 10 - using it here would have made the handshake
-    // fail on every older system, which is the opposite of the point of
-    // writing this websocket by hand in the first place.
     bool sha1(const void* data, unsigned int len, unsigned char out[20])
     {
-        BCRYPT_ALG_HANDLE alg = 0;
-        if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA1_ALGORITHM, 0, 0) != 0) return false;
-
-        BCRYPT_HASH_HANDLE hash = 0;
-        bool ok = BCryptCreateHash(alg, &hash, 0, 0, 0, 0, 0) == 0;
-
-        if (ok) ok = BCryptHashData(hash, (PUCHAR)data, len, 0) == 0;
-        if (ok) ok = BCryptFinishHash(hash, out, 20, 0) == 0;
-
-        if (hash) BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(alg, 0);
-        return ok;
+        crypto::sha1(data, len, out);
+        return true;
     }
 
     bool header_is(const char* line, const char* name)
