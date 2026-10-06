@@ -621,6 +621,105 @@ void science::captcha_verified(const char* sitekey, const char* flow_key)
     emit("captcha_event", TIER_ESSENTIAL, &p);
 }
 
+void science::pins_opened()
+{
+    jwriter p;
+    p.init();
+    common(&p);
+    p.kv_str("type", "Channel Pins");
+    emit("open_popout", TIER_ESSENTIAL, &p);
+}
+
+// ---- group DMs ------------------------------------------------------------
+
+namespace
+{
+    // The channel half of the group invite events, as the capture carries
+    // it. size_total counts recipients, not ourselves.
+    void group_channel_props(jwriter* p, snowflake channel_id)
+    {
+        dchannel* c = channel_id ? store::find_channel(channel_id) : 0;
+
+        if (channel_id) p->kv_snowflake("channel_id", channel_id);
+        p->kv_i64("channel_type", c ? c->type : 1);
+        p->kv_i64("channel_size_total", c ? (int)c->recipients.count : 0);
+        p->kv_str("channel_member_perms", "0");
+        p->kv_bool("channel_hidden", false);
+    }
+
+    int group_friend_total()
+    {
+        int n = 0;
+        store::guard g;
+        const ulist<drelationship>& rels = store::relationships();
+        for (unsigned int i = 0; i < rels.count; i++)
+            if (rels[i].type == REL_FRIEND) n++;
+        return n;
+    }
+}
+
+void science::group_invite_opened(snowflake channel_id)
+{
+    {
+        jwriter p;
+        p.init();
+        common(&p);
+        group_channel_props(&p, channel_id);
+        p.kv_str("type", "Add Friends to DM");
+        p.kv_bool("is_friend", true);
+        p.kv_str("source", "DM");
+        emit("open_popout", TIER_ESSENTIAL, &p);
+    }
+
+    {
+        int friends = group_friend_total();
+
+        jwriter p;
+        p.init();
+        common(&p);
+        group_channel_props(&p, channel_id);
+        p.kv_i64("default_results_count", friends);
+        p.kv_i64("default_results_friend_count", friends);
+        p.kv_i64("default_results_non_friend_count", 0);
+        p.kv_str("entry_point_type", "Add Friends to DM");
+        p.kv_str("entry_point_source", "DM");
+        emit("private_channel_invite_modal_opened", TIER_ESSENTIAL, &p);
+    }
+}
+
+void science::group_invite_confirmed(snowflake channel_id, const snowflake* user_ids,
+                                     int count, bool is_new)
+{
+    jwriter p;
+    p.init();
+    common(&p);
+    group_channel_props(&p, channel_id);
+    p.kv_bool("is_new_dm", is_new);
+    p.kv_str("entry_point_type", "Add Friends to DM");
+    p.kv_str("entry_point_source", "DM");
+
+    p.key("recipient_ids");
+    p.begin_arr();
+    for (int i = 0; i < count; i++)
+    {
+        char id[32];
+        cnprint(id, sizeof(id), "%llu", user_ids[i]);
+        p.val_str(id);
+    }
+    p.end_arr();
+
+    p.kv_i64("num_searches", 0);
+
+    p.key("affinity_score");
+    p.begin_arr();
+    for (int i = 0; i < count; i++) p.val_i64(-1);
+    p.end_arr();
+
+    p.kv_i64("friend_recipient_count", count);
+    p.kv_i64("non_friend_recipient_count", 0);
+    emit("create_dm_user_list_clicked", TIER_ESSENTIAL, &p);
+}
+
 // ---- the invite chain -----------------------------------------------------
 
 namespace

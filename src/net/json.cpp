@@ -1,5 +1,7 @@
 #include "pch.h"
 #include "json.h"
+#include "core/log.h"
+#include "system/io/ufile.h"
 
 // ---------------------------------------------------------------------------
 // value accessors
@@ -643,4 +645,81 @@ void jwriter::kv_snowflake(const char* name, unsigned long long v)
     cnprint(tmp, sizeof(tmp), "%llu", v);
     key(name);
     val_str(tmp);
+}
+
+bool json_test_file(const wchar_t* path)
+{
+    ubuffer blob;
+    blob.init();
+    if (!ufile::read_all(path, &blob) || !blob.size)
+    {
+        log_line("jsontest: файл не прочитан");
+        blob.free_buffer();
+        return false;
+    }
+
+    const char* text = (const char*)blob.c_str();
+    unsigned int size = blob.size;
+
+    // Our own dumps start with "status:"/"body:" lines; the body after them
+    // is what gets parsed.
+    if (size > 7 && ccsncmpf(text, "status:", 7) == 0)
+    {
+        unsigned int at = 0;
+        while (at < size && text[at] != '\n') at++;
+        if (at < size) at++;
+        if (at + 6 <= size && ccsncmpf(text + at, "body: ", 6) == 0) at += 6;
+
+        text += at;
+        size -= at;
+    }
+
+    log_line("jsontest: %u байт, первые 120: %.120s", size, text);
+
+    jdoc doc;
+    doc.init();
+    bool ok = doc.parse(text, (int)size);
+    if (ok && doc.root)
+    {
+        const char* kind = "?";
+        unsigned int n = 0;
+        if (doc.root->type == JTYPE_OBJ) { kind = "object"; n = doc.root->size(); }
+        else if (doc.root->type == JTYPE_ARR) { kind = "array"; n = doc.root->count; }
+        else if (doc.root->type == JTYPE_STR) kind = "string";
+        else if (doc.root->type == JTYPE_NUM) kind = "number";
+
+        const jval* items = doc.root->arr("items");
+
+        log_line("jsontest: РАЗОБРАН, корень %s, полей %u, items %s", kind, n,
+                 items->type == JTYPE_ARR ? "массив" : "нет/не массив");
+
+        if (doc.root->type == JTYPE_OBJ)
+        {
+            for (unsigned int i = 0; i < doc.root->size(); i++)
+            {
+                const jmember* m = doc.root->member_at(i);
+                log_line("jsontest: поле %u: ключ=%.64s тип=%d размер=%u", i,
+                         (m && m->key) ? m->key : "(нет)",
+                         m ? (int)m->value->type : -1,
+                         m ? m->value->size() : 0);
+            }
+        }
+
+        // The exact lookup the pins fetch does.
+        if (items->type == JTYPE_ARR)
+        {
+            unsigned int msgs = 0;
+            for (unsigned int i = 0; i < items->count; i++)
+                if (items->at(i)->obj("message")->type == JTYPE_OBJ) msgs++;
+            log_line("jsontest: записей %u, с message %u", items->count, msgs);
+        }
+    }
+    else
+    {
+        log_line("jsontest: НЕ РАЗОБРАН");
+    }
+    doc.free_doc();
+
+    blob.free_buffer();
+    return ok && doc.root != 0;
 }

@@ -785,6 +785,16 @@ namespace
             ui_invite_to_server_menu(c->id);
 
             ImGui::Separator();
+            if (c->type == CH_GROUP_DM)
+            {
+                if (ImGui::MenuItem(tr("Покинуть группу"))) api::close_conversation(c->id);
+            }
+            else if (c->type == CH_DM)
+            {
+                if (ImGui::MenuItem(tr("Скрыть переписку"))) api::close_conversation(c->id);
+            }
+
+            ImGui::Separator();
             ui_copy_id_item(c->id, tr("Скопировать ID чата"));
             if (peer) ui_copy_id_item(peer->id, tr("Скопировать ID пользователя"));
 

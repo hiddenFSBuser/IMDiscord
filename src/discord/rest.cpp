@@ -33,6 +33,13 @@ namespace
     api::modal_form g_pending_modal;
     bool g_modal_ready = false;
 
+    // The channel a group operation just produced, for the interface to
+    // open. Jobs never touch the interface state directly; the picker that
+    // started the operation picks this up on its next frame and jumps.
+    CRITICAL_SECTION g_group_lock;
+    bool g_group_lock_ready = false;
+    snowflake g_group_result = 0;
+
     // Nonces of component clicks this client sent, so a form arriving over
     // the gateway can be matched to the click that asked for it. A modal for
     // a click from another client (the same account in a browser) is not
@@ -423,6 +430,8 @@ void api::init()
     InitializeCriticalSection(&g_err_lock);
     InitializeCriticalSection(&g_modal_lock);
     g_modal_lock_ready = true;
+    InitializeCriticalSection(&g_group_lock);
+    g_group_lock_ready = true;
     ccfset(g_token, 0, sizeof(g_token));
     ccfset(g_last_error, 0, sizeof(g_last_error));
     // The onboarding lists and the raw rules form live for the whole run, so
@@ -441,6 +450,8 @@ void api::shutdown()
 {
     if (!g_ready) return;
     ccfset(g_token, 0, sizeof(g_token));
+    DeleteCriticalSection(&g_group_lock);
+    g_group_lock_ready = false;
     DeleteCriticalSection(&g_modal_lock);
     g_modal_lock_ready = false;
     DeleteCriticalSection(&g_err_lock);
@@ -1287,6 +1298,193 @@ namespace
         memfree(j);
     }
 
+    // The channel a group operation just produced, for the interface to open.
+    // Jobs never touch the interface state directly; the picker that started
+    // the operation picks this up on its next frame and jumps.
+    void stash_group_result(snowflake channel_id)
+    {
+        EnterCriticalSection(&g_group_lock);
+        g_group_result = channel_id;
+        LeaveCriticalSection(&g_group_lock);
+    }
+
+    struct group_add_args
+    {
+        snowflake channel;
+        snowflake members[10];
+        int count;
+    };
+
+    // One member per request, in order: adding to a 1-1 conversation turns
+    // it into a group, and the answer carries the new channel id, which the
+    // next request goes to.
+    void job_group_add(void* user)
+    {
+        group_add_args* j = (group_add_args*)user;
+        snowflake current = j->channel;
+
+        for (int i = 0; i < j->count; i++)
+        {
+            char path[160];
+            cnprint(path, sizeof(path), "/channels/%llu/recipients/%llu", current, j->members[i]);
+
+            http_response res;
+            res.init();
+            bool ok = api::call("PUT", path, 0, &res) && res.ok();
+
+            if (ok)
+            {
+                jdoc doc;
+                doc.init();
+                if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                {
+                    store::guard g;
+                    dchannel* c = store::upsert_channel(doc.root, 0);
+                    if (c) current = c->id;
+                    store::bump_revision();
+                }
+                doc.free_doc();
+            }
+
+            log_line("group: +%llu в %llu -> %d", j->members[i], current, res.status);
+
+            if (!ok)
+            {
+                record_api_error(tr("Не удалось добавить в группу"), &res);
+                res.free_response();
+                memfree(j);
+                return;
+            }
+
+            res.free_response();
+        }
+
+        stash_group_result(current);
+        memfree(j);
+    }
+
+    void job_group_create(void* user)
+    {
+        group_add_args* j = (group_add_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.key("recipients");
+        w.begin_arr();
+        for (int i = 0; i < j->count; i++)
+        {
+            char id[32];
+            cnprint(id, sizeof(id), "%llu", j->members[i]);
+            w.val_str(id);
+        }
+        w.end_arr();
+        w.end_obj();
+
+        http_response res;
+        res.init();
+        bool ok = api::call("POST", "/users/@me/channels", w.c_str(), &res) && res.ok();
+
+        if (ok)
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                store::guard g;
+                dchannel* c = store::upsert_channel(doc.root, 0);
+                if (c)
+                {
+                    store::bump_revision();
+                    stash_group_result(c->id);
+                    log_line("group: создана %llu", c->id);
+                }
+            }
+            doc.free_doc();
+            api::clear_last_error();
+        }
+        else
+        {
+            record_api_error(tr("Группа не создалась"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
+    void job_group_remove(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[160];
+        cnprint(path, sizeof(path), "/channels/%llu/recipients/%llu", j->a, j->b);
+
+        http_response res;
+        res.init();
+        if (api::call("DELETE", path, 0, &res) && res.ok())
+        {
+            log_line("group: -%llu из %llu", j->b, j->a);
+            api::clear_last_error();
+        }
+        else
+        {
+            record_api_error(tr("Не удалось убрать из группы"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_group_leave(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[160];
+        cnprint(path, sizeof(path), "/channels/%llu?silent=false", j->a);
+
+        http_response res;
+        res.init();
+        if (api::call("DELETE", path, 0, &res) && res.ok())
+        {
+            log_line("group: выход из %llu", j->a);
+            api::clear_last_error();
+        }
+        else
+        {
+            record_api_error(tr("Не удалось выйти"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_group_transfer(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu", j->a);
+
+        char body[64];
+        cnprint(body, sizeof(body), "{\"owner\":\"%llu\"}", j->b);
+
+        http_response res;
+        res.init();
+        if (api::call("PATCH", path, body, &res) && res.ok())
+        {
+            log_line("group: владение %llu -> %llu", j->a, j->b);
+            api::clear_last_error();
+        }
+        else
+        {
+            record_api_error(tr("Владение не передалось"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
     void job_simple_put_relationship(void* user)
     {
         job_ids* j = (job_ids*)user;
@@ -1334,6 +1532,104 @@ namespace
         res.free_response();
         memfree(j);
     }
+
+    void job_fetch_pins(void* user)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/messages/pins?limit=25", j->a);
+        log_line("pins: запрос для канала %llu", j->a);
+
+        http_response res;
+        res.init();
+        if (api::call("GET", path, 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root != 0;
+            // Note: arr, not obj - obj() only returns objects, and items is
+            // an array. Reading it through obj() yields the null dummy, the
+            // list stays empty, and the popup loads forever.
+            const jval* items = parsed ? doc.root->arr("items") : 0;
+
+            if (parsed && items && items->type == JTYPE_ARR)
+            {
+                snowflake ids[50];
+                int n = 0;
+
+                store::guard g;
+                for (unsigned int i = 0; i < items->count && n < 50; i++)
+                {
+                    const jval* m = items->at(i)->obj("message");
+                    if (!m || m->type != JTYPE_OBJ) continue;
+
+                    dmessage* mm = store::upsert_message(m);
+                    if (mm) ids[n++] = mm->id;
+                }
+                store::set_channel_pins(j->a, ids, n);
+                store::bump_revision();
+                log_line("pins: канал %llu, закрепов %d", j->a, n);
+            }
+            else
+            {
+                log_line("pins: канал %llu, ответ не разобран (http %d, %u байт)",
+                         j->a, res.status, res.body.size);
+                store::fail_channel_pins(j->a);
+
+                // Written next to the log as well: what the bytes actually
+                // were is the whole question when a 200 does not parse.
+                wchar_t path[MAX_PATH];
+                if (ufile::app_path(L"pins_last_response.txt", path, MAX_PATH))
+                {
+                    ubuffer dump;
+                    dump.init(1024);
+                    dump.append_fmt("status: %d\n", res.status);
+                    dump.append_str("body: ");
+                    if (res.body.size) dump.append(res.body.data, res.body.size);
+                    else dump.append_str("(пусто)");
+                    ufile::write_all(path, dump.data, dump.size);
+                    dump.free_buffer();
+                }
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            log_line("pins: канал %llu, запрос не удался (http %d)", j->a, res.status);
+            store::fail_channel_pins(j->a);
+            record_api_error(tr("Закрепы не загрузились"), &res);
+        }
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_pin_message(void* user, bool pin)
+    {
+        job_ids* j = (job_ids*)user;
+
+        char path[160];
+        cnprint(path, sizeof(path), "/channels/%llu/messages/pins/%llu", j->a, j->b);
+
+        http_response res;
+        res.init();
+        bool ok = pin ? api::call("PUT", path, 0, &res) && res.ok()
+                      : api::call("DELETE", path, 0, &res) && res.ok();
+
+        // The CHANNEL_PINS_UPDATE dispatch that follows refreshes the list;
+        // this only reports a refusal.
+        if (!ok)
+            record_api_error(pin ? tr("Сообщение не закрепилось") : tr("Закреп не снялся"), &res);
+        else
+            api::clear_last_error();
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_pin_add(void* user) { job_pin_message(user, true); }
+    void job_pin_remove(void* user) { job_pin_message(user, false); }
 
     void job_block_user(void* user)
     {
@@ -4585,6 +4881,91 @@ void api::accept_friend_request(snowflake user_id, bool confirm)
 {
     job_ids* j = make_ids(user_id, confirm ? 1 : 0);
     if (j) jobs::post(job_simple_put_relationship, j);
+}
+
+void api::group_add_members(snowflake channel_id, const snowflake* user_ids, int count)
+{
+    if (!channel_id || !user_ids || count <= 0) return;
+    if (count > 10) count = 10;
+
+    group_add_args* j = (group_add_args*)memalloc(sizeof(group_add_args));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel = channel_id;
+    for (int i = 0; i < count; i++) j->members[i] = user_ids[i];
+    j->count = count;
+
+    jobs::post(job_group_add, j);
+}
+
+void api::group_create(const snowflake* user_ids, int count)
+{
+    if (!user_ids || count <= 0) return;
+    if (count > 10) count = 10;
+
+    group_add_args* j = (group_add_args*)memalloc(sizeof(group_add_args));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    for (int i = 0; i < count; i++) j->members[i] = user_ids[i];
+    j->count = count;
+
+    jobs::post(job_group_create, j);
+}
+
+void api::group_remove_member(snowflake channel_id, snowflake user_id)
+{
+    job_ids* j = make_ids(channel_id, user_id);
+    if (j) jobs::post(job_group_remove, j);
+}
+
+void api::close_conversation(snowflake channel_id)
+{
+    job_ids* j = make_ids(channel_id, 0);
+    if (j) jobs::post(job_group_leave, j);
+}
+
+void api::group_transfer_owner(snowflake channel_id, snowflake user_id)
+{
+    job_ids* j = make_ids(channel_id, user_id);
+    if (j) jobs::post(job_group_transfer, j);
+}
+
+bool api::take_created_channel(snowflake* out)
+{
+    if (!g_group_lock_ready || !out) return false;
+
+    EnterCriticalSection(&g_group_lock);
+    bool got = g_group_result != 0;
+    if (got)
+    {
+        *out = g_group_result;
+        g_group_result = 0;
+    }
+    LeaveCriticalSection(&g_group_lock);
+    return got;
+}
+
+void api::fetch_pins(snowflake channel_id)
+{
+    if (!channel_id) return;
+    job_ids* j = make_ids(channel_id, 0);
+    if (j) jobs::post(job_fetch_pins, j);
+}
+
+void api::pin_message(snowflake channel_id, snowflake message_id)
+{
+    if (!channel_id || !message_id) return;
+    job_ids* j = make_ids(channel_id, message_id);
+    if (j) jobs::post(job_pin_add, j);
+}
+
+void api::unpin_message(snowflake channel_id, snowflake message_id)
+{
+    if (!channel_id || !message_id) return;
+    job_ids* j = make_ids(channel_id, message_id);
+    if (j) jobs::post(job_pin_remove, j);
 }
 
 void api::remove_relationship(snowflake user_id)

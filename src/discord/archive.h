@@ -59,6 +59,42 @@ namespace archive
     // Every channel the archive holds, for the exporter and the statistics.
     int all_channels(snowflake* out, int cap);
 
+    // ---- local search ----
+    //
+    // Searches message text across warmed history without touching the
+    // network: live memory first, then the archive files on disk. Zero
+    // scope means everywhere. Returns hits stored, total matches seen.
+    struct search_hit
+    {
+        snowflake channel_id;
+        snowflake id;
+        snowflake author_id;
+        char author_name[64];
+        char timestamp[48];
+        char snippet[256];
+
+        // The attachment this hit is about. Empty for text hits.
+        char file_url[700];
+        char filename[128];
+        unsigned int file_size;
+        int media_kind;      // 0 none, 1 image, 2 video, 3 other file
+        int attach_index;
+    };
+
+    enum search_flags
+    {
+        SEARCH_CASE = 1,     // case sensitive (default folds case)
+        SEARCH_WHOLE = 2,    // whole words only
+        SEARCH_PREFIX = 4,   // match at word starts instead of anywhere
+        SEARCH_MEDIA = 8,    // only messages carrying attachments
+        SEARCH_IMAGES = 16,  // per-attachment hits, images only
+        SEARCH_VIDEOS = 32,  // per-attachment hits, videos only
+    };
+
+    int search_local(const char* query, int flags, snowflake scope_channel,
+                     int year, int month,
+                     search_hit* out, int cap, int* total);
+
     // ---- the snapshot ----
     //
     // Messages are only half of what a client needs to be worth opening with

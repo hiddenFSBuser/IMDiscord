@@ -85,6 +85,13 @@ struct jdoc
     static const jval* null_value();
 };
 
+// Parses a file and reports the outcome to the log: whether it parsed,
+// what the root is, and how many top-level members it holds. A diagnostic
+// for responses that come back 200 but do not parse. Files written by the
+// client itself start with "status:"/"body:" lines; the body after them is
+// what gets parsed.
+bool json_test_file(const wchar_t* path);
+
 // ---------------------------------------------------------------------------
 // writer
 // ---------------------------------------------------------------------------

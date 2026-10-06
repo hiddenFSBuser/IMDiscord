@@ -635,6 +635,58 @@ static void draw_glyph(ImDrawList* dl, ui_icon icon, ImVec2 center, float s, ImU
                     ImVec2(head_x + s * 0.46f, center.y - s * 0.24f), fg, t);
         break;
     }
+
+    case ICON_SEARCH:
+    {
+        // A magnifier: a ring with a handle to the lower right.
+        float t = s * 0.13f;
+        ImVec2 rc(center.x - s * 0.08f, center.y - s * 0.08f);
+        dl->AddCircle(rc, s * 0.30f, fg, 20, t);
+        dl->AddLine(ImVec2(rc.x + s * 0.22f, rc.y + s * 0.22f),
+                    ImVec2(center.x + s * 0.44f, center.y + s * 0.44f), fg, t);
+        break;
+    }
+
+    case ICON_PIN:
+    {
+        // A pushpin: a round head, a tapering body, a point.
+        dl->AddCircleFilled(ImVec2(center.x, center.y - s * 0.30f), s * 0.16f, fg, 12);
+        ImVec2 body[4] =
+        {
+            ImVec2(center.x - s * 0.12f, center.y - s * 0.18f),
+            ImVec2(center.x + s * 0.12f, center.y - s * 0.18f),
+            ImVec2(center.x + s * 0.03f, center.y + s * 0.34f),
+            ImVec2(center.x - s * 0.03f, center.y + s * 0.34f),
+        };
+        dl->AddQuadFilled(body[0], body[1], body[2], body[3], fg);
+        dl->AddLine(ImVec2(center.x - s * 0.03f, center.y + s * 0.34f),
+                    ImVec2(center.x - s * 0.03f, center.y + s * 0.46f), fg, s * 0.09f);
+        break;
+    }
+
+    case ICON_IMAGE:
+    {
+        // A picture: a frame with two mountains and a sun.
+        float t = s * 0.10f;
+        dl->AddRect(ImVec2(center.x - s * 0.46f, center.y - s * 0.36f),
+                    ImVec2(center.x + s * 0.46f, center.y + s * 0.36f), fg, s * 0.08f, 0, t);
+        dl->AddCircleFilled(ImVec2(center.x - s * 0.22f, center.y - s * 0.14f), s * 0.08f, fg, 10);
+        ImVec2 m1[3] =
+        {
+            ImVec2(center.x - s * 0.46f, center.y + s * 0.36f),
+            ImVec2(center.x - s * 0.08f, center.y - s * 0.02f),
+            ImVec2(center.x + s * 0.22f, center.y + s * 0.36f),
+        };
+        dl->AddTriangleFilled(m1[0], m1[1], m1[2], fg);
+        ImVec2 m2[3] =
+        {
+            ImVec2(center.x - s * 0.02f, center.y + s * 0.36f),
+            ImVec2(center.x + s * 0.24f, center.y + s * 0.06f),
+            ImVec2(center.x + s * 0.46f, center.y + s * 0.36f),
+        };
+        dl->AddTriangleFilled(m2[0], m2[1], m2[2], fg);
+        break;
+    }
     }
 }
 
@@ -2369,6 +2421,8 @@ void ui_frame()
 
     ui_view_profile_popup();
     ui_view_friend_accept_popup();
+    ui_view_group_picker_popup();
+    ui_view_group_transfer_popup();
     ui_view_server_info_popup();
     ui_view_roles_popup();
     ui_view_invites_popup();
@@ -2422,6 +2476,9 @@ void ui_frame()
     ui_view_offline_banner();
     ui_view_accounts_popup();
     ui_view_downloads();
+    ui_view_pins_popup();
+    ui_view_search_popup();
+    ui_view_media_popup();
 
     // Global shortcut: logging out is always available.
     ImGuiIO& io = ImGui::GetIO();

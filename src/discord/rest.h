@@ -222,10 +222,35 @@ namespace api
     // Accepts an incoming request. confirm answers the "is this a stranger"
     // question discord asks about people it does not recognise: without it
     // the accept comes back 400/80013.
-    void accept_friend_request(snowflake user_id, bool confirm);
-    // Declines an incoming request, cancels an outgoing one, or removes a friend.
+    void accept_friend_request(snowflake user_id, bool confirm);    // Declines an incoming request, cancels an outgoing one, or removes a friend.
     void remove_relationship(snowflake user_id);
     void block_user(snowflake user_id);
+
+    // ---- group DMs ----
+    // Adding someone to a 1-1 conversation turns it into a group (the answer
+    // carries the new channel id); adding to a group just grows it. Done one
+    // member per request, in order, the way the official client does it.
+    void group_add_members(snowflake channel_id, const snowflake* user_ids, int count);
+    // A fresh group from a bare list of friends.
+    void group_create(const snowflake* user_ids, int count);
+    void group_remove_member(snowflake channel_id, snowflake user_id);
+    // Leaving a group and hiding a 1-1 conversation are the same request;
+    // the server tells them apart. Messages stay on disk either way.
+    void close_conversation(snowflake channel_id);
+    // Hands the crown to someone else. A plain PATCH, no codes involved.
+    void group_transfer_owner(snowflake channel_id, snowflake user_id);
+
+    // Picks up a channel a group operation just produced, for the interface
+    // to open. True once per channel.
+    bool take_created_channel(snowflake* out);
+
+    // ---- pins ----
+    // The pinned messages of a channel, kept in store::channel_pins. Pinning
+    // and unpinning only report refusals: the CHANNEL_PINS_UPDATE dispatch
+    // that follows refreshes the list on its own.
+    void fetch_pins(snowflake channel_id);
+    void pin_message(snowflake channel_id, snowflake message_id);
+    void unpin_message(snowflake channel_id, snowflake message_id);
     // ---- an invite sitting in a message ----------------------------------
     //
     // Discord draws those as a panel with the server on it rather than as a

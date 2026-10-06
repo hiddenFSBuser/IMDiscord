@@ -14,6 +14,19 @@ namespace
 
     ulist<drelationship> g_relationships;
     ulist<dvoice_state> g_voice;
+
+    // Pinned message ids per channel, as last fetched. The message bodies
+    // themselves live in the channel history (upserted on fetch, deduped by
+    // id); this is only the order to show them in.
+    struct pin_list
+    {
+        snowflake channel;
+        ulist<snowflake> ids;
+    };
+    ulist<pin_list> g_pins;
+    // Channels whose pins fetch failed. A failed channel shows an error
+    // with a retry instead of loading forever.
+    ulist<snowflake> g_pins_failed;
     ulist<snowflake> g_guild_order;
     ulist<snowflake> g_dm_order;
 
@@ -39,6 +52,8 @@ void store::init()
     g_channels = umap<snowflake, dchannel*>();
     g_guilds = umap<snowflake, dguild*>();
     g_relationships = ulist<drelationship>();
+    g_pins = ulist<pin_list>();
+    g_pins_failed = ulist<snowflake>();
     g_voice = ulist<dvoice_state>();
     g_guild_order = ulist<snowflake>();
     g_dm_order = ulist<snowflake>();
@@ -70,6 +85,11 @@ void store::reset()
     g_channels = umap<snowflake, dchannel*>();
     g_guilds = umap<snowflake, dguild*>();
     g_relationships = ulist<drelationship>();
+    for (unsigned int i = 0; i < g_pins.count; i++) g_pins[i].ids.dispose();
+    g_pins.dispose();
+    g_pins = ulist<pin_list>();
+    g_pins_failed.dispose();
+    g_pins_failed = ulist<snowflake>();
     g_voice = ulist<dvoice_state>();
     g_guild_order = ulist<snowflake>();
     g_dm_order = ulist<snowflake>();
@@ -1432,6 +1452,71 @@ int store::relationship_type(snowflake user_id)
 }
 
 const ulist<drelationship>& store::relationships() { return g_relationships; }
+
+void store::fail_channel_pins(snowflake channel_id)
+{
+    for (unsigned int i = 0; i < g_pins_failed.count; i++)
+        if (g_pins_failed[i] == channel_id) return;
+
+    g_pins_failed.push(channel_id);
+    bump_revision();
+}
+
+bool store::pins_failed(snowflake channel_id)
+{
+    for (unsigned int i = 0; i < g_pins_failed.count; i++)
+        if (g_pins_failed[i] == channel_id) return true;
+
+    return false;
+}
+
+void store::set_channel_pins(snowflake channel_id, const snowflake* ids, int count)
+{
+    for (unsigned int i = 0; i < g_pins_failed.count; i++)
+    {
+        if (g_pins_failed[i] != channel_id) continue;
+        g_pins_failed.delete_at(i);
+        break;
+    }
+
+    for (unsigned int i = 0; i < g_pins.count; i++)
+    {
+        if (g_pins[i].channel != channel_id) continue;
+
+        g_pins[i].ids.dispose();
+        g_pins[i].ids = ulist<snowflake>();
+        for (int k = 0; k < count; k++) g_pins[i].ids.push(ids[k]);
+        bump_revision();
+        return;
+    }
+
+    pin_list p;
+    ccfset(&p, 0, sizeof(p));
+    p.channel = channel_id;
+    p.ids = ulist<snowflake>();
+    for (int k = 0; k < count; k++) p.ids.push(ids[k]);
+    g_pins.push(p);
+    bump_revision();
+}
+
+const ulist<snowflake>* store::channel_pins(snowflake channel_id)
+{
+    for (unsigned int i = 0; i < g_pins.count; i++)
+        if (g_pins[i].channel == channel_id) return &g_pins[i].ids;
+
+    return 0;
+}
+
+bool store::is_channel_pinned(snowflake channel_id, snowflake message_id)
+{
+    const ulist<snowflake>* ids = channel_pins(channel_id);
+    if (!ids) return false;
+
+    for (unsigned int i = 0; i < ids->count; i++)
+        if ((*ids)[i] == message_id) return true;
+
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // voice

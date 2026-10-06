@@ -565,6 +565,18 @@ static void draw_group_members(dchannel* c, float width)
             {
                 if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, 0);
                 ui_invite_to_server_menu(c->id);
+
+                // The owner runs the group: removing members and handing the
+                // crown on. Everybody else just sees the voice controls.
+                if (c->owner_id && c->owner_id == store::self_id() && u->id != store::self_id())
+                {
+                    ImGui::Separator();
+                    if (ImGui::MenuItem(tr("Убрать из группы")))
+                        api::group_remove_member(c->id, u->id);
+                    if (ImGui::MenuItem(tr("Передать владение")))
+                        ui_open_group_transfer(c->id, u->id);
+                }
+
                 ImGui::Separator();
 
                 // Voice controls for group call participants (same as in server sidebar)
@@ -1152,6 +1164,250 @@ void ui_view_friend_accept_popup()
     ImGui::PopStyleColor();
 }
 
+// ---- group creation ------------------------------------------------------
+//
+// A picker over the friends list. From a 1-1 conversation the checked names
+// are PUT into it one by one (which is what turns it into a group); with no
+// base conversation the same names go out as one POST. Ten members including
+// ourselves is all discord allows, so the box stops checking past nine.
+
+namespace
+{
+    snowflake g_group_base = 0;
+    snowflake g_group_checked[10];
+    int g_group_checked_count = 0;
+    bool g_group_want_open = false;
+    bool g_group_waiting = false;
+
+    bool group_is_checked(snowflake id)
+    {
+        for (int i = 0; i < g_group_checked_count; i++)
+            if (g_group_checked[i] == id) return true;
+        return false;
+    }
+
+    void group_set_checked(snowflake id, bool on)
+    {
+        for (int i = 0; i < g_group_checked_count; i++)
+        {
+            if (g_group_checked[i] != id) continue;
+            if (!on)
+            {
+                for (int k = i; k + 1 < g_group_checked_count; k++)
+                    g_group_checked[k] = g_group_checked[k + 1];
+                g_group_checked_count--;
+            }
+            return;
+        }
+
+        if (on && g_group_checked_count < 10)
+            g_group_checked[g_group_checked_count++] = id;
+    }
+
+    bool group_base_has(snowflake id)
+    {
+        if (!g_group_base) return false;
+
+        dchannel* c = store::find_channel(g_group_base);
+        if (!c) return false;
+
+        for (unsigned int i = 0; i < c->recipients.count; i++)
+            if (c->recipients[i] == id) return true;
+        return false;
+    }
+
+    int group_existing_count()
+    {
+        // Ourselves plus whoever is already in the base conversation.
+        if (!g_group_base) return 1;
+
+        dchannel* c = store::find_channel(g_group_base);
+        return c ? (int)c->recipients.count + 1 : 1;
+    }
+}
+
+void ui_open_group_picker(snowflake base_dm_channel, snowflake preselect_user)
+{
+    g_group_base = base_dm_channel;
+    g_group_checked_count = 0;
+    g_group_waiting = false;
+
+    if (preselect_user && !group_base_has(preselect_user) &&
+        store::relationship_type(preselect_user) == REL_FRIEND)
+        g_group_checked[g_group_checked_count++] = preselect_user;
+
+    science::group_invite_opened(base_dm_channel);
+    g_group_want_open = true;
+}
+
+void ui_view_group_picker_popup()
+{
+    if (g_group_want_open)
+    {
+        ImGui::OpenPopup("##grouppicker");
+        g_group_want_open = false;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(420, 480), ImGuiCond_Always);
+    if (!ImGui::BeginPopup("##grouppicker", ImGuiWindowFlags_NoResize))
+        return;
+
+    // A group the worker just made: open it and get out of the way.
+    snowflake created = 0;
+    if (g_group_waiting && api::take_created_channel(&created))
+    {
+        g_group_waiting = false;
+        g_group_base = 0;
+        g_group_checked_count = 0;
+        ImGui::CloseCurrentPopup();
+        ui_jump_to_message(created, 0);
+        ImGui::EndPopup();
+        return;
+    }
+
+    ImGui::TextUnformatted(g_group_base ? tr("Добавить в группу") : tr("Новая группа"));
+    ImGui::Separator();
+
+    if (g_group_waiting)
+    {
+        ImGui::Dummy(ImVec2(0, 20));
+        ui_text_muted(tr("Создание группы..."));
+        ImGui::Dummy(ImVec2(0, 8));
+        if (ImGui::Button(tr("Отмена"), ImVec2(120, 30)))
+        {
+            g_group_waiting = false;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+        return;
+    }
+
+    int existing = group_existing_count();
+    int left = 10 - existing;
+    if (left < 0) left = 0;
+
+    char hint[96];
+    cnprint(hint, sizeof(hint), tr("Мест осталось: %d"), left);
+    ui_text_muted(hint);
+
+    ImGui::BeginChild("##groupfriends", ImVec2(0, -70), false);
+
+    const ulist<drelationship>& rels = store::relationships();
+    for (unsigned int i = 0; i < rels.count; i++)
+    {
+        if (rels[i].type != REL_FRIEND) continue;
+
+        duser* u = store::find_user(rels[i].user_id);
+        if (!u || group_base_has(u->id)) continue;
+
+        const char* nm = u->display_name();
+        if (!nm || !nm[0]) nm = "?";
+
+        ImGui::PushID((const void*)(size_t)u->id);
+
+        bool checked = group_is_checked(u->id);
+        bool full = !checked && g_group_checked_count >= left;
+        if (full) ImGui::BeginDisabled();
+
+        ui_avatar(u, 24.0f, false);
+        ImGui::SameLine();
+        if (ImGui::Checkbox(nm, &checked))
+            group_set_checked(u->id, checked);
+
+        if (full) ImGui::EndDisabled();
+        ImGui::PopID();
+    }
+    ImGui::EndChild();
+
+    bool go = g_group_checked_count > 0 && g_group_checked_count <= left;
+    if (!go) ImGui::BeginDisabled();
+    if (ImGui::Button(g_group_base ? tr("Добавить") : tr("Создать"), ImVec2(140, 30)) && go)
+    {
+        snowflake picked[10];
+        for (int i = 0; i < g_group_checked_count; i++) picked[i] = g_group_checked[i];
+
+        // A fresh group and a converted 1-1 are both new conversations;
+        // growing an existing group is not.
+        bool is_new = true;
+        if (g_group_base)
+        {
+            dchannel* base = store::find_channel(g_group_base);
+            is_new = !base || base->type == CH_DM;
+        }
+        science::group_invite_confirmed(g_group_base, picked, g_group_checked_count, is_new);
+
+        if (g_group_base)
+            api::group_add_members(g_group_base, picked, g_group_checked_count);
+        else
+            api::group_create(picked, g_group_checked_count);
+
+        g_group_waiting = true;
+    }
+    if (!go) ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Отмена"), ImVec2(120, 30)))
+        ImGui::CloseCurrentPopup();
+
+    ImGui::EndPopup();
+}
+
+static snowflake g_transfer_channel = 0;
+static snowflake g_transfer_user = 0;
+static bool g_transfer_want_open = false;
+
+void ui_open_group_transfer(snowflake channel_id, snowflake user_id)
+{
+    g_transfer_channel = channel_id;
+    g_transfer_user = user_id;
+    g_transfer_want_open = true;
+}
+
+void ui_view_group_transfer_popup()
+{
+    if (g_transfer_want_open)
+    {
+        ImGui::OpenPopup("##grouptransfer");
+        g_transfer_want_open = false;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Always);
+    if (!ImGui::BeginPopupModal("##grouptransfer", 0,
+                                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    duser* u = store::find_user(g_transfer_user);
+    const char* name = (u && u->display_name()) ? u->display_name() : tr("Аккаунт");
+
+    ImGui::TextUnformatted(tr("Передать владение группой"));
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 4));
+
+    char line[256];
+    cnprint(line, sizeof(line), tr("Сделать %s владельцем? Корона уйдёт сразу."), name);
+    ImGui::TextWrapped("%s", line);
+    ImGui::Dummy(ImVec2(0, 8));
+
+    if (ui_icon_button(tr("Передать"), ImVec2(140, 32), col::green, col::green))
+    {
+        if (g_transfer_channel && g_transfer_user)
+            api::group_transfer_owner(g_transfer_channel, g_transfer_user);
+        g_transfer_channel = 0;
+        g_transfer_user = 0;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Отмена"), ImVec2(120, 32)) ||
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+    {
+        g_transfer_channel = 0;
+        g_transfer_user = 0;
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::EndPopup();
+}
+
 void ui_view_profile_popup()
 {
     if (g_ui.open_profile_popup)
@@ -1182,6 +1438,21 @@ void ui_view_profile_popup()
         ImGui::EndPopup();
         ImGui::PopStyleColor();
         return;
+    }
+
+    // Group creation, top left, on its own row: the corner badge sat on
+    // the name. With an existing 1-1 conversation the checked names join
+    // it; without one a fresh group is made, with this person pre-checked
+    // when they are a friend.
+    if (!u->bot && u->id != store::self_id())
+    {
+        if (ui_glyph_button("##groupadd", ICON_PLUS, false, ImVec2(28, 28),
+                            col::bg_panel, col::bg_hover, col::text_normal))
+            ui_open_group_picker(store::dm_with(u->id), u->id);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Создать группу"));
+        ImGui::SameLine(0, 8);
+        ui_text_muted(tr("Группа"));
+        ImGui::Dummy(ImVec2(0, 2));
     }
 
     // Banner strip.

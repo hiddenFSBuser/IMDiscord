@@ -75,10 +75,21 @@ namespace science
     void friends_list_viewed(const char* tab);
     void friends_list_clicked(const char* tab);
     void add_friend_input_clicked();
+    // Opening the pins popout. The official client reports it as open_popout
+    // with type "Channel Pins", right before the pins fetch goes out.
+    void pins_opened();
     // A captcha solved elsewhere and retried with its token. The official
     // client reports the solve right after it worked; the flow key is the
     // challenge session the refusal carried.
     void captcha_verified(const char* sitekey, const char* flow_key);
+
+    // ---- group DMs ----
+    // Opening the "add friends" box in a conversation, and confirming it.
+    // Shaped after the capture: open_popout plus the modal event on open,
+    // the clicked event with the chosen recipients on confirm.
+    void group_invite_opened(snowflake channel_id);
+    void group_invite_confirmed(snowflake channel_id, const snowflake* user_ids,
+                                int count, bool is_new);
 
     // The settings screen discord points people at when it will not show
     // something in place - blocked accounts are behind it - reported as the

@@ -1063,6 +1063,15 @@ namespace
             return;
         }
 
+        // Carries no ids, only the fact that the set changed - so the list
+        // is simply fetched again.
+        if (ccscmp(type, "CHANNEL_PINS_UPDATE") == 0)
+        {
+            snowflake ch = d->sf("channel_id");
+            if (ch) api::fetch_pins(ch);
+            return;
+        }
+
         if (ccscmp(type, "PRESENCE_UPDATE") == 0)
         {
             store::guard g;

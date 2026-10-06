@@ -17,6 +17,7 @@
 #include "video/player.h"
 #include "video/capture.h"
 #include "net/http.h"
+#include "net/json.h"
 #include "net/netdump.h"
 #include "discord/sdp.h"
 #include "net/selfcert.h"
@@ -396,6 +397,39 @@ extern "C" void __stdcall im_entry()
         if (wanted)
         {
             bool ok = ui_zip_self_test();
+            WSACleanup();
+            log_shutdown();
+            ExitProcess(ok ? 0 : 1);
+        }
+    }
+
+    // "--jsontest <path>" parses a file and reports the outcome: whether it
+    // parsed, what the root is, and whether the pins lookup finds anything.
+    // A diagnostic for responses that come back 200 but do not parse.
+    {
+        const wchar_t* found = 0;
+        for (const wchar_t* p = cmdline; *p; p++)
+        {
+            if (p[0] == L'-' && p[1] == L'-' && p[2] == L'j' && p[3] == L's' &&
+                p[4] == L'o' && p[5] == L'n' && p[6] == L't' && p[7] == L'e' &&
+                p[8] == L's' && p[9] == L't')
+            {
+                found = p + 10;
+                break;
+            }
+        }
+
+        if (found)
+        {
+            while (*found == L' ' || *found == L'"') found++;
+
+            wchar_t path[MAX_PATH];
+            int n = 0;
+            while (found[n] && found[n] != L'"' && n < MAX_PATH - 1) { path[n] = found[n]; n++; }
+            while (n > 0 && path[n - 1] == L' ') n--;
+            path[n] = 0;
+
+            bool ok = json_test_file(path);
             WSACleanup();
             log_shutdown();
             ExitProcess(ok ? 0 : 1);

@@ -271,6 +271,9 @@ enum ui_icon
     ICON_HANGUP,     // leave a call
     ICON_SCREEN,     // share the screen
     ICON_MUSIC,      // play a track into the call
+    ICON_SEARCH,     // message search
+    ICON_PIN,        // pinned messages
+    ICON_IMAGE,      // media listing
 };
 
 bool ui_glyph_button(const char* id, ui_icon icon, bool crossed, const ImVec2& size,
@@ -300,6 +303,13 @@ void ui_view_chat(float width, float height);
 bool ui_zip_self_test();
 void ui_downloads_init();
 void ui_view_downloads();
+void ui_jump_to_message(snowflake channel_id, snowflake message_id);
+void ui_open_pins(snowflake channel_id);
+void ui_view_pins_popup();
+void ui_open_search(snowflake channel_id);
+void ui_view_search_popup();
+void ui_open_media(snowflake channel_id);
+void ui_view_media_popup();
 void ui_view_modal_popup();
 void ui_view_members(float width, float height);
 void ui_view_friends(float width, float height);
@@ -324,6 +334,10 @@ void ui_apply_saved_guild_order();
 void ui_view_profile_popup();
 void ui_open_friend_accept(snowflake user_id);
 void ui_view_friend_accept_popup();
+void ui_open_group_picker(snowflake base_dm_channel, snowflake preselect_user);
+void ui_view_group_picker_popup();
+void ui_open_group_transfer(snowflake channel_id, snowflake user_id);
+void ui_view_group_transfer_popup();
 void ui_view_server_info_popup();
 void ui_view_roles_popup();
 void ui_view_invites_popup();

@@ -539,6 +539,485 @@ int archive::all_channels(snowflake* out, int cap)
 }
 
 // ---------------------------------------------------------------------------
+// local search
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    // One code point from *p, ASCII and Cyrillic folded to lowercase (Ё
+    // included) when asked. Anything else passes through decoded.
+    unsigned int search_next(const char** p, bool fold)
+    {
+        const unsigned char* s = (const unsigned char*)*p;
+        unsigned int c = s[0];
+
+        if (c < 0x80)
+        {
+            (*p)++;
+            if (fold && c >= 'A' && c <= 'Z') c += 32;
+            return c;
+        }
+
+        if (c == 0xD0 && s[1])
+        {
+            unsigned char d = s[1];
+            *p += 2;
+            if (d >= 0x90 && d <= 0xBF)
+                return fold ? (0x430u + (d - 0x90)) : (0x410u + (d - 0x90));
+            if (d == 0x81) return fold ? 0x451u : 0x401u;
+            return (0xD0u << 8) | d;
+        }
+
+        if (c == 0xD1 && s[1])
+        {
+            *p += 2;
+            return (0xD1u << 8) | s[1];
+        }
+
+        if ((c & 0xE0) == 0xC0 && s[1])
+        {
+            *p += 2;
+            return ((c & 0x1Fu) << 6) | (s[1] & 0x3Fu);
+        }
+
+        if ((c & 0xF0) == 0xE0 && s[1] && s[2])
+        {
+            *p += 3;
+            return ((c & 0x0Fu) << 12) | ((s[1] & 0x3Fu) << 6) | (s[2] & 0x3Fu);
+        }
+
+        if ((c & 0xF8) == 0xF0 && s[1] && s[2] && s[3])
+        {
+            *p += 4;
+            return ((c & 0x07u) << 18) | ((s[1] & 0x3Fu) << 12) |
+                   ((s[2] & 0x3Fu) << 6) | (s[3] & 0x3Fu);
+        }
+
+        (*p)++;
+        return c;
+    }
+
+    bool search_word_cp(unsigned int c)
+    {
+        if (c < 128)
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || c == '_';
+        if (c >= 0x430 && c <= 0x44F) return true;
+        if (c == 0x451) return true;
+        return false;
+    }
+
+    bool search_peek_word(const char* p, bool fold)
+    {
+        if (!p || !*p) return false;
+        const char* t = p;
+        return search_word_cp(search_next(&t, fold));
+    }
+
+    // Byte offset of the match in text, or -1. A substring by default; whole
+    // words only, or word starts only, when asked.
+    int search_find(const char* text, const unsigned int* q, int qn,
+                    bool fold, bool whole, bool prefix)
+    {
+        if (!text || qn <= 0) return -1;
+
+        bool prev_word = false;
+        bool first = true;
+
+        for (const char* s = text; *s; )
+        {
+            const char* t = s;
+            int i = 0;
+            for (; i < qn; i++)
+            {
+                if (!*t) break;
+                if (search_next(&t, fold) != q[i]) break;
+            }
+
+            if (i == qn)
+            {
+                bool left_ok = first || !prev_word;
+                if (whole && left_ok && !search_peek_word(t, fold))
+                    return (int)(s - text);
+                if (prefix && left_ok)
+                    return (int)(s - text);
+                if (!whole && !prefix)
+                    return (int)(s - text);
+            }
+
+            prev_word = search_peek_word(s, fold);
+            first = false;
+            search_next(&s, fold);
+        }
+
+        return -1;
+    }
+
+    bool raw_contains_n(const char* hay, unsigned int hay_len, const char* needle)
+    {
+        if (!*needle) return true;
+
+        unsigned int nlen = 0;
+        while (needle[nlen]) nlen++;
+
+        for (unsigned int i = 0; i + nlen <= hay_len; i++)
+        {
+            unsigned int k = 0;
+            while (k < nlen && hay[i + k] == needle[k]) k++;
+            if (k == nlen) return true;
+        }
+        return false;
+    }
+
+    void search_snippet(const char* text, int at, char* out, int cap)
+    {
+        int len = (int)ccslenf(text);
+        if (at < 0) at = 0;
+        if (at > len) at = len;
+
+        int from = at - 60;
+        if (from < 0) from = 0;
+        else
+        {
+            while (from < len && (((unsigned char)text[from] & 0xC0) == 0x80)) from++;
+        }
+
+        int to = at + 80;
+        if (to > len) to = len;
+        else
+        {
+            while (to > from && (((unsigned char)text[to] & 0xC0) == 0x80)) to--;
+        }
+
+        int o = 0;
+        if (from > 0 && o < cap - 4) { out[o++] = '.'; out[o++] = '.'; out[o++] = '.'; }
+        for (int i = from; i < to && o < cap - 5; i++)
+        {
+            // One line in the results: a newline inside the snippet makes a
+            // row no row can hold.
+            char c = text[i];
+            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            out[o++] = c;
+        }
+        if (to < len && o < cap - 4) { out[o++] = '.'; out[o++] = '.'; out[o++] = '.'; }
+        out[o] = 0;
+    }
+
+    struct search_accum
+    {
+        archive::search_hit* out;
+        int cap;
+        int found;
+        int matches;
+    };
+
+    struct search_attach
+    {
+        const char* filename;
+        const char* url;
+        const char* content_type;
+        unsigned int size;
+    };
+
+    // 1 image, 2 video, 3 other file. Same rules as attachments.
+    int search_media_kind(const char* content_type, const char* filename)
+    {
+        if (content_type)
+        {
+            if (ccsncmpf(content_type, "image/", 6) == 0) return 1;
+            if (ccsncmpf(content_type, "video/", 6) == 0) return 2;
+        }
+        if (filename)
+        {
+            int n = (int)ccslenf(filename);
+            if (n > 4)
+            {
+                const char* ext = filename + n - 4;
+                if (cctolower(ext[0]) == '.' && cctolower(ext[1]) == 'm' &&
+                    cctolower(ext[2]) == 'p' && ext[3] == '4') return 2;
+            }
+        }
+        return 3;
+    }
+
+    bool search_date_ok(const char* timestamp, const char* year, const char* month)
+    {
+        if (!year[0] && !month[0]) return true;
+        if (!timestamp) return false;
+        // ISO8601 starts with YYYY-MM.
+        if (year[0] && ccsncmpf(timestamp, year, 4) != 0) return false;
+        if (month[0] && (timestamp[4] != '-' || timestamp[5] != month[0] ||
+                         timestamp[6] != month[1])) return false;
+        return true;
+    }
+
+    void search_emit(search_accum* a, snowflake channel, snowflake id,
+                     snowflake author, const char* author_name,
+                     const char* timestamp, const char* snippet,
+                     const char* filename, const char* file_url,
+                     unsigned int file_size, int media_kind, int attach_index)
+    {
+        for (int i = 0; i < a->found; i++)
+        {
+            if (a->out[i].channel_id != channel || a->out[i].id != id) continue;
+            if (a->out[i].attach_index != attach_index) continue;
+            return;
+        }
+
+        a->matches++;
+        if (a->found >= a->cap) return;
+
+        archive::search_hit* h = &a->out[a->found++];
+        ccfset(h, 0, sizeof(*h));
+        h->channel_id = channel;
+        h->id = id;
+        h->author_id = author;
+        if (author_name) ccstrncpy(h->author_name, author_name, sizeof(h->author_name) - 1);
+        if (timestamp) ccstrncpy(h->timestamp, timestamp, sizeof(h->timestamp) - 1);
+        if (snippet) ccstrncpy(h->snippet, snippet, sizeof(h->snippet) - 1);
+        if (filename) ccstrncpy(h->filename, filename, sizeof(h->filename) - 1);
+        if (file_url) ccstrncpy(h->file_url, file_url, sizeof(h->file_url) - 1);
+        h->file_size = file_size;
+        h->media_kind = media_kind;
+        h->attach_index = attach_index;
+    }
+
+    // media_want: 0 text mode (one hit per message), 1 any attachment,
+    // 2 images, 3 videos (one hit per attachment).
+    void search_consider(search_accum* a, snowflake channel, snowflake id,
+                         snowflake author, const char* author_name,
+                         const char* timestamp, const char* content,
+                         const search_attach* atts, int att_count,
+                         const char* year, const char* month,
+                         const unsigned int* q, int qn,
+                         bool fold, bool whole, bool prefix, int media_want,
+                         bool require_media)
+    {
+        if (!search_date_ok(timestamp, year, month)) return;
+
+        int at = -1;
+        if (qn > 0)
+        {
+            if (!content || !content[0]) return;
+            at = search_find(content, q, qn, fold, whole, prefix);
+            if (at < 0) return;
+        }
+        else if (!media_want)
+        {
+            return;
+        }
+
+        if (!media_want)
+        {
+            if (require_media && !att_count) return;
+
+            char snippet[256];
+            search_snippet(content, at, snippet, sizeof(snippet));
+            search_emit(a, channel, id, author, author_name, timestamp, snippet,
+                        0, 0, 0, 0, 0);
+            return;
+        }
+
+        for (int k = 0; k < att_count; k++)
+        {
+            int kind = search_media_kind(atts[k].content_type, atts[k].filename);
+            if (media_want == 2 && kind != 1) continue;
+            if (media_want == 3 && kind != 2) continue;
+
+            search_emit(a, channel, id, author, author_name, timestamp,
+                        atts[k].filename, atts[k].filename, atts[k].url,
+                        atts[k].size, kind, k);
+        }
+    }
+}
+
+int archive::search_local(const char* query, int flags, snowflake scope_channel,
+                          int year, int month,
+                          archive::search_hit* out, int cap, int* total)
+{
+    if (total) *total = 0;
+    if (!out || cap <= 0) return 0;
+    if (!query) query = "";
+
+    bool fold = (flags & archive::SEARCH_CASE) == 0;
+    bool whole = (flags & archive::SEARCH_WHOLE) != 0;
+    bool prefix = (flags & archive::SEARCH_PREFIX) != 0;
+    bool require_media = (flags & archive::SEARCH_MEDIA) != 0;
+
+    int media_want = 0;
+    bool want_images = (flags & archive::SEARCH_IMAGES) != 0;
+    bool want_videos = (flags & archive::SEARCH_VIDEOS) != 0;
+    if (want_images && want_videos) media_want = 1;
+    else if (want_images) media_want = 2;
+    else if (want_videos) media_want = 3;
+
+    unsigned int q[128];
+    int qn = 0;
+    for (const char* p = query; *p && qn < 128; )
+        q[qn++] = search_next(&p, fold);
+    if (!qn && !media_want) return 0;
+
+    char ystr[8];
+    char mstr[4];
+    ccfset(ystr, 0, sizeof(ystr));
+    ccfset(mstr, 0, sizeof(mstr));
+    if (year > 0) cnprint(ystr, sizeof(ystr), "%d", year);
+    if (month >= 1 && month <= 12)
+    {
+        mstr[0] = (char)('0' + month / 10);
+        mstr[1] = (char)('0' + month % 10);
+    }
+
+    search_accum a;
+    a.out = out;
+    a.cap = cap;
+    a.found = 0;
+    a.matches = 0;
+
+    // Live memory first: what is open is also what is newest.
+    {
+        store::guard g;
+
+        ulist<snowflake> ids;
+        ids = ulist<snowflake>();
+        if (scope_channel) ids.push(scope_channel);
+        else store::all_channels(&ids);
+
+        for (unsigned int c = 0; c < ids.count; c++)
+        {
+            dchannel* ch = store::find_channel(ids[c]);
+            if (!ch) continue;
+
+            for (unsigned int i = 0; i < ch->messages.count; i++)
+            {
+                dmessage* m = &ch->messages[i];
+
+                search_attach atts[10];
+                int att_count = 0;
+                for (unsigned int k = 0; k < m->attachments.count && att_count < 10; k++)
+                {
+                    const dattachment* at = &m->attachments[k];
+                    atts[att_count].filename = at->filename;
+                    atts[att_count].url = (at->proxy_url && at->proxy_url[0])
+                        ? at->proxy_url : at->url;
+                    atts[att_count].content_type = at->content_type;
+                    atts[att_count].size = at->size;
+                    att_count++;
+                }
+
+                duser* u = store::find_user(m->author_id);
+                search_consider(&a, ch->id, m->id, m->author_id,
+                                u ? u->display_name() : 0, m->timestamp, m->content,
+                                atts, att_count, ystr, mstr,
+                                q, qn, fold, whole, prefix, media_want, require_media);
+            }
+        }
+        ids.dispose();
+    }
+
+    // Then the files: everything warmed, whether it is loaded or not.
+    {
+        snowflake channels[2048];
+        int nch = 0;
+        if (scope_channel)
+        {
+            channels[0] = scope_channel;
+            nch = 1;
+        }
+        else
+        {
+            nch = archive::all_channels(channels, 2048);
+        }
+
+        for (int c = 0; c < nch; c++)
+        {
+            wchar_t path[MAX_PATH];
+            if (!channel_path(channels[c], L".jsonl", path, MAX_PATH)) continue;
+
+            ubuffer blob;
+            blob.init();
+            if (!ufile::read_all(path, &blob))
+            {
+                blob.free_buffer();
+                continue;
+            }
+
+            const char* text = (const char*)blob.c_str();
+            unsigned int size = blob.size;
+
+            unsigned int pos = 0;
+            while (pos < size)
+            {
+                unsigned int end = pos;
+                while (end < size && text[end] != '\n') end++;
+
+                if (end - pos > 2)
+                {
+                    // Case sensitive pairs with a raw prefilter: when the
+                    // bytes are not in the line, the parsed content cannot
+                    // match either, and most lines skip the parse. Skipped
+                    // for match-all media sweeps, where there is no query.
+                    if (!qn || fold || raw_contains_n(text + pos, end - pos, query))
+                    {
+                        jdoc doc;
+                        doc.init();
+                        if (doc.parse(text + pos, (int)(end - pos)) &&
+                            doc.r()->type == JTYPE_OBJ)
+                        {
+                            const jval* v = doc.r();
+                            const char* content = v->str("content", "");
+
+                            search_attach atts[10];
+                            int att_count = 0;
+                            const jval* ja = v->arr("attachments");
+                            if (ja->type == JTYPE_ARR)
+                            {
+                                for (unsigned int k = 0; k < ja->count && att_count < 10; k++)
+                                {
+                                    const jval* ao = ja->at(k);
+                                    atts[att_count].filename = ao->str("filename", 0);
+                                    atts[att_count].url = ao->str("url", 0);
+                                    atts[att_count].content_type = ao->str("content_type", 0);
+                                    atts[att_count].size = (unsigned int)ao->i64("size", 0);
+                                    att_count++;
+                                }
+                            }
+
+                            char aname[64];
+                            aname[0] = 0;
+
+                            snowflake author = 0;
+                            const jval* au = v->obj("author");
+                            if (au->type == JTYPE_OBJ)
+                            {
+                                author = au->sf("id");
+                                const char* gn = au->str("global_name", 0);
+                                const char* un = au->str("username", 0);
+                                ccstrncpy(aname, (gn && gn[0]) ? gn : (un ? un : ""),
+                                          sizeof(aname) - 1);
+                            }
+
+                            search_consider(&a, channels[c], v->sf("id"), author, aname,
+                                            v->str("timestamp", ""), content,
+                                            atts, att_count, ystr, mstr,
+                                            q, qn, fold, whole, prefix, media_want,
+                                            require_media);
+                        }
+                        doc.free_doc();
+                    }
+                }
+
+                pos = end + 1;
+            }
+
+            blob.free_buffer();
+        }
+    }
+
+    if (total) *total = a.matches;
+    return a.found;
+}
+
+// ---------------------------------------------------------------------------
 // the snapshot
 // ---------------------------------------------------------------------------
 

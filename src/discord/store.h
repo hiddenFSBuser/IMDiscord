@@ -90,6 +90,16 @@ namespace store
     const char* relationship_since(snowflake user_id);
     const ulist<drelationship>& relationships();
 
+    // Pinned message ids of a channel, as last fetched. Null when nobody
+    // asked yet; messages themselves live in the channel history.
+    void set_channel_pins(snowflake channel_id, const snowflake* ids, int count);
+    const ulist<snowflake>* channel_pins(snowflake channel_id);
+    bool is_channel_pinned(snowflake channel_id, snowflake message_id);
+    // The last fetch for the channel failed. Shown as an error with a retry
+    // instead of loading forever.
+    void fail_channel_pins(snowflake channel_id);
+    bool pins_failed(snowflake channel_id);
+
     // ---- voice ----
     void set_voice_state(const jval* v, snowflake guild_id);
     // Null when the user is not in any voice channel we know about.

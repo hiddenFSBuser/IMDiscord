@@ -837,6 +837,26 @@ namespace
         snowflake anchor;        // first message drawn, or 0 while pinned
         bool pinned;             // sitting at the end, as a chat normally does
 
+        // A jump just landed here: hold the top, and do not mistake the
+        // forced scroll for a manual scroll to the top (which would show
+        // more and eat the anchor a hundred messages at a time). Cleared
+        // by the first scroll the person makes themselves.
+        bool jump_hold;
+
+        // Frames to drive the scroll onto the jumped-to row before the
+        // release checks below may look at it. On the landing frame the
+        // scroll still shows where the reader was (usually the bottom,
+        // where jumps are clicked from) - reading that as input drops the
+        // hold without ever moving, which is how jumps landed "far away".
+        // While this runs, the scroll is not input.
+        int jump_settle;
+
+        // Cursor Y of the anchor row this frame. The jumped-to message is
+        // drawn first, but archive/loading controls above it move by tens
+        // of pixels, so the row is not at zero - the hold scrolls to this,
+        // never to a guess.
+        float anchor_y;
+
         // Content height last frame, and whether the window was just extended
         // upwards. Adding messages above the scroll position moves everything
         // down by however tall they turned out to be, and that has to be
@@ -845,7 +865,7 @@ namespace
         bool grew_upwards;
     };
 
-    chat_window g_win = { 0, 0, true, 0.0f, false };
+    chat_window g_win = { 0, 0, true, false, 0, 0.0f, 0.0f, false };
 
     // Index of the first message with an id at least this one. The list is
     // sorted, so this is a binary search - a linear one runs per frame over
@@ -2971,6 +2991,15 @@ namespace
             if (author && ImGui::MenuItem(tr("Профиль автора"))) ui_open_profile(author->id, m->guild_id);
             if (m->content && ImGui::MenuItem(tr("Копировать текст"))) ImGui::SetClipboardText(m->content);
 
+            if (store::is_channel_pinned(m->channel_id, m->id))
+            {
+                if (ImGui::MenuItem(tr("Открепить"))) api::unpin_message(m->channel_id, m->id);
+            }
+            else
+            {
+                if (ImGui::MenuItem(tr("Закрепить"))) api::pin_message(m->channel_id, m->id);
+            }
+
             ImGui::Separator();
             if (author) ui_copy_id_item(author->id, tr("Скопировать ID автора"));
             ui_copy_id_item(m->id, tr("Скопировать ID сообщения"));
@@ -3452,9 +3481,671 @@ void ui_view_modal_popup()
     ImGui::EndPopup();
 }
 
+    // ---- local search --------------------------------------------------
+    //
+    // Searches warmed history without touching the network, String.Contains
+    // style: a plain substring by default, with checkboxes for case, whole
+    // words, and word starts instead of anywhere. Runs on a worker because a
+    // cold archive scan takes longer than a frame.
+
+    struct search_job_args
+    {
+        char query[256];
+        int flags;
+        snowflake scope;
+        int year;
+        int month;
+        int kind;   // 0 text, 1 media gallery
+
+        archive::search_hit hits[200];
+        int count;
+        int total;
+    };
+
+    CRITICAL_SECTION g_search_lock;
+    bool g_search_lock_ready = false;
+    search_job_args g_search_done;
+    bool g_search_have_results = false;
+    bool g_search_running = false;
+    int g_search_slot_kind = -1;
+
+    void search_lock_ready()
+    {
+        // Created on the interface thread, before the first job that uses
+        // it is posted.
+        if (g_search_lock_ready) return;
+        InitializeCriticalSection(&g_search_lock);
+        g_search_lock_ready = true;
+    }
+
+    void job_search(void* user)
+    {
+        search_job_args* j = (search_job_args*)user;
+
+        int total = 0;
+        j->count = archive::search_local(j->query, j->flags, j->scope,
+                                         j->year, j->month,
+                                         j->hits, 200, &total);
+        j->total = total;
+
+        EnterCriticalSection(&g_search_lock);
+        g_search_done = *j;
+        g_search_slot_kind = j->kind;
+        g_search_have_results = true;
+        g_search_running = false;
+        LeaveCriticalSection(&g_search_lock);
+
+        memfree(j);
+    }
+
+    static char g_search_query[256];
+    static int g_search_flags = 0;
+    static bool g_search_all = false;
+    static snowflake g_search_channel = 0;
+    static bool g_search_want_open = false;
+    static archive::search_hit g_search_hits[200];
+    static int g_search_count = 0;
+    static int g_search_total = 0;
+    static bool g_search_show_results = false;
+    static int g_search_year = 0;
+    static int g_search_month = 0;
+
+    void ui_open_search(snowflake channel_id)
+    {
+        g_search_channel = channel_id;
+        g_search_all = false;
+        g_search_want_open = true;
+        g_search_show_results = false;
+        g_search_count = 0;
+        g_search_total = 0;
+    }
+
+    void search_channel_label(snowflake channel_id, char* out, int cap)
+    {
+        dchannel* c = store::find_channel(channel_id);
+        if (!c)
+        {
+            ccstrncpy(out, tr("канал"), cap - 1);
+            return;
+        }
+        ui_channel_display_name(c, out, cap);
+    }
+
+    void ui_view_search_popup()
+    {
+        if (g_search_want_open)
+        {
+            ImGui::OpenPopup("##search");
+            g_search_want_open = false;
+        }
+
+        ImGui::SetNextWindowSize(ImVec2(560, 480), ImGuiCond_Always);
+        if (!ImGui::BeginPopup("##search", ImGuiWindowFlags_NoResize))
+            return;
+
+        ImGui::TextUnformatted(tr("Поиск по сохранённому"));
+        ImGui::Separator();
+
+        ImGui::SetNextItemWidth(-90.0f);
+        bool go = ImGui::InputTextWithHint("##searchq", tr("что искать"),
+                                           g_search_query, sizeof(g_search_query),
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+
+        bool can_go = g_search_query[0] != 0 && !g_search_running;
+        if (!can_go) ImGui::BeginDisabled();
+        if ((ImGui::Button(tr("Найти"), ImVec2(-1, 0)) || go) && can_go)
+        {
+            search_lock_ready();
+
+            search_job_args* j = (search_job_args*)memalloc(sizeof(search_job_args));
+            if (j)
+            {
+                ccfset(j, 0, sizeof(*j));
+                ccstrncpy(j->query, g_search_query, sizeof(j->query) - 1);
+                j->flags = g_search_flags;
+                j->scope = g_search_all ? 0 : g_search_channel;
+                j->year = g_search_year;
+                j->month = g_search_month;
+
+                EnterCriticalSection(&g_search_lock);
+                g_search_running = true;
+                g_search_have_results = false;
+                g_search_slot_kind = -1;
+                LeaveCriticalSection(&g_search_lock);
+
+                jobs::post(job_search, j);
+            }
+        }
+        if (!can_go) ImGui::EndDisabled();
+
+        bool match_case = (g_search_flags & archive::SEARCH_CASE) != 0;
+        if (ImGui::Checkbox(tr("Учитывать регистр"), &match_case))
+        {
+            if (match_case) g_search_flags |= archive::SEARCH_CASE;
+            else g_search_flags &= ~archive::SEARCH_CASE;
+        }
+        ImGui::SameLine();
+        bool whole = (g_search_flags & archive::SEARCH_WHOLE) != 0;
+        if (ImGui::Checkbox(tr("Целое слово"), &whole))
+        {
+            if (whole) g_search_flags |= archive::SEARCH_WHOLE;
+            else g_search_flags &= ~archive::SEARCH_WHOLE;
+        }
+        ImGui::SameLine();
+        bool prefix = (g_search_flags & archive::SEARCH_PREFIX) != 0;
+        if (ImGui::Checkbox(tr("С начала слова"), &prefix))
+        {
+            if (prefix) g_search_flags |= archive::SEARCH_PREFIX;
+            else g_search_flags &= ~archive::SEARCH_PREFIX;
+        }
+        ImGui::SameLine();
+        bool media = (g_search_flags & archive::SEARCH_MEDIA) != 0;
+        if (ImGui::Checkbox(tr("Только с вложениями"), &media))
+        {
+            if (media) g_search_flags |= archive::SEARCH_MEDIA;
+            else g_search_flags &= ~archive::SEARCH_MEDIA;
+        }
+
+        bool everywhere = g_search_all;
+        if (ImGui::RadioButton(tr("Везде"), everywhere)) g_search_all = true;
+        ImGui::SameLine();
+        if (ImGui::RadioButton(tr("В этом канале"), !everywhere)) g_search_all = false;
+
+        // A year and a month bound the hunt: timestamps start with YYYY-MM,
+        // so this is a prefix check, not a calendar.
+        {
+            static const char* MONTHS[] = { "Все", "Январь", "Февраль", "Март",
+                "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь",
+                "Октябрь", "Ноябрь", "Декабрь" };
+            static int year_idx = 0;
+            static int month_idx = 0;
+
+            char year_label[8];
+            if (year_idx <= 0 || year_idx > 12) ccstrncpy(year_label, tr("Все"), sizeof(year_label) - 1);
+            else cnprint(year_label, sizeof(year_label), "%d", 2027 - year_idx);
+
+            ImGui::SetNextItemWidth(90);
+            if (ImGui::BeginCombo("##searchyear", year_label))
+            {
+                for (int y = 0; y <= 12; y++)
+                {
+                    char item[8];
+                    if (y <= 0 || y > 12) ccstrncpy(item, tr("Все"), sizeof(item) - 1);
+                    else cnprint(item, sizeof(item), "%d", 2027 - y);
+
+                    ImGui::PushID(y);
+                    if (ImGui::Selectable(item, year_idx == y)) year_idx = y;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(120);
+            if (ImGui::BeginCombo("##searchmonth", tr(MONTHS[month_idx])))
+            {
+                for (int m = 0; m <= 12; m++)
+                {
+                    ImGui::PushID(100 + m);
+                    if (ImGui::Selectable(tr(MONTHS[m]), month_idx == m)) month_idx = m;
+                    ImGui::PopID();
+                }
+                ImGui::EndCombo();
+            }
+
+            g_search_year = year_idx <= 0 || year_idx > 12 ? 0 : 2027 - year_idx;
+            g_search_month = (month_idx >= 1 && month_idx <= 12) ? month_idx : 0;
+        }
+
+        ImGui::Separator();
+
+        // Pick up what the worker found, if anything. The slot is shared
+        // with the media gallery; each takes only its own kind.
+        bool running = false;
+        if (g_search_lock_ready)
+        {
+            EnterCriticalSection(&g_search_lock);
+            running = g_search_running;
+            if (g_search_have_results && g_search_slot_kind == 0)
+            {
+                g_search_count = g_search_done.count;
+                g_search_total = g_search_done.total;
+                for (int i = 0; i < g_search_count; i++)
+                    g_search_hits[i] = g_search_done.hits[i];
+                g_search_have_results = false;
+                g_search_show_results = true;
+            }
+            LeaveCriticalSection(&g_search_lock);
+        }
+
+        if (running)
+        {
+            ui_text_muted(tr("Идёт поиск..."));
+        }
+        else if (g_search_show_results)
+        {
+            char status[128];
+            if (g_search_total > g_search_count)
+                cnprint(status, sizeof(status), tr("Найдено: %d (первые %d)"),
+                        g_search_total, g_search_count);
+            else
+                cnprint(status, sizeof(status), tr("Найдено: %d"), g_search_total);
+            ui_text_muted(status);
+
+            // Explicit height, not (0, -1): inside a window whose own size did
+            // not apply the fill collapses to nothing and takes its rows
+            // with it, which is how results vanished while the counter saw
+            // them.
+            float results_h = 470.0f - ImGui::GetCursorPosY();
+            if (results_h < 100.0f) results_h = 100.0f;
+            ImGui::BeginChild("##searchresults", ImVec2(0, results_h), false);
+            for (int i = 0; i < g_search_count; i++)
+            {
+                ImGui::PushID(i);
+                const archive::search_hit* h = &g_search_hits[i];
+
+                char where[160];
+                search_channel_label(h->channel_id, where, sizeof(where));
+
+                char head[256];
+                cnprint(head, sizeof(head), "%s · %s", where,
+                        h->author_name[0] ? h->author_name : "?");
+                ui_text_muted(head);
+
+                char stamp[48];
+                format_timestamp(h->timestamp, stamp, sizeof(stamp));
+
+                char row[512];
+                cnprint(row, sizeof(row), "%s  %s",
+                        stamp[0] ? stamp : "", h->snippet);
+                if (ImGui::Selectable(row, false, 0, ImVec2(0, 0)))
+                {
+                    ui_jump_to_message(h->channel_id, h->id);
+                    ImGui::CloseCurrentPopup();
+                }
+
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
+        else
+        {
+            ui_text_muted(tr("Ищет по прогретым чатам, без сети."));
+        }
+
+        ImGui::EndPopup();
+    }
+
+    // ---- media listing ---------------------------------------------------
+    //
+    // A gallery beside the text search: same warmed history, but only
+    // messages carrying pictures or video, shown as themselves rather than
+    // as text rows. An empty query lists everything.
+
+    static char g_media_query[256];
+    static bool g_media_images = true;
+    static bool g_media_videos = true;
+    static bool g_media_all = false;
+    static snowflake g_media_channel = 0;
+    static bool g_media_want_open = false;
+    static archive::search_hit g_media_hits[200];
+    static int g_media_count = 0;
+    static int g_media_total = 0;
+    static bool g_media_show_results = false;
+
+    void ui_open_media(snowflake channel_id)
+    {
+        g_media_channel = channel_id;
+        g_media_all = false;
+        g_media_want_open = true;
+        g_media_show_results = false;
+        g_media_count = 0;
+        g_media_total = 0;
+    }
+
+    void ui_view_media_popup()
+    {
+        if (g_media_want_open)
+        {
+            ImGui::OpenPopup("##media");
+            g_media_want_open = false;
+        }
+
+        ImGui::SetNextWindowSize(ImVec2(560, 520), ImGuiCond_Always);
+        if (!ImGui::BeginPopup("##media", ImGuiWindowFlags_NoResize))
+            return;
+
+        ImGui::TextUnformatted(tr("Медиа"));
+        ImGui::Separator();
+
+        ImGui::SetNextItemWidth(-90.0f);
+        bool go = ImGui::InputTextWithHint("##mediaq", tr("подпись или имя файла (можно пусто)"),
+                                           g_media_query, sizeof(g_media_query),
+                                           ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+
+        bool can_go = (g_media_images || g_media_videos) && !g_search_running;
+        if (!can_go) ImGui::BeginDisabled();
+        if ((ImGui::Button(tr("Найти"), ImVec2(-1, 0)) || go) && can_go)
+        {
+            search_lock_ready();
+
+            search_job_args* j = (search_job_args*)memalloc(sizeof(search_job_args));
+            if (j)
+            {
+                int flags = 0;
+                if (g_media_images) flags |= archive::SEARCH_IMAGES;
+                if (g_media_videos) flags |= archive::SEARCH_VIDEOS;
+
+                ccfset(j, 0, sizeof(*j));
+                ccstrncpy(j->query, g_media_query, sizeof(j->query) - 1);
+                j->flags = flags;
+                j->scope = g_media_all ? 0 : g_media_channel;
+                j->year = 0;
+                j->month = 0;
+                j->kind = 1;
+
+                EnterCriticalSection(&g_search_lock);
+                g_search_running = true;
+                g_search_have_results = false;
+                g_search_slot_kind = -1;
+                LeaveCriticalSection(&g_search_lock);
+
+                jobs::post(job_search, j);
+            }
+        }
+        if (!can_go) ImGui::EndDisabled();
+
+        ImGui::Checkbox(tr("Фото"), &g_media_images);
+        ImGui::SameLine();
+        ImGui::Checkbox(tr("Видео"), &g_media_videos);
+
+        bool everywhere = g_media_all;
+        if (ImGui::RadioButton(tr("Везде"), everywhere)) g_media_all = true;
+        ImGui::SameLine();
+        if (ImGui::RadioButton(tr("В этом канале"), !everywhere)) g_media_all = false;
+
+        ImGui::Separator();
+
+        bool running = false;
+        if (g_search_lock_ready)
+        {
+            EnterCriticalSection(&g_search_lock);
+            running = g_search_running;
+            if (g_search_have_results && g_search_slot_kind == 1)
+            {
+                g_media_count = g_search_done.count;
+                g_media_total = g_search_done.total;
+                for (int i = 0; i < g_media_count; i++)
+                    g_media_hits[i] = g_search_done.hits[i];
+                g_search_have_results = false;
+                g_media_show_results = true;
+            }
+            LeaveCriticalSection(&g_search_lock);
+        }
+
+        if (running)
+        {
+            ui_text_muted(tr("Идёт поиск..."));
+        }
+        else if (g_media_show_results)
+        {
+            char status[128];
+            if (g_media_total > g_media_count)
+                cnprint(status, sizeof(status), tr("Найдено: %d (первые %d)"),
+                        g_media_total, g_media_count);
+            else
+                cnprint(status, sizeof(status), tr("Найдено: %d"), g_media_total);
+            ui_text_muted(status);
+
+            float gh = 510.0f - ImGui::GetCursorPosY();
+            if (gh < 100.0f) gh = 100.0f;
+            ImGui::BeginChild("##mediagallery", ImVec2(0, gh), false);
+
+            for (int i = 0; i < g_media_count; i++)
+            {
+                ImGui::PushID(i);
+                const archive::search_hit* h = &g_media_hits[i];
+
+                duser* author = store::find_user(h->author_id);
+                char head[256];
+                cnprint(head, sizeof(head), "%s · %s",
+                        author ? (author->display_name() ? author->display_name() : "?")
+                               : (h->author_name[0] ? h->author_name : "?"),
+                        h->filename[0] ? h->filename : "?");
+                ui_text_muted(head);
+
+                if (h->media_kind == 1 && h->file_url[0])
+                {
+                    if (draw_image(h->file_url, 0, 0))
+                        ui_open_image_viewer(h->file_url, h->filename[0] ? h->filename : 0);
+                    if (ImGui::IsItemHovered()) g_media_hovered = true;
+
+                    // On its own line under the picture: hung off the image
+                    // row it lands on top of the picture, where a click opens
+                    // the viewer instead of jumping.
+                    if (ImGui::Button(tr("Перейти"), ImVec2(120, 26)))
+                    {
+                        ui_jump_to_message(h->channel_id, h->id);
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+                else
+                {
+                    char size_text[32];
+                    human_size(h->file_size, size_text, sizeof(size_text));
+
+                    char row[320];
+                    cnprint(row, sizeof(row), "%s · %s",
+                            h->filename[0] ? h->filename : tr("файл"), size_text);
+                    ImGui::TextUnformatted(row);
+
+                    if (h->file_url[0] && ImGui::Button(tr("Скачать"), ImVec2(120, 26)))
+                        start_download(h->file_url,
+                                       h->filename[0] ? h->filename : "file");
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(tr("Перейти")))
+                    {
+                        ui_jump_to_message(h->channel_id, h->id);
+                        ImGui::CloseCurrentPopup();
+                    }
+                }
+
+                ImGui::Separator();
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
+        else
+        {
+            ui_text_muted(tr("Картинки и видео из прогретых чатов."));
+        }
+
+        if (ImGui::Button(tr("Закрыть"), ImVec2(120, 28)))
+            ImGui::CloseCurrentPopup();
+
+        ImGui::EndPopup();
+    }
+
 bool ui_zip_self_test()
 {
     return zip_self_test();
+}
+
+// A jump to one message: the channel opens on it, scrolled to the top.
+// When the message is not held, history just below it is asked for, which
+// lands it at the end of what arrives; either way the anchor puts it first
+// on screen.
+static snowflake g_pending_jump = 0;
+static snowflake g_pending_channel = 0;
+static int g_pending_tries = 0;
+
+// The jumped-to message flashes until it is unmistakable which row was
+// meant. Without it a landing "nearby" reads as a miss even when the anchor
+// is exact - and an actual miss reads as nothing at all.
+static snowflake g_jump_flash = 0;
+static unsigned long long g_jump_flash_until = 0;
+
+void ui_jump_to_message(snowflake channel_id, snowflake message_id)
+{
+    if (!channel_id) return;
+
+    dchannel* ch = store::find_channel(channel_id);
+    if (!ch) return;
+
+    if (g_ui.active_channel != channel_id)
+    {
+        g_ui.active_channel = channel_id;
+        g_ui.active_guild = ch->guild_id;
+    }
+
+    // No message: just open the channel at the end.
+    if (!message_id)
+    {
+        g_pending_jump = 0;
+        g_pending_channel = 0;
+        g_pending_tries = 0;
+        g_win.jump_hold = false;
+        g_win.jump_settle = 0;
+        g_ui.scroll_to_bottom = true;
+        return;
+    }
+
+    // Landed on arrival, not on click: the draw loop below anchors once the
+    // message is actually held, fetching around it until then.
+    g_pending_channel = channel_id;
+    g_pending_jump = message_id;
+    g_pending_tries = 0;
+}
+
+static snowflake g_pins_channel = 0;
+static bool g_pins_want_open = false;
+
+void ui_open_pins(snowflake channel_id)
+{
+    if (!channel_id) return;
+    g_pins_channel = channel_id;
+    g_pins_want_open = true;
+    science::pins_opened();
+    api::fetch_pins(channel_id);
+}
+
+void ui_view_pins_popup()
+{
+    if (g_pins_want_open)
+    {
+        ImGui::OpenPopup("##pins");
+        g_pins_want_open = false;
+    }
+    if (!g_pins_channel) return;
+
+    // Fixed size, reapplied every frame: content-driven sizing feeds back
+    // into itself and the width walks away a frame at a time.
+    ImGui::SetNextWindowSize(ImVec2(480, 420), ImGuiCond_Always);
+    if (!ImGui::BeginPopup("##pins", ImGuiWindowFlags_NoResize))
+        return;
+
+    dchannel* ch = store::find_channel(g_pins_channel);
+
+    ImGui::TextUnformatted(tr("Закреплённые сообщения"));
+    ImGui::SameLine();
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - 90.0f);
+    if (ImGui::SmallButton(tr("Обновить"))) api::fetch_pins(g_pins_channel);
+    ImGui::Separator();
+
+    const ulist<snowflake>* ids = store::channel_pins(g_pins_channel);
+    if (!ids)
+    {
+        if (store::pins_failed(g_pins_channel))
+        {
+            ImGui::TextUnformatted(tr("Не удалось загрузить"));
+            if (ImGui::Button(tr("Повторить"), ImVec2(140, 28)))
+                api::fetch_pins(g_pins_channel);
+        }
+        else
+        {
+            ui_text_muted(tr("Загрузка..."));
+        }
+    }
+    else if (!ids->count)
+    {
+        ui_text_muted(tr("Закрепов нет"));
+    }
+    else
+    {
+        // Explicit height, same story as the search results: a (0, -1)
+        // child inside a window whose size did not apply shows nothing.
+        float pins_h = 410.0f - ImGui::GetCursorPosY();
+        if (pins_h < 100.0f) pins_h = 100.0f;
+        ImGui::BeginChild("##pinlist", ImVec2(0, pins_h), false);
+        for (unsigned int i = 0; i < ids->count; i++)
+        {
+            ImGui::PushID((int)i);
+
+            dmessage* m = (ch && (*ids)[i]) ? store::find_message(ch, (*ids)[i]) : 0;
+
+            char head[192];
+            if (m)
+            {
+                duser* author = store::find_user(m->author_id);
+                char stamp[48];
+                format_timestamp(m->timestamp, stamp, sizeof(stamp));
+                cnprint(head, sizeof(head), "%s · %s",
+                        author ? author->display_name() : "?",
+                        stamp[0] ? stamp : "");
+            }
+            else
+            {
+                cnprint(head, sizeof(head), "%llu", (*ids)[i]);
+            }
+
+            ui_text_muted(head);
+
+            // One line, no newlines: a wrapped or clickable text block is
+            // what kept eating the row layout, so the text is text and the
+            // actions below it are plain fixed buttons.
+            char snippet[160];
+            if (m && m->content && m->content[0])
+            {
+                unsigned int n = 0;
+                while (m->content[n] && n < sizeof(snippet) - 5) n++;
+                while (n > 0 && (((unsigned char)m->content[n] & 0xC0) == 0x80)) n--;
+                for (unsigned int k = 0; k < n; k++)
+                {
+                    char c = m->content[k];
+                    snippet[k] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+                }
+                snippet[n] = 0;
+                if (m->content[n]) ccstrncpy(snippet + n, "...", 4);
+            }
+            else if (m && m->attachments.count)
+            {
+                cnprint(snippet, sizeof(snippet), tr("[вложение]"));
+            }
+            else
+            {
+                cnprint(snippet, sizeof(snippet), tr("[сообщение не загружено]"));
+            }
+
+            ImGui::TextWrapped("%s", snippet);
+
+            if (ImGui::Button(tr("Перейти"), ImVec2(120, 26)))
+            {
+                ui_jump_to_message(g_pins_channel, (*ids)[i]);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button(tr("Открепить"), ImVec2(120, 26)))
+                api::unpin_message(g_pins_channel, (*ids)[i]);
+
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+    }
+
+    ImGui::EndPopup();
 }
 
 void ui_downloads_init()
@@ -3544,6 +4235,40 @@ void ui_view_chat(float width, float height)
         ImGui::PushStyleColor(ImGuiCol_Text, col::text_muted);
         ImGui::TextUnformatted(ch->topic);
         ImGui::PopStyleColor();
+    }
+
+    // Pins, search and media, off what is already on disk. Glyphs with
+    // tooltips: three text buttons do not fit next to the call button.
+    {
+        float bx = width - 8.0f;
+        if (ch->is_dm()) bx -= 88.0f;   // the call button and the group plus
+
+        const float BSZ = 30.0f, BGAP = 6.0f;
+        ImGui::SetCursorPos(ImVec2(bx - (3.0f * BSZ + 2.0f * BGAP), 8.0f));
+        if (ui_glyph_button("##hdrsearch", ICON_SEARCH, false, ImVec2(BSZ, BSZ),
+                            col::bg_panel, col::bg_hover, col::text_muted))
+            ui_open_search(ch->id);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Поиск"));
+        ImGui::SameLine(0, BGAP);
+        if (ui_glyph_button("##hdrpins", ICON_PIN, false, ImVec2(BSZ, BSZ),
+                            col::bg_panel, col::bg_hover, col::text_muted))
+            ui_open_pins(ch->id);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Закрепы"));
+        ImGui::SameLine(0, BGAP);
+        if (ui_glyph_button("##hdrmedia", ICON_IMAGE, false, ImVec2(BSZ, BSZ),
+                            col::bg_panel, col::bg_hover, col::text_muted))
+            ui_open_media(ch->id);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Медиа"));
+    }
+
+    // Growing the conversation: one more friend turns a 1-1 into a group.
+    if (ch->is_dm())
+    {
+        ImGui::SetCursorPos(ImVec2(width - 88.0f, 8.0f));
+        if (ui_glyph_button("##addmember", ICON_PLUS, false, ImVec2(32, 30),
+                            col::bg_panel, col::bg_hover, col::text_normal))
+            ui_open_group_picker(ch->id, 0);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip(tr("Добавить в группу"));
     }
 
     // Direct messages get a call button: a DM call is an ordinary voice
@@ -3682,8 +4407,56 @@ void ui_view_chat(float width, float height)
         g_win.channel = ch->id;
         g_win.anchor = 0;
         g_win.pinned = true;
+        g_win.jump_hold = false;
+        g_win.jump_settle = 0;
         g_win.last_height = 0.0f;
         g_win.grew_upwards = false;
+    }
+
+    // A jump requested from elsewhere (pins, search): land the window on
+    // the message once it is actually held, fetching around it until then.
+    // Anchoring to a missing id lands near it and never corrects itself,
+    // which is how jumps kept missing.
+    if (g_pending_jump)
+    {
+        if (g_pending_channel != ch->id)
+        {
+            // Navigated away mid-flight: let it go.
+            log_line("jump: снят, ушли в другой канал");
+            g_pending_jump = 0;
+            g_pending_channel = 0;
+            g_pending_tries = 0;
+        }
+        else if (store::find_message(ch, g_pending_jump))
+        {
+            g_win.anchor = g_pending_jump;
+            g_win.pinned = false;
+            g_win.jump_hold = true;
+            g_win.jump_settle = 3;
+            g_win.grew_upwards = false;
+            g_jump_flash = g_pending_jump;
+            g_jump_flash_until = GetTickCount64() + 2500;
+            log_line("jump: якорь %llu, холд", g_pending_jump);
+            g_pending_jump = 0;
+            g_pending_channel = 0;
+            g_pending_tries = 0;
+        }
+        else if (ch->history_exhausted || g_pending_tries >= 8)
+        {
+            log_line("jump: сообщения %llu в канале %llu нет (попыток %d, исчерпано %d)",
+                     g_pending_jump, ch->id, g_pending_tries, ch->history_exhausted ? 1 : 0);
+            api::set_last_error(ch->history_exhausted ? tr("Сообщение не найдено")
+                                                      : tr("Не удалось загрузить историю"));
+            g_pending_jump = 0;
+            g_pending_channel = 0;
+            g_pending_tries = 0;
+        }
+        else if (!ch->history_loading)
+        {
+            g_pending_tries++;
+            log_line("jump: догрузка вокруг %llu (попытка %d)", g_pending_jump, g_pending_tries);
+            api::fetch_messages(ch->id, g_pending_jump + 1);
+        }
     }
 
     unsigned int total = ch->messages.count;
@@ -3694,13 +4467,21 @@ void ui_view_chat(float width, float height)
     if (!g_win.pinned && g_win.anchor)
     {
         first = index_of(ch, g_win.anchor);
-        if (first > tail) first = tail;
+        // The anchor is what was asked for: it goes first on screen, and
+        // the hold below scrolls exactly there. Clamping it back to the
+        // recent window is what made jumps land "nearby" - up to three
+        // hundred rows off - instead of on the message. Only fall back
+        // when the anchor is past everything held (deleted or trimmed
+        // while the jump was in flight).
+        if (first >= total) first = tail;
     }
 
     // At the very top of what is drawn, with more of it above: show more.
     // This is what makes scrolling up work at all - the button below only
-    // asks discord for messages that are not here yet.
-    if (ImGui::GetScrollY() <= 2.0f && first > 0 && ImGui::GetScrollMaxY() > 0.0f)
+    // asks discord for messages that are not here yet. Not while a jump is
+    // holding the top: that scroll is programmatic, and answering it here
+    // would eat the fresh anchor a hundred messages at a time.
+    if (!g_win.jump_hold && ImGui::GetScrollY() <= 2.0f && first > 0 && ImGui::GetScrollMaxY() > 0.0f)
     {
         unsigned int step = MAX_RENDERED_MESSAGES / 3;
         first = first > step ? first - step : 0;
@@ -3709,16 +4490,19 @@ void ui_view_chat(float width, float height)
         g_win.anchor = ch->messages[first].id;
         g_win.grew_upwards = true;
     }
-    else if (ImGui::GetScrollMaxY() > 0.0f &&
+    else if (!g_win.jump_hold && ImGui::GetScrollMaxY() > 0.0f &&
              ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 4.0f)
     {
         // Back at the end: follow it again, so a new message still scrolls
-        // into view the way it should.
+        // into view the way it should. Not while a jump is holding the top:
+        // on the landing frame the scroll is still the stale one (usually
+        // the bottom, where jumps are clicked from), and answering it here
+        // wipes the fresh anchor in the same frame it was set.
         g_win.pinned = true;
         g_win.anchor = 0;
         first = tail;
     }
-    else if (!g_win.pinned)
+    else if (!g_win.pinned && !g_win.jump_hold)
     {
         g_win.anchor = first < total ? ch->messages[first].id : 0;
     }
@@ -3729,6 +4513,8 @@ void ui_view_chat(float width, float height)
 
     snowflake prev_author = 0;
     unsigned long long prev_time = 0;
+
+    g_win.anchor_y = 0.0f;
 
     for (unsigned int i = first; i < ch->messages.count; i++)
     {
@@ -3767,9 +4553,28 @@ void ui_view_chat(float width, float height)
         // has no height to stand in for and is drawn properly, which is also
         // how it gets one.
         float top = ImGui::GetCursorPosY();
+        if (g_win.anchor && m->id == g_win.anchor) g_win.anchor_y = top;
         bool measured = m->draw_height > 0.0f;
         bool visible = !measured ||
                        ImGui::IsRectVisible(ImVec2(0.0f, m->draw_height));
+
+        if (m->id == g_jump_flash)
+        {
+            if (GetTickCount64() < g_jump_flash_until)
+            {
+                // Behind the row, from its cached height: this runs before
+                // the row draws, so the text lands on top of the tint.
+                ImVec2 p = ImGui::GetCursorScreenPos();
+                float w = ImGui::GetContentRegionAvail().x;
+                float h = measured ? m->draw_height : 40.0f;
+                dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), col::bg_hover, 4.0f);
+                dl->AddRectFilled(p, ImVec2(p.x + 4.0f, p.y + h), col::accent, 2.0f);
+            }
+            else
+            {
+                g_jump_flash = 0;
+            }
+        }
 
         if (visible)
         {
@@ -3856,11 +4661,47 @@ void ui_view_chat(float width, float height)
 
     if (g_ui.scroll_to_bottom || ch->messages.count != g_ui.seen_message_count)
     {
-        // Only auto-scroll when the user is already near the end.
-        if (g_ui.scroll_to_bottom || ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 80.0f)
+        // Only auto-scroll when the user is already near the end. Never
+        // against a held jump: on its frames the scroll still shows the old
+        // place, which reads as "near the end" and yanks the view to the
+        // bottom before the hold below can pin it to the target row.
+        if (!g_win.jump_hold &&
+            (g_ui.scroll_to_bottom || ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 80.0f))
             ImGui::SetScrollHereY(1.0f);
         g_ui.seen_message_count = ch->messages.count;
         g_ui.scroll_to_bottom = false;
+    }
+
+    // A landed jump holds the target row at the top until the person scrolls
+    // themselves. The reference is the row's own position this frame, not
+    // zero: archive/loading controls above the list move by tens of pixels,
+    // and the scroll on the landing frames still shows the old place, which
+    // is nobody's input. The wheel, here and now, or a scrollbar drag, seen
+    // as the scroll moved away from the row, counts as theirs. Once it is
+    // theirs, the scroll-up branch above does what a manual scroll to the
+    // top has always done.
+    if (g_win.jump_hold)
+    {
+        if (g_win.jump_settle > 0)
+        {
+            g_win.jump_settle--;
+            ImGui::SetScrollY(g_win.anchor_y);
+        }
+        else if (ImGui::GetIO().MouseWheel != 0.0f)
+        {
+            log_line("jump: холд снят колесом");
+            g_win.jump_hold = false;
+        }
+        else if (ImGui::GetScrollY() < g_win.anchor_y - 2.0f ||
+                 ImGui::GetScrollY() > g_win.anchor_y + 2.0f)
+        {
+            log_line("jump: холд снят полосой");
+            g_win.jump_hold = false;
+        }
+        else
+        {
+            ImGui::SetScrollY(g_win.anchor_y);
+        }
     }
 
     ImGui::EndChild();
@@ -3977,6 +4818,23 @@ void ui_view_chat(float width, float height)
                                           ImVec2(width - 60.0f, 32.0f), flags);
 
     bool input_active = ImGui::IsItemActive() || ImGui::IsItemFocused();
+
+    // Up in an empty box edits your own last message, the way the official
+    // client does. Only from empty: with text in the box Up is history,
+    // which this client does not keep.
+    if (input_active && !g_ui.message_input[0] &&
+        ImGui::IsKeyPressed(ImGuiKey_UpArrow, false) && ch)
+    {
+        for (int i = (int)ch->messages.count - 1; i >= 0; i--)
+        {
+            const dmessage* m = &ch->messages[i];
+            if (m->author_id == store::self_id() && !m->deleted && m->content && m->content[0])
+            {
+                begin_edit(m);
+                break;
+            }
+        }
+    }
 
     if (send)
     {
