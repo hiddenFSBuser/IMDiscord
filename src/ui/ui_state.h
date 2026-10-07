@@ -312,6 +312,7 @@ void ui_open_search(snowflake channel_id);
 void ui_view_search_popup();
 void ui_open_media(snowflake channel_id);
 void ui_view_media_popup();
+void ui_view_captcha_popup();
 void ui_view_modal_popup();
 void ui_view_members(float width, float height);
 void ui_view_friends(float width, float height);
@@ -362,6 +363,9 @@ void ui_view_rename_popup();
 void ui_view_onboarding_popup();
 void ui_view_token_popup();
 void ui_open_token(int account_index);
+// Re-signs in as the current account under a fresh token (password change
+// rotates it). Keeps voice, like an account switch without switching.
+void ui_relogin_with(const char* token);
 void ui_open_onboarding(snowflake guild_id);
 void ui_open_rename_channel(snowflake channel_id);
 void ui_open_delete_guild(snowflake guild_id);

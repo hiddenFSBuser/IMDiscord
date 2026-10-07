@@ -3,6 +3,7 @@
 #include "store.h"
 #include "people.h"
 #include "archive.h"
+#include "captcha.h"
 #include "core/offline.h"
 #include "core/log.h"
 #include "core/crypto.h"
@@ -2161,6 +2162,109 @@ namespace
         memfree(j);
     }
 
+    // Same as api::call, plus verbatim extra header lines. The captcha
+    // retry is the only one that needs headers no other request sends.
+    bool call_with_extra(const char* method, const char* path, const char* json_body,
+                         http_response* out, const char* location, const char* extra)
+    {
+        ubuffer headers;
+        headers.init();
+        build_headers(&headers, json_body ? "application/json" : 0, location);
+        if (extra && extra[0]) headers.append_str(extra);
+
+        char url[2048];
+        cnprint(url, sizeof(url), "%s%s", API_BASE, path);
+
+        unsigned int body_len = json_body ? (unsigned int)ccslenf(json_body) : 0;
+        bool ok = http::request(method, url, headers.c_str(), json_body, body_len, out);
+        headers.free_buffer();
+
+        if (ok && out->status == 429)
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(out->text(), (int)out->body.size))
+                out->retry_after_ms = (int)(doc.root->dbl("retry_after", 1.0) * 1000.0);
+            doc.free_doc();
+            if (out->retry_after_ms <= 0) out->retry_after_ms = 1000;
+        }
+        return ok;
+    }
+
+    // One attempt, then - on a captcha demand only - a solve in the default
+    // browser and a retry carrying the token. Returns the last answer either
+    // way; solved, when given, is the demand that was answered. The demand
+    // is also stashed in the globals, so the manual paste fallback in the
+    // friends UI still has something to show when the solve is cancelled.
+    bool call_captcha_aware(const char* method, const char* path, const char* json_body,
+                            http_response* res, const char* location, const char* action,
+                            captcha::challenge* solved)
+    {
+        if (api::call(method, path, json_body, res, location) && res->ok())
+            return true;
+        if (res->status != 400) return false;
+
+        jdoc doc;
+        doc.init();
+        captcha::challenge ch;
+        bool demanded = doc.parse(res->text(), (int)res->body.size) &&
+                        captcha::parse_demand(doc.root, &ch);
+        doc.free_doc();
+        if (!demanded) return false;
+
+        ccfset(g_captcha_sitekey, 0, sizeof(g_captcha_sitekey));
+        ccfset(g_captcha_rqtoken, 0, sizeof(g_captcha_rqtoken));
+        ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
+        ccstrncpy(g_captcha_sitekey, ch.sitekey, sizeof(g_captcha_sitekey) - 1);
+        ccstrncpy(g_captcha_rqtoken, ch.rqtoken, sizeof(g_captcha_rqtoken) - 1);
+        ccstrncpy(g_captcha_session, ch.session, sizeof(g_captcha_session) - 1);
+
+        log_line("captcha: %s, demand (%s)", action ? action : "?", ch.sitekey);
+
+        char token[4096];
+        token[0] = 0;
+        if (!captcha::solve_blocking(&ch, action, token, sizeof(token)))
+            return false;
+
+        // The token rides a header line: anything with a line break in it is
+        // refused rather than sent.
+        for (const char* p = token; *p; p++)
+        {
+            if (*p == '\r' || *p == '\n')
+            {
+                ccfset(token, 0, sizeof(token));
+                return false;
+            }
+        }
+
+        char extra[4608];
+        // What the browser sends on a solved login: the key, the rqtoken
+        // the demand carried, and the session it belongs to. Absent parts
+        // are left out rather than sent empty.
+        if (ch.rqtoken[0] && ch.session[0])
+            cnprint(extra, sizeof(extra), "X-Captcha-Key: %s\r\nX-Captcha-Rqtoken: %s\r\n"
+                                          "X-Captcha-Session-Id: %s\r\n",
+                    token, ch.rqtoken, ch.session);
+        else if (ch.rqtoken[0])
+            cnprint(extra, sizeof(extra), "X-Captcha-Key: %s\r\nX-Captcha-Rqtoken: %s\r\n",
+                    token, ch.rqtoken);
+        else if (ch.session[0])
+            cnprint(extra, sizeof(extra), "X-Captcha-Key: %s\r\nX-Captcha-Session-Id: %s\r\n",
+                    token, ch.session);
+        else
+            cnprint(extra, sizeof(extra), "X-Captcha-Key: %s\r\n", token);
+
+        res->free_response();
+        res->init();
+        bool ok = call_with_extra(method, path, json_body, res, location, extra);
+
+        ccfset(token, 0, sizeof(token));
+        ccfset(extra, 0, sizeof(extra));
+
+        if (ok && res->ok() && solved) *solved = ch;
+        return ok && res->ok();
+    }
+
     void job_friend_by_name(void* user)
     {
         job_friend* j = (job_friend*)user;
@@ -2205,8 +2309,23 @@ namespace
         log_line("friend: заявка на %s%s", j->name,
                  j->captcha_key[0] ? " (с токеном капчи)" : "");
 
-        bool sent = api::call("POST", "/users/@me/relationships", w.c_str(), &res,
-                              "Add Friend");
+        // A pasted token rides the body, the way it always has. A fresh
+        // demand goes through the browser harness instead, then retries
+        // with the token in the headers.
+        bool sent;
+        captcha::challenge solved;
+        ccfset(&solved, 0, sizeof(solved));
+
+        if (j->captcha_key[0])
+        {
+            sent = api::call("POST", "/users/@me/relationships", w.c_str(), &res,
+                             "Add Friend");
+        }
+        else
+        {
+            sent = call_captcha_aware("POST", "/users/@me/relationships", w.c_str(), &res,
+                                      "Add Friend", tr("Заявка в друзья"), &solved);
+        }
 
         if (!sent || !res.ok())
             log_line("friend: ответ %d, тело %.400s", res.status,
@@ -2241,6 +2360,8 @@ namespace
             // the way the official client does, right after it worked.
             if (j->captcha_key[0])
                 science::captcha_verified(g_captcha_sitekey, g_captcha_session);
+            else if (solved.sitekey[0])
+                science::captcha_verified(solved.sitekey, solved.session);
 
             api::clear_captcha();
         }
@@ -2590,7 +2711,14 @@ namespace
 
         http_response res;
         res.init();
-        if (api::call("POST", path, body.buf.c_str(), &res, context) && res.ok())
+
+        // The one request discord answers with a CAPTCHA: a demand here
+        // opens the browser harness, then retries with the token.
+        captcha::challenge solved;
+        ccfset(&solved, 0, sizeof(solved));
+
+        if (call_captcha_aware("POST", path, body.buf.c_str(), &res, context,
+                               tr("Вход на сервер"), &solved))
         {
             jdoc doc;
             doc.init();
@@ -2609,6 +2737,9 @@ namespace
                 api::set_last_error(msg);
             }
             doc.free_doc();
+
+            if (solved.sitekey[0])
+                science::captcha_verified(solved.sitekey, solved.session);
         }
         else
         {
@@ -5412,6 +5543,476 @@ void api::send_friend_request(const char* username, const char* captcha_key,
     jobs::post(job_friend_by_name, j);
 }
 
+namespace
+{
+    struct job_login_text
+    {
+        char login[128];
+        char password[256];
+    };
+
+    struct job_login_code
+    {
+        char code[32];
+        int method;   // 0 totp, 1 sms, 2 backup
+    };
+
+    struct job_forgot_text
+    {
+        char login[128];
+    };
+
+    struct job_new_password
+    {
+        char old_pw[256];
+        char new_pw[256];
+    };
+
+    char g_login_ticket[256];
+    bool g_login_totp = false;
+    bool g_login_sms = false;
+    bool g_login_backup = false;
+
+    // The outcome slot mirrors api::login_outcome; have lives beside it
+    // because the interface struct carries no consumption mark.
+    api::login_outcome g_login_outcome;
+    bool g_login_outcome_have = false;
+    struct simple_slot
+    {
+        bool have;
+        bool ok;
+        char text[256];
+    };
+    simple_slot g_forgot_outcome;
+
+    struct password_slot
+    {
+        bool have;
+        bool ok;
+        char token[512];
+        char error[256];
+    };
+    password_slot g_password_outcome;
+
+    bool g_sms_sent = false;
+
+    void login_outcome_fail(const char* error)
+    {
+        g_login_outcome_have = true;
+        g_login_outcome.ok = false;
+        g_login_outcome.need_mfa = false;
+        g_login_outcome.need_email_check = false;
+        g_login_outcome.token[0] = 0;
+        ccstrncpy(g_login_outcome.error, error ? error : "",
+                  sizeof(g_login_outcome.error) - 1);
+    }
+
+    // First code out of errors.<field>._errors[0].code, or null.
+    const char* login_form_code(const jval* root, const char* field)
+    {
+        if (!root || root->type != JTYPE_OBJ || !field) return 0;
+        const jval* errors = root->obj("errors");
+        if (!errors || errors->type != JTYPE_OBJ) return 0;
+        const jval* one = errors->obj(field);
+        if (!one || one->type != JTYPE_OBJ) return 0;
+        const jval* list = one->arr("_errors");
+        if (!list || !list->count) return 0;
+        return list->at(0)->str("code", 0);
+    }
+
+    // Maps a refused login to the outcome. Captcha leftovers mean the
+    // solve was cancelled: the demand itself is the message.
+    void login_outcome_from_400(const jval* root, int status)
+    {
+        if (root && (root->has("captcha_sitekey") || root->has("captcha_key")))
+        {
+            login_outcome_fail(tr("Капча не решена"));
+            return;
+        }
+
+        const char* code = login_form_code(root, "login");
+        if (code && ccscmp(code, "ACCOUNT_LOGIN_VERIFICATION_EMAIL") == 0)
+        {
+            g_login_outcome_have = true;
+            g_login_outcome.ok = false;
+            g_login_outcome.need_mfa = false;
+            g_login_outcome.need_email_check = true;
+            g_login_outcome.token[0] = 0;
+            ccstrncpy(g_login_outcome.error, tr("Новое место входа: проверь почту и повтори"),
+                      sizeof(g_login_outcome.error) - 1);
+            return;
+        }
+
+        if (code && ccscmp(code, "INVALID_LOGIN") == 0)
+        {
+            login_outcome_fail(tr("Логин или пароль неверны"));
+            return;
+        }
+
+        const char* detail = root ? root->str("message", 0) : 0;
+        if (detail && detail[0])
+        {
+            login_outcome_fail(detail);
+            return;
+        }
+
+        char fallback[96];
+        cnprint(fallback, sizeof(fallback), tr("Не удалось войти (HTTP %d)"), status);
+        login_outcome_fail(fallback);
+    }
+
+    void job_login_password(void* user)
+    {
+        job_login_text* j = (job_login_text*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("login", j->login);
+        w.kv_str("password", j->password);
+        w.kv_bool("undelete", false);
+        w.end_obj();
+
+        ccfset(g_login_ticket, 0, sizeof(g_login_ticket));
+        g_login_totp = g_login_sms = g_login_backup = false;
+        g_sms_sent = false;
+
+        http_response res;
+        res.init();
+
+        bool answered = call_captcha_aware("POST", "/auth/login", w.c_str(), &res,
+                                           0, tr("Вход в аккаунт"), 0);
+        w.free_writer();
+
+        if (answered && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) &&
+                doc.root && doc.root->type == JTYPE_OBJ)
+            {
+                const char* token = doc.root->str("token", 0);
+                if (token && token[0])
+                {
+                    g_login_outcome_have = true;
+                    g_login_outcome.ok = true;
+                    g_login_outcome.need_mfa = false;
+                    g_login_outcome.need_email_check = false;
+                    ccstrncpy(g_login_outcome.token, token, sizeof(g_login_outcome.token) - 1);
+                    g_login_outcome.error[0] = 0;
+                    log_line("login: токен получен");
+                }
+                else if (doc.root->boolean("mfa", false))
+                {
+                    const char* ticket = doc.root->str("ticket", 0);
+                    if (ticket) ccstrncpy(g_login_ticket, ticket, sizeof(g_login_ticket) - 1);
+                    g_login_totp = doc.root->boolean("totp", false);
+                    g_login_sms = doc.root->boolean("sms", false);
+                    g_login_backup = doc.root->boolean("backup", false);
+
+                    g_login_outcome_have = true;
+                    g_login_outcome.ok = false;
+                    g_login_outcome.need_mfa = g_login_ticket[0] != 0;
+                    g_login_outcome.need_email_check = false;
+                    g_login_outcome.token[0] = 0;
+                    if (!g_login_outcome.need_mfa)
+                        ccstrncpy(g_login_outcome.error, tr("Двухфакторка без кода из письма"),
+                                  sizeof(g_login_outcome.error) - 1);
+                    else
+                        g_login_outcome.error[0] = 0;
+                    log_line("login: нужна двухфакторка");
+                }
+                else
+                {
+                    login_outcome_fail(tr("Неожиданный ответ сервера"));
+                }
+            }
+            else
+            {
+                login_outcome_fail(tr("Неожиданный ответ сервера"));
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                login_outcome_from_400(doc.root, res.status);
+            else if (res.status == 0)
+                login_outcome_fail(tr("Нет соединения с discord.com"));
+            else
+                login_outcome_fail(tr("Не удалось войти"));
+            doc.free_doc();
+        }
+
+        res.free_response();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    const char* mfa_endpoint(int method)
+    {
+        if (method == 1) return "/auth/mfa/sms";
+        if (method == 2) return "/auth/mfa/backup";
+        return "/auth/mfa/totp";
+    }
+
+    void job_login_mfa(void* user)
+    {
+        job_login_code* j = (job_login_code*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("code", j->code);
+        w.kv_str("ticket", g_login_ticket);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        bool answered = call_captcha_aware("POST", mfa_endpoint(j->method), w.c_str(),
+                                           &res, 0, tr("Двухфакторка"), 0);
+        w.free_writer();
+
+        if (answered && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* token = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                token = doc.root->str("token", 0);
+
+            if (token && token[0])
+            {
+                g_login_outcome_have = true;
+                g_login_outcome.ok = true;
+                g_login_outcome.need_mfa = false;
+                g_login_outcome.need_email_check = false;
+                ccstrncpy(g_login_outcome.token, token, sizeof(g_login_outcome.token) - 1);
+                g_login_outcome.error[0] = 0;
+                ccfset(g_login_ticket, 0, sizeof(g_login_ticket));
+                log_line("login: двухфакторка пройдена");
+            }
+            else
+            {
+                login_outcome_fail(tr("Неожиданный ответ сервера"));
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root;
+            const char* code = parsed ? login_form_code(doc.root, "code") : 0;
+            // A wrong code invalidates nothing: the ticket stays, the code
+            // can be retyped. Anything else drops the attempt.
+            if (code && ccscmp(code, "INVALID_CODE") == 0)
+            {
+                login_outcome_fail(tr("Неверный код"));
+                g_login_outcome.need_mfa = g_login_ticket[0] != 0;
+            }
+            else if (parsed)
+            {
+                login_outcome_from_400(doc.root, res.status);
+            }
+            else
+            {
+                login_outcome_fail(tr("Не удалось проверить код"));
+            }
+            doc.free_doc();
+        }
+
+        res.free_response();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_login_mfa_sms(void* user)
+    {
+        (void)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("ticket", g_login_ticket);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/auth/mfa/sms/send", w.c_str(), &res,
+                               0, tr("Двухфакторка"), 0) && res.ok())
+        {
+            g_sms_sent = true;
+            log_line("login: SMS-код запрошен");
+        }
+        else
+        {
+            login_outcome_fail(tr("Не удалось запросить SMS-код"));
+        }
+        w.free_writer();
+
+        res.free_response();
+    }
+
+    void job_login_forgot(void* user)
+    {
+        job_forgot_text* j = (job_forgot_text*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("login", j->login);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/auth/forgot", w.c_str(), &res,
+                               0, tr("Восстановление доступа"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* method = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                method = doc.root->str("method", 0);
+
+            g_forgot_outcome.have = true;
+            g_forgot_outcome.ok = true;
+            if (method && method[0])
+                ccstrncpy(g_forgot_outcome.text, method, sizeof(g_forgot_outcome.text) - 1);
+            else
+                g_forgot_outcome.text[0] = 0;
+            log_line("login: письмо для восстановления отправлено");
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            g_forgot_outcome.have = true;
+            g_forgot_outcome.ok = false;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                const char* detail = doc.root->str("message", 0);
+                if (detail && detail[0])
+                    ccstrncpy(g_forgot_outcome.text, detail, sizeof(g_forgot_outcome.text) - 1);
+                else
+                    ccstrncpy(g_forgot_outcome.text, tr("Не удалось отправить письмо"),
+                              sizeof(g_forgot_outcome.text) - 1);
+            }
+            else
+            {
+                ccstrncpy(g_forgot_outcome.text, tr("Не удалось отправить письмо"),
+                          sizeof(g_forgot_outcome.text) - 1);
+            }
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_change_password(void* user)
+    {
+        job_new_password* j = (job_new_password*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("password", j->old_pw);
+        w.kv_str("new_password", j->new_pw);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/@me", w.c_str(), &res,
+                               0, tr("Смена пароля"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* token = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                token = doc.root->str("token", 0);
+
+            g_password_outcome.have = true;
+            if (token && token[0])
+            {
+                g_password_outcome.ok = true;
+                ccstrncpy(g_password_outcome.token, token,
+                          sizeof(g_password_outcome.token) - 1);
+                g_password_outcome.error[0] = 0;
+                log_line("password: сменён, токен обновлён");
+            }
+            else
+            {
+                g_password_outcome.ok = false;
+                g_password_outcome.token[0] = 0;
+                ccstrncpy(g_password_outcome.error, tr("Неожиданный ответ сервера"),
+                          sizeof(g_password_outcome.error) - 1);
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            g_password_outcome.have = true;
+            g_password_outcome.ok = false;
+            g_password_outcome.token[0] = 0;
+
+            bool mapped = false;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                const char* code = login_form_code(doc.root, "password");
+                if (!code) code = login_form_code(doc.root, "new_password");
+
+                if (code && ccscmp(code, "PASSWORD_DOES_NOT_MATCH") == 0)
+                {
+                    ccstrncpy(g_password_outcome.error, tr("Текущий пароль неверный"),
+                              sizeof(g_password_outcome.error) - 1);
+                    mapped = true;
+                }
+                else if (code && ccscmp(code, "BASE_TYPE_MIN_LENGTH") == 0)
+                {
+                    ccstrncpy(g_password_outcome.error, tr("Новый пароль слишком короткий"),
+                              sizeof(g_password_outcome.error) - 1);
+                    mapped = true;
+                }
+                else
+                {
+                    const char* detail = doc.root->str("message", 0);
+                    if (detail && detail[0])
+                    {
+                        ccstrncpy(g_password_outcome.error, detail,
+                                  sizeof(g_password_outcome.error) - 1);
+                        mapped = true;
+                    }
+                }
+            }
+            if (!mapped)
+            {
+                ccstrncpy(g_password_outcome.error, tr("Не удалось сменить пароль"),
+                          sizeof(g_password_outcome.error) - 1);
+            }
+            doc.free_doc();
+
+            record_api_error(tr("Смена пароля"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+}
+
 const char* api::heartbeat_session_id() { return g_heartbeat_session; }
 const char* api::launch_signature() { return g_launch_signature; }
 
@@ -5424,6 +6025,154 @@ void api::clear_captcha()
     ccfset(g_captcha_sitekey, 0, sizeof(g_captcha_sitekey));
     ccfset(g_captcha_rqtoken, 0, sizeof(g_captcha_rqtoken));
     ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
+}
+
+void api::login_password(const char* login, const char* password)
+{
+    if (offline::active())
+    {
+        login_outcome_fail(tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!login || !login[0] || !password || !password[0]) return;
+
+    // A fresh attempt drops the previous challenge at once, so the form
+    // below does not offer a code for it while the request is in flight.
+    ccfset(g_login_ticket, 0, sizeof(g_login_ticket));
+    g_login_totp = g_login_sms = g_login_backup = false;
+    g_sms_sent = false;
+    g_login_outcome_have = false;
+
+    job_login_text* j = (job_login_text*)memalloc(sizeof(job_login_text));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->login, login, sizeof(j->login) - 1);
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+
+    jobs::post(job_login_password, j);
+}
+
+bool api::login_mfa_pending(login_mfa_methods* out)
+{
+    if (!g_login_ticket[0]) return false;
+    if (out)
+    {
+        out->totp = g_login_totp;
+        out->sms = g_login_sms;
+        out->backup = g_login_backup;
+    }
+    return true;
+}
+
+void api::login_mfa(const char* code, int method)
+{
+    if (offline::active())
+    {
+        login_outcome_fail(tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!code || !code[0] || !g_login_ticket[0]) return;
+    if (method == 1 && !g_login_sms) return;
+    if (method == 2 && !g_login_backup) return;
+    if (method != 1 && method != 2 && !g_login_totp) return;
+
+    job_login_code* j = (job_login_code*)memalloc(sizeof(job_login_code));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->code, code, sizeof(j->code) - 1);
+    j->method = method;
+
+    g_login_outcome_have = false;
+    jobs::post(job_login_mfa, j);
+}
+
+void api::login_mfa_send_sms()
+{
+    if (offline::active() || !g_login_ticket[0] || !g_login_sms) return;
+    g_sms_sent = false;
+    jobs::post(job_login_mfa_sms, 0);
+}
+
+bool api::take_login_sms_sent()
+{
+    if (!g_sms_sent) return false;
+    g_sms_sent = false;
+    return true;
+}
+
+bool api::take_login_result(login_outcome* out)
+{
+    if (!g_login_outcome_have || !out) return false;
+    *out = g_login_outcome;
+    g_login_outcome_have = false;
+    return true;
+}
+
+void api::login_forgot(const char* login)
+{
+    if (offline::active())
+    {
+        g_forgot_outcome.have = true;
+        g_forgot_outcome.ok = false;
+        ccstrncpy(g_forgot_outcome.text, tr("Нет соединения с discord.com"),
+                  sizeof(g_forgot_outcome.text) - 1);
+        return;
+    }
+    if (!login || !login[0]) return;
+
+    job_forgot_text* j = (job_forgot_text*)memalloc(sizeof(job_forgot_text));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->login, login, sizeof(j->login) - 1);
+
+    g_forgot_outcome.have = false;
+    jobs::post(job_login_forgot, j);
+}
+
+bool api::take_forgot_result(bool* ok, char* info, int info_cap)
+{
+    if (!g_forgot_outcome.have) return false;
+    if (ok) *ok = g_forgot_outcome.ok;
+    if (info && info_cap > 0)
+        ccstrncpy(info, g_forgot_outcome.text, info_cap - 1);
+    g_forgot_outcome.have = false;
+    return true;
+}
+
+void api::change_password(const char* old_password, const char* new_password)
+{
+    if (offline::active())
+    {
+        g_password_outcome.have = true;
+        g_password_outcome.ok = false;
+        g_password_outcome.token[0] = 0;
+        ccstrncpy(g_password_outcome.error, tr("Нет соединения с discord.com"),
+                  sizeof(g_password_outcome.error) - 1);
+        return;
+    }
+    if (!old_password || !old_password[0] || !new_password || !new_password[0]) return;
+
+    job_new_password* j = (job_new_password*)memalloc(sizeof(job_new_password));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->old_pw, old_password, sizeof(j->old_pw) - 1);
+    ccstrncpy(j->new_pw, new_password, sizeof(j->new_pw) - 1);
+
+    g_password_outcome.have = false;
+    jobs::post(job_change_password, j);
+}
+
+bool api::take_password_result(bool* ok, char* token_out, int token_cap,
+                               char* error, int error_cap)
+{
+    if (!g_password_outcome.have) return false;
+    if (ok) *ok = g_password_outcome.ok;
+    if (token_out && token_cap > 0)
+        ccstrncpy(token_out, g_password_outcome.token, token_cap - 1);
+    if (error && error_cap > 0)
+        ccstrncpy(error, g_password_outcome.error, error_cap - 1);
+    g_password_outcome.have = false;
+    return true;
 }
 
 void api::accept_friend_request(snowflake user_id, bool confirm)

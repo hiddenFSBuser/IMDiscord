@@ -223,6 +223,48 @@ namespace api
     void send_friend_request(const char* username, const char* captcha_key = 0,
                              const char* captcha_rqtoken = 0, const char* note = 0);
 
+    // ---- password login ----
+    // Step 1: mail/phone + password. The outcome is picked up once with
+    // take_login_result: ok carries a token for begin_login, need_mfa opens
+    // step 2, need_email_check means a verification mail went out and the
+    // login has to be repeated after it. Captcha demands open the harness.
+    void login_password(const char* login, const char* password);
+    struct login_mfa_methods
+    {
+        bool totp;
+        bool sms;
+        bool backup;
+    };
+    // What the challenge offers. False when no challenge is waiting.
+    bool login_mfa_pending(login_mfa_methods* out);
+    // Step 2: a code by TOTP (0), SMS (1) or backup code (2).
+    void login_mfa(const char* code, int method);
+    void login_mfa_send_sms();
+    // True if an SMS code was requested since the challenge arrived.
+    // Consumed once.
+    bool take_login_sms_sent();
+    struct login_outcome
+    {
+        bool ok;
+        bool need_mfa;
+        bool need_email_check;
+        char token[512];
+        char error[256];
+    };
+    // Takes the step-1/step-2 result, once. False when there is none yet.
+    bool take_login_result(login_outcome* out);
+    // Sends the reset mail. The new password is set through the link in it,
+    // in a browser - the mail answers which way with its method.
+    void login_forgot(const char* login);
+    // Takes the send result, once. ok also carries the method in error
+    // (reused as an info line when there is no error).
+    bool take_forgot_result(bool* ok, char* info, int info_cap);
+    // A new password for the signed-in account. The token rotates: ok
+    // carries the fresh one for a re-login, error the server's reason.
+    void change_password(const char* old_password, const char* new_password);
+    bool take_password_result(bool* ok, char* token_out, int token_cap,
+                              char* error, int error_cap);
+
     // What the last refusal asked for. Empty when nothing is pending.
     // The identifiers this run of the client reports in its properties.
     // Analytics has to quote the same ones or the two describe different

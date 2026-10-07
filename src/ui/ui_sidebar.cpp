@@ -1741,6 +1741,101 @@ void ui_view_voice_panel(float width)
 // settings
 // ---------------------------------------------------------------------------
 
+namespace
+{
+    char g_pw_cur[256];
+    char g_pw_new[256];
+    char g_pw_rep[256];
+    bool g_pw_busy = false;
+    bool g_pw_ok = false;
+    char g_pw_info[256];
+
+    void ui_change_password_block()
+    {
+        bool ok = false;
+        char token[512];
+        token[0] = 0;
+        char err[256];
+        err[0] = 0;
+        if (api::take_password_result(&ok, token, sizeof(token), err, sizeof(err)))
+        {
+            g_pw_busy = false;
+            if (ok && token[0])
+            {
+                g_pw_ok = true;
+                ccstrncpy(g_pw_info, tr("Пароль сменён, вход обновлён"),
+                          sizeof(g_pw_info) - 1);
+                ccfset(g_pw_cur, 0, sizeof(g_pw_cur));
+                ccfset(g_pw_new, 0, sizeof(g_pw_new));
+                ccfset(g_pw_rep, 0, sizeof(g_pw_rep));
+                ui_relogin_with(token);
+                ccfset(token, 0, sizeof(token));
+            }
+            else
+            {
+                g_pw_ok = false;
+                ccstrncpy(g_pw_info, err[0] ? err : tr("Не удалось сменить пароль"),
+                          sizeof(g_pw_info) - 1);
+            }
+        }
+
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##pwcur", tr("текущий пароль"),
+                                 g_pw_cur, sizeof(g_pw_cur),
+                                 ImGuiInputTextFlags_Password);
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##pwnew", tr("новый пароль"),
+                                 g_pw_new, sizeof(g_pw_new),
+                                 ImGuiInputTextFlags_Password);
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##pwrep", tr("новый пароль ещё раз"),
+                                 g_pw_rep, sizeof(g_pw_rep),
+                                 ImGuiInputTextFlags_Password);
+
+        ImGui::Dummy(ImVec2(0, 4));
+        if (g_pw_busy)
+        {
+            ui_text_muted(tr("Меняем..."));
+        }
+        else if (ImGui::Button(tr("Сменить пароль"), ImVec2(-1, 0)))
+        {
+            if (!g_pw_cur[0] || !g_pw_new[0])
+            {
+                g_pw_ok = false;
+                ccstrncpy(g_pw_info, tr("Заполни оба поля"), sizeof(g_pw_info) - 1);
+            }
+            else if (ccscmp(g_pw_new, g_pw_rep) != 0)
+            {
+                g_pw_ok = false;
+                ccstrncpy(g_pw_info, tr("Новые пароли не совпадают"),
+                          sizeof(g_pw_info) - 1);
+            }
+            else
+            {
+                g_pw_ok = false;
+                g_pw_info[0] = 0;
+                g_pw_busy = true;
+                api::change_password(g_pw_cur, g_pw_new);
+            }
+        }
+
+        if (g_pw_info[0])
+        {
+            ImGui::Dummy(ImVec2(0, 4));
+            if (g_pw_ok)
+            {
+                ui_text_muted(g_pw_info);
+            }
+            else
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+                ImGui::TextWrapped("%s", g_pw_info);
+                ImGui::PopStyleColor();
+            }
+        }
+    }
+}
+
 void ui_view_settings_popup()
 {
     if (g_ui.show_settings)
@@ -2491,6 +2586,20 @@ void ui_view_settings_popup()
                 (me && me->verified) ? tr("да") : tr("нет"),
                 (me && me->mfa_enabled) ? tr("включена") : tr("выключена"));
         ui_text_muted(line);
+    }
+
+    // Bots have no password to change; the block is for user accounts.
+    {
+        store::guard g;
+        duser* self = store::self();
+        if (!self || !self->bot)
+        {
+            ImGui::Dummy(ImVec2(0, 10));
+            ImGui::TextUnformatted(tr("Смена пароля"));
+            ImGui::Separator();
+
+            ui_change_password_block();
+        }
     }
 
     ImGui::Dummy(ImVec2(0, 10));

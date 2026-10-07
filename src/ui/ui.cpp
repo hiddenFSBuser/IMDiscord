@@ -9,6 +9,7 @@
 #include "core/storage.h"
 #include "core/offline.h"
 #include "discord/archive.h"
+#include "discord/captcha.h"
 #include "discord/store.h"
 #include "discord/rest.h"
 #include "discord/cdnfix.h"
@@ -54,6 +55,20 @@ namespace
     // Set for test logins so a throwaway account does not overwrite the token
     // the user actually signed in with.
     bool g_ephemeral_login = false;
+
+    // Password-login form state. File statics, zero-initialised.
+    char g_cred_login[128];
+    char g_cred_pass[256];
+    char g_cred_code[32];
+    int g_cred_method;
+    char g_forgot_email[128];
+    bool g_forgot_open;
+    char g_forgot_info[256];
+    bool g_forgot_ok;
+    bool g_email_check;
+    char g_email_text[256];
+    bool g_sms_info_have;
+    char g_sms_info[64];
 
     void job_login(void* user)
     {
@@ -321,6 +336,22 @@ namespace
             }
         }
     }
+}
+
+namespace
+{
+    void tear_down_session(bool keep_media);
+    void begin_login(const char* token, bool is_bot);
+}
+
+// Re-signs in as the current account under a fresh token: the password
+// change rotates it, and the old one stops working everywhere, gateway
+// included. Same shape as an account switch, without switching.
+void ui_relogin_with(const char* token)
+{
+    if (!token || !token[0] || g_ui.login_busy) return;
+    tear_down_session(true);
+    begin_login(token, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1918,7 +1949,23 @@ void ui_view_login()
     // back in as one of them is a click rather than another paste.
     int remembered = storage::accounts_count();
     float proxy_room = (g_ui.proxy_editing == PROXY_SLOT_DEFAULT) ? 230.0f : 24.0f;
-    float want_h = 330.0f + proxy_room +
+
+    // Which form signs in. Credentials first: the token is the fallback for
+    // bots and for accounts whose password is gone. Remembered.
+    int login_mode = storage::settings_get_int("login_method", 0);
+    if (login_mode != 0 && login_mode != 1) login_mode = 0;
+
+    float cred_extra = 0.0f;
+    if (login_mode == 0)
+    {
+        cred_extra = 250.0f;
+        if (g_forgot_open) cred_extra += 120.0f;
+        api::login_mfa_methods mfa_mm;
+        ccfset(&mfa_mm, 0, sizeof(mfa_mm));
+        if (api::login_mfa_pending(&mfa_mm)) cred_extra += 210.0f;
+    }
+
+    float want_h = 330.0f + proxy_room + cred_extra +
                    (remembered > 0 ? 46.0f + remembered * 30.0f : 0.0f);
 
     // The account list grows without bound, and the window used to grow with
@@ -1981,41 +2028,278 @@ void ui_view_login()
 
     ImGui::Dummy(ImVec2(0, 6));
 
-    ImGui::TextUnformatted(tr("Токен"));
-
-    ImGuiInputTextFlags token_flags = ImGuiInputTextFlags_EnterReturnsTrue;
-    if (!g_ui.token_visible) token_flags |= ImGuiInputTextFlags_Password;
-
-    ImGui::SetNextItemWidth(-96.0f);
-    bool submitted = ImGui::InputText("##token", g_ui.token_input, sizeof(g_ui.token_input), token_flags);
-
-    ImGui::SameLine();
-    if (ui_icon_button(g_ui.token_visible ? tr("Скрыть##tok") : tr("Показать##tok"), ImVec2(88, 0),
-                       col::bg_input, col::bg_hover))
-        g_ui.token_visible = !g_ui.token_visible;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(tr("Вырезание и копирование работают только в открытом виде"));
-
-    ImGui::Dummy(ImVec2(0, 6));
-
-    // Which kind of token this is. The two look alike, and the difference
-    // decides the prefix on every request and the shape of the identify - so
-    // it is asked once here rather than discovered by failing.
-    ImGui::Checkbox(tr("Токен бота"), &g_ui.login_is_bot);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip(tr("Бот не может добавлять в друзья и заходить по ссылке - "
-                             "его добавляют через OAuth2. Телеметрия ему не шлётся."));
-
-    ImGui::Dummy(ImVec2(0, 8));
-
-    if (g_ui.login_busy)
     {
-        ui_text_muted(tr("Проверка токена..."));
+        int mode = login_mode;
+        ImGui::RadioButton(tr("По данным"), &mode, 0);
+        ImGui::SameLine();
+        ImGui::RadioButton(tr("По токену"), &mode, 1);
+        if (mode != login_mode)
+        {
+            login_mode = mode;
+            storage::settings_set_int("login_method", mode);
+        }
+    }
+
+    ImGui::Dummy(ImVec2(0, 4));
+
+    if (login_mode == 1)
+    {
+        ImGui::TextUnformatted(tr("Токен"));
+
+        ImGuiInputTextFlags token_flags = ImGuiInputTextFlags_EnterReturnsTrue;
+        if (!g_ui.token_visible) token_flags |= ImGuiInputTextFlags_Password;
+
+        ImGui::SetNextItemWidth(-96.0f);
+        bool submitted = ImGui::InputText("##token", g_ui.token_input, sizeof(g_ui.token_input), token_flags);
+
+        ImGui::SameLine();
+        if (ui_icon_button(g_ui.token_visible ? tr("Скрыть##tok") : tr("Показать##tok"), ImVec2(88, 0),
+                           col::bg_input, col::bg_hover))
+            g_ui.token_visible = !g_ui.token_visible;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(tr("Вырезание и копирование работают только в открытом виде"));
+
+        ImGui::Dummy(ImVec2(0, 6));
+
+        // Which kind of token this is. The two look alike, and the difference
+        // decides the prefix on every request and the shape of the identify - so
+        // it is asked once here rather than discovered by failing.
+        ImGui::Checkbox(tr("Токен бота"), &g_ui.login_is_bot);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(tr("Бот не может добавлять в друзья и заходить по ссылке - "
+                                 "его добавляют через OAuth2. Телеметрия ему не шлётся."));
+
+        ImGui::Dummy(ImVec2(0, 8));
+
+        if (g_ui.login_busy)
+        {
+            ui_text_muted(tr("Проверка токена..."));
+        }
+        else
+        {
+            if (ImGui::Button(tr("Войти"), ImVec2(140, 34)) || submitted)
+                begin_login(g_ui.token_input, g_ui.login_is_bot);
+        }
     }
     else
     {
-        if (ImGui::Button(tr("Войти"), ImVec2(140, 34)) || submitted)
-            begin_login(g_ui.token_input, g_ui.login_is_bot);
+        // Password login: a credential attempt reports back through
+        // take_login_result; the busy flag covers it the way it covers the
+        // token check, and clears when the outcome is consumed below.
+        // Nothing here runs while signed in: this is the sign-in screen.
+        bool busy = g_ui.login_busy != 0;
+
+        api::login_outcome oc;
+        ccfset(&oc, 0, sizeof(oc));
+        if (api::take_login_result(&oc))
+        {
+            InterlockedExchange(&g_ui.login_busy, 0);
+            busy = false;
+
+            if (oc.ok && oc.token[0])
+            {
+                ccfset(g_cred_pass, 0, sizeof(g_cred_pass));
+                ccfset(g_cred_code, 0, sizeof(g_cred_code));
+                g_email_check = false;
+                begin_login(oc.token, false);
+            }
+            else if (oc.need_mfa)
+            {
+                g_cred_method = 0;
+                ccfset(g_cred_code, 0, sizeof(g_cred_code));
+            }
+            else if (oc.need_email_check)
+            {
+                g_email_check = true;
+                ccstrncpy(g_email_text, oc.error, sizeof(g_email_text) - 1);
+            }
+            else
+            {
+                g_email_check = false;
+                ccstrncpy(g_ui.login_error, oc.error, sizeof(g_ui.login_error) - 1);
+            }
+        }
+
+        if (api::take_login_sms_sent())
+        {
+            ccstrncpy(g_sms_info, tr("Код отправлен"), sizeof(g_sms_info) - 1);
+            g_sms_info_have = true;
+        }
+
+        bool fok = false;
+        char finfo[256];
+        finfo[0] = 0;
+        if (api::take_forgot_result(&fok, finfo, sizeof(finfo)))
+        {
+            InterlockedExchange(&g_ui.login_busy, 0);
+            busy = false;
+            g_forgot_ok = fok;
+            if (fok)
+            {
+                if (finfo[0])
+                    cnprint(g_forgot_info, sizeof(g_forgot_info),
+                            tr("Письмо отправлено (%s). Дальше — по ссылке из письма."),
+                            finfo);
+                else
+                    ccstrncpy(g_forgot_info, tr("Письмо отправлено. Дальше — по ссылке из письма."),
+                              sizeof(g_forgot_info) - 1);
+            }
+            else
+            {
+                ccstrncpy(g_forgot_info, finfo[0] ? finfo : tr("Не удалось отправить письмо"),
+                          sizeof(g_forgot_info) - 1);
+            }
+        }
+
+        ImGui::Dummy(ImVec2(0, 10));
+        ImGui::Separator();
+        ImGui::Dummy(ImVec2(0, 6));
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##credlogin", tr("почта или телефон"),
+                                 g_cred_login, sizeof(g_cred_login));
+
+        ImGuiInputTextFlags pass_flags = ImGuiInputTextFlags_Password;
+        bool submit_pass = false;
+        if (!busy)
+        {
+            ImGui::SetNextItemWidth(-1.0f);
+            submit_pass = ImGui::InputTextWithHint("##credpass", tr("пароль"),
+                                                   g_cred_pass, sizeof(g_cred_pass),
+                                                   pass_flags | ImGuiInputTextFlags_EnterReturnsTrue);
+        }
+        else
+        {
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##credpass", tr("пароль"),
+                                     g_cred_pass, sizeof(g_cred_pass), pass_flags);
+        }
+
+        if (g_email_check)
+        {
+            ImGui::Dummy(ImVec2(0, 4));
+            ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+            ImGui::TextWrapped("%s", g_email_text);
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Dummy(ImVec2(0, 4));
+
+        if (busy)
+        {
+            ui_text_muted(tr("Входим..."));
+        }
+        else
+        {
+            bool can = g_cred_login[0] && g_cred_pass[0];
+            if (ImGui::Button(tr("Войти по паролю"), ImVec2(200, 34)) ||
+                (submit_pass && can))
+            {
+                if (can)
+                {
+                    g_email_check = false;
+                    g_forgot_ok = false;
+                    g_forgot_info[0] = 0;
+                    g_sms_info_have = false;
+                    InterlockedExchange(&g_ui.login_busy, 1);
+                    ccfset(g_ui.login_error, 0, sizeof(g_ui.login_error));
+                    api::login_password(g_cred_login, g_cred_pass);
+                }
+            }
+
+            ImGui::SameLine();
+            if (ImGui::SmallButton(g_forgot_open ? tr("Скрыть##forgot")
+                                                 : tr("Забыл пароль?")))
+            {
+                g_forgot_open = !g_forgot_open;
+                g_forgot_info[0] = 0;
+            }
+        }
+
+        if (g_forgot_open && !busy)
+        {
+            ImGui::Dummy(ImVec2(0, 4));
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##forgotemail", tr("почта для письма"),
+                                     g_forgot_email, sizeof(g_forgot_email));
+            if (ImGui::Button(tr("Отправить письмо"), ImVec2(200, 30)) && g_forgot_email[0])
+            {
+                g_forgot_ok = false;
+                g_forgot_info[0] = 0;
+                InterlockedExchange(&g_ui.login_busy, 1);
+                api::login_forgot(g_forgot_email);
+            }
+        }
+
+        if (g_forgot_info[0])
+        {
+            ImGui::Dummy(ImVec2(0, 4));
+            if (g_forgot_ok) ui_text_muted(g_forgot_info);
+            else
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+                ImGui::TextWrapped("%s", g_forgot_info);
+                ImGui::PopStyleColor();
+            }
+        }
+
+        // Step two, only while a challenge waits for this account.
+        api::login_mfa_methods mm;
+        ccfset(&mm, 0, sizeof(mm));
+        if (api::login_mfa_pending(&mm) && !busy)
+        {
+            int methods[3];
+            const char* names[3];
+            int n = 0;
+            if (mm.totp) { methods[n] = 0; names[n] = tr("Код из приложения"); n++; }
+            if (mm.sms) { methods[n] = 1; names[n] = tr("SMS"); n++; }
+            if (mm.backup) { methods[n] = 2; names[n] = tr("Резервный код"); n++; }
+            if (g_cred_method >= n) g_cred_method = 0;
+
+            ImGui::Dummy(ImVec2(0, 6));
+            ImGui::Separator();
+            ImGui::Dummy(ImVec2(0, 4));
+            ui_text_muted(tr("Двухфакторка"));
+
+            if (!n)
+            {
+                ui_text_muted(tr("Этот вид двухфакторки не поддерживается"));
+            }
+            else
+            {
+                for (int i = 0; i < n; i++)
+                    ImGui::RadioButton(names[i], &g_cred_method, i);
+
+                ImGui::SetNextItemWidth(-1.0f);
+                bool submit_code = ImGui::InputTextWithHint("##mfacode", tr("код"),
+                                                            g_cred_code, sizeof(g_cred_code),
+                                                            ImGuiInputTextFlags_EnterReturnsTrue);
+
+                ImGui::Dummy(ImVec2(0, 4));
+                bool can = g_cred_code[0] != 0;
+                if (ImGui::Button(tr("Проверить код"), ImVec2(200, 34)) ||
+                    (submit_code && can))
+                {
+                    if (can)
+                    {
+                        InterlockedExchange(&g_ui.login_busy, 1);
+                        ccfset(g_ui.login_error, 0, sizeof(g_ui.login_error));
+                        api::login_mfa(g_cred_code, methods[g_cred_method]);
+                    }
+                }
+
+                if (mm.sms)
+                {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(tr("Прислать SMS")))
+                        api::login_mfa_send_sms();
+                    if (g_sms_info_have)
+                    {
+                        ImGui::SameLine();
+                        ui_text_muted(g_sms_info);
+                    }
+                }
+            }
+        }
     }
 
     // Always offered, including while an attempt is still spinning. A server
@@ -2027,7 +2311,7 @@ void ui_view_login()
         int fallback = storage::active_account();
         if (fallback < 0) fallback = 0;
 
-        ImGui::SameLine();
+        ImGui::Dummy(ImVec2(0, 4));
         ImGui::PushStyleColor(ImGuiCol_Button, col::bg_input);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, col::bg_hover);
         if (ImGui::Button(tr("Открыть сохранённое"), ImVec2(200, 34)))
@@ -2046,7 +2330,6 @@ void ui_view_login()
         ImGui::TextWrapped("%s", g_ui.login_error);
         ImGui::PopStyleColor();
     }
-
     if (remembered > 0)
     {
         ImGui::Dummy(ImVec2(0, 10));
@@ -2238,6 +2521,8 @@ void ui_init()
 bool ui_wants_redraw()
 {
     if (voice::state() != VOICE_IDLE) return true;          // meters, speaking rings
+    if (g_ui.login_busy) return true;                       // sign-in attempts
+    if (captcha::waiting()) return true;                    // captcha solve
     if (streamview::state() != WATCH_IDLE) return true;     // somebody's screen
     if (voice::watched_camera()) return true;               // somebody's camera
 
@@ -2353,6 +2638,7 @@ void ui_frame()
     if (!g_ui.logged_in)
     {
         ui_view_login();
+        ui_view_captcha_popup();
         return;
     }
 
@@ -2513,6 +2799,7 @@ void ui_frame()
     ui_view_pins_popup();
     ui_view_search_popup();
     ui_view_media_popup();
+    ui_view_captcha_popup();
 
     // Global shortcut: logging out is always available.
     ImGuiIO& io = ImGui::GetIO();
