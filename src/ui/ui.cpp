@@ -687,6 +687,40 @@ static void draw_glyph(ImDrawList* dl, ui_icon icon, ImVec2 center, float s, ImU
         dl->AddTriangleFilled(m2[0], m2[1], m2[2], fg);
         break;
     }
+
+    case ICON_FORUM:
+    {
+        // Two stacked speech bubbles, the way forums read: posts with
+        // replies under them.
+        float t = s * 0.10f;
+        dl->AddRect(ImVec2(center.x - s * 0.46f, center.y - s * 0.44f),
+                    ImVec2(center.x + s * 0.18f, center.y - s * 0.02f), fg, s * 0.10f, 0, t);
+        dl->AddRect(ImVec2(center.x - s * 0.18f, center.y + s * 0.02f),
+                    ImVec2(center.x + s * 0.46f, center.y + s * 0.44f), fg, s * 0.10f, 0, t);
+        ImVec2 tail[3] =
+        {
+            ImVec2(center.x - s * 0.30f, center.y - s * 0.04f),
+            ImVec2(center.x - s * 0.14f, center.y - s * 0.04f),
+            ImVec2(center.x - s * 0.26f, center.y + s * 0.12f),
+        };
+        dl->AddTriangleFilled(tail[0], tail[1], tail[2], fg);
+        break;
+    }
+
+    case ICON_ARCHIVE:
+    {
+        // An archive box: a crate body with the lid drawn shut.
+        float t = s * 0.10f;
+        dl->AddRect(ImVec2(center.x - s * 0.42f, center.y - s * 0.08f),
+                    ImVec2(center.x + s * 0.42f, center.y + s * 0.42f), fg, s * 0.06f, 0, t);
+        dl->AddLine(ImVec2(center.x - s * 0.46f, center.y - s * 0.08f),
+                    ImVec2(center.x + s * 0.46f, center.y - s * 0.08f), fg, t);
+        dl->AddLine(ImVec2(center.x - s * 0.12f, center.y - s * 0.08f),
+                    ImVec2(center.x - s * 0.12f, center.y + s * 0.10f), fg, t);
+        dl->AddLine(ImVec2(center.x + s * 0.12f, center.y - s * 0.08f),
+                    ImVec2(center.x + s * 0.12f, center.y + s * 0.10f), fg, t);
+        break;
+    }
     }
 }
 

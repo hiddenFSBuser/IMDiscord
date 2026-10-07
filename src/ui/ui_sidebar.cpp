@@ -277,7 +277,7 @@ void ui_view_guild_rail(float width, float height)
             for (unsigned int k = 0; k < g->channels.count; k++)
             {
                 dchannel* c = store::find_channel(g->channels[k]);
-                if (c && c->is_textual()) { g_ui.active_channel = c->id; break; }
+                if (c && (c->is_textual() || c->type == CH_FORUM)) { g_ui.active_channel = c->id; break; }
             }
             g_ui.scroll_to_bottom = true;
         }
@@ -646,12 +646,19 @@ namespace
         ImU32 tint = active ? col::text_normal : col::text_muted;
         if (hidden && !active) tint = IM_COL32(110, 114, 124, 255);
 
-        ui_draw_icon(dl, is_voice ? ICON_SPEAKER : ICON_HASH,
+        ui_draw_icon(dl, is_voice ? ICON_SPEAKER : (c->type == CH_FORUM ? ICON_FORUM : ICON_HASH),
                      ImVec2(start.x + 13.0f, start.y + row_h * 0.5f), 15.0f, tint);
 
         ImVec2 text_size = ImGui::CalcTextSize(label);
         ui_draw_text_emoji(dl, ImVec2(start.x + 28.0f, start.y + (row_h - text_size.y) * 0.5f),
                            tint, label);
+
+        // Access lost but something saved: the disk copy is still readable,
+        // and the box says so next to the lock.
+        bool saved = hidden && archive::channel_count(c->id) > 0;
+        if (saved)
+            ui_draw_icon(dl, ICON_ARCHIVE,
+                         ImVec2(start.x + row_w - 32.0f, start.y + row_h * 0.5f), 14.0f, tint);
 
         if (hidden)
             draw_lock(dl, ImVec2(start.x + row_w - 14.0f, start.y + row_h * 0.5f), 14.0f, tint);
@@ -1151,7 +1158,10 @@ void ui_view_channel_list(float width, float height)
                         continue;
                     }
 
-                    if (!c->is_textual() && c->type != CH_GUILD_VOICE && c->type != CH_STAGE) continue;
+                    // Forums read posts, not messages, but they open like any
+                    // other channel - the chat view draws the post list.
+                    if (!c->is_textual() && c->type != CH_GUILD_VOICE && c->type != CH_STAGE &&
+                        c->type != CH_FORUM) continue;
 
                     ImGui::PushID((const void*)(size_t)c->id);
                     bool active = (g_ui.active_channel == c->id);
@@ -1221,6 +1231,22 @@ void ui_view_channel_list(float width, float height)
                             g_ui.channel_info_id = c->id;
                             g_ui.open_channel_info_popup = true;
                         }
+                        // Lost access, disk copy kept: read what was saved.
+                        // The view is preset to failed so nothing is asked
+                        // over the network; "Повторить" there retries live.
+                        if (hidden && archive::channel_count(c->id))
+                        {
+                            if (ImGui::MenuItem(tr("Открыть сохранённое")))
+                            {
+                                g_ui.active_channel = c->id;
+                                g_ui.show_friends = false;
+                                science::channel_opened(c->id, g->id);
+                                g_ui.scroll_to_bottom = true;
+                                g_ui.reply_to = 0;
+                                c->history_failed = true;
+                                gateway::subscribe_guild(g->id, c->id);
+                            }
+                        }
                         if (ImGui::MenuItem(tr("Переименовать"))) ui_open_rename_channel(c->id);
                         if (ImGui::MenuItem(tr("Права канала"))) ui_open_channel_perms(c->id);
                         if (ImGui::MenuItem(tr("Удалить канал"))) api::delete_channel(c->id);
@@ -1276,7 +1302,9 @@ void ui_view_channel_list(float width, float height)
                         science::channel_opened(c->id, g->id);
                         g_ui.scroll_to_bottom = true;
                         g_ui.reply_to = 0;
-                        if (!c->history_loaded) api::fetch_messages(c->id, 0);
+                        // A forum has no messages of its own; its view pulls
+                        // the post list itself.
+                        if (c->type != CH_FORUM && !c->history_loaded) api::fetch_messages(c->id, 0);
                         gateway::subscribe_guild(g->id, c->id);
                     }
 
@@ -2300,6 +2328,12 @@ void ui_view_settings_popup()
         ui_text_muted(g_ui.show_hidden_channels
                           ? tr("С замком - те, куда нет доступа. Клик открывает свойства")
                           : tr("Видно только то, что можно читать"));
+
+        bool nogaps = storage::settings_get_int("no_gaps_mode", 0) != 0;
+        if (ImGui::Checkbox(tr("Режим без пропусков"), &nogaps))
+            storage::settings_set_int("no_gaps_mode", nogaps ? 1 : 0);
+        ui_text_muted(tr("Вид никогда не перешагивает через пропуск: выше него "
+                         "ничего не грузится, только кнопка подгрузки"));
     }
 
     ImGui::Dummy(ImVec2(0, 10));

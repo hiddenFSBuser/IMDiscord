@@ -938,6 +938,69 @@ namespace
             return;
         }
 
+        // Threads ride the same shape as channels - a full object on create
+        // and update - except the guild is named on the parent, not on the
+        // thread itself.
+        if (ccscmp(type, "THREAD_CREATE") == 0 || ccscmp(type, "THREAD_UPDATE") == 0)
+        {
+            bool created = ccscmp(type, "THREAD_CREATE") == 0;
+
+            store::guard g;
+            snowflake gid = d->sf("guild_id");
+            dchannel* c = store::upsert_channel(d, gid);
+            if (c && !gid && c->parent_id)
+            {
+                dchannel* parent = store::find_channel(c->parent_id);
+                if (parent && parent->guild_id)
+                {
+                    c->guild_id = parent->guild_id;
+                    gid = parent->guild_id;
+                }
+            }
+            if (c && gid)
+            {
+                dguild* guild = store::find_guild(gid);
+                if (guild)
+                {
+                    bool known = false;
+                    for (unsigned int i = 0; i < guild->channels.count; i++)
+                        if (guild->channels[i] == c->id) { known = true; break; }
+                    if (!known) guild->channels.push(c->id);
+                    store::sort_guild_channels(guild);
+                }
+            }
+            // A new post leads the forum's list, the way a created one does.
+            if (created && c && c->id && c->parent_id)
+                store::prepend_forum_post(c->parent_id, c->id);
+            store::bump_revision();
+            return;
+        }
+
+        if (ccscmp(type, "THREAD_DELETE") == 0)
+        {
+            snowflake tid = d->sf("id");
+            store::guard g;
+            // Marked, not dropped: the messages are still on disk, the forum
+            // still lists the post, and the archive can still open it.
+            dchannel* c = store::find_channel(tid);
+            if (c) c->deleted = true;
+            else store::remove_channel(tid);
+            store::bump_revision();
+            return;
+        }
+
+        if (ccscmp(type, "THREAD_LIST_SYNC") == 0)
+        {
+            store::guard g;
+            snowflake gid = d->sf("guild_id");
+            const jval* threads = d->arr("threads");
+            if (threads && threads->type == JTYPE_ARR)
+                for (unsigned int i = 0; i < threads->count; i++)
+                    store::upsert_channel(threads->at(i), gid);
+            store::bump_revision();
+            return;
+        }
+
         if (ccscmp(type, "GUILD_CREATE") == 0 || ccscmp(type, "GUILD_UPDATE") == 0)
         {
             store::guard g;

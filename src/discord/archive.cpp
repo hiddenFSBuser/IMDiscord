@@ -1061,6 +1061,30 @@ namespace
         if (c->topic) w->kv_str("topic", c->topic);
         if (c->icon) w->kv_str("icon", c->icon);
         w->kv_i64("position", c->position);
+        if (c->deleted) w->kv_bool("deleted", true);
+
+        // The locks are computed from these, so without them the archive
+        // opens every channel and forgets every role change in between.
+        if (c->overwrites.count)
+        {
+            w->key("permission_overwrites");
+            w->begin_arr();
+            for (unsigned int i = 0; i < c->overwrites.count; i++)
+            {
+                const doverwrite* o = &c->overwrites[i];
+                char allow[24], deny[24];
+                cnprint(allow, sizeof(allow), "%llu", o->allow);
+                cnprint(deny, sizeof(deny), "%llu", o->deny);
+
+                w->begin_obj();
+                w->kv_snowflake("id", o->id);
+                w->kv_i64("type", o->type);
+                w->kv_str("allow", allow);
+                w->kv_str("deny", deny);
+                w->end_obj();
+            }
+            w->end_arr();
+        }
 
         if (c->recipients.count)
         {
@@ -1070,6 +1094,47 @@ namespace
             {
                 char id[24];
                 cnprint(id, sizeof(id), "%llu", c->recipients[i]);
+                w->val_str(id);
+            }
+            w->end_arr();
+        }
+        w->end_obj();
+    }
+
+    void write_role(jwriter* w, const drole* r)
+    {
+        w->begin_obj();
+        w->kv_snowflake("id", r->id);
+        if (r->name) w->kv_str("name", r->name);
+        w->kv_i64("color", (long long)r->color);
+        w->kv_i64("position", r->position);
+        {
+            char perms[24];
+            cnprint(perms, sizeof(perms), "%llu", r->permissions);
+            w->kv_str("permissions", perms);
+        }
+        w->kv_bool("hoist", r->hoist);
+        w->kv_bool("mentionable", r->mentionable);
+        w->end_obj();
+    }
+
+    void write_member(jwriter* w, const dmember* m)
+    {
+        w->begin_obj();
+        w->key("user");
+        w->begin_obj();
+        w->kv_snowflake("id", m->user_id);
+        w->end_obj();
+
+        if (m->nick) w->kv_str("nick", m->nick);
+        if (m->roles.count)
+        {
+            w->key("roles");
+            w->begin_arr();
+            for (unsigned int i = 0; i < m->roles.count; i++)
+            {
+                char id[24];
+                cnprint(id, sizeof(id), "%llu", m->roles[i]);
                 w->val_str(id);
             }
             w->end_arr();
@@ -1137,6 +1202,27 @@ bool archive::snapshot_save()
             if (g->owner_id) w.kv_snowflake("owner_id", g->owner_id);
             w.kv_i64("position", g->position);
 
+            // Roles and who holds them are what every lock is computed
+            // from. Without them the archive opens everything - or keeps
+            // the locks from the previous run, which is worse.
+            if (g->roles.count)
+            {
+                w.key("roles");
+                w.begin_arr();
+                for (unsigned int r = 0; r < g->roles.count; r++)
+                    write_role(&w, &g->roles[r]);
+                w.end_arr();
+            }
+
+            if (g->members.count)
+            {
+                w.key("members");
+                w.begin_arr();
+                for (unsigned int m = 0; m < g->members.count; m++)
+                    write_member(&w, &g->members[m]);
+                w.end_arr();
+            }
+
             w.key("channels");
             w.begin_arr();
             for (unsigned int k = 0; k < g->channels.count; k++)
@@ -1163,6 +1249,23 @@ bool archive::snapshot_save()
 
     w.end_obj();
     ids.dispose();
+
+    // Never replace a good snapshot with garbage: a truncated write is
+    // already covered by the temp file below, but only a parse catches a
+    // writer that built malformed JSON in memory.
+    {
+        jdoc check;
+        check.init();
+        bool valid = check.parse(w.buf.c_str(), (int)w.buf.size) &&
+                     check.r() && check.r()->type == JTYPE_OBJ;
+        check.free_doc();
+        if (!valid)
+        {
+            log_line("archive: снимок не записан - собран битый JSON");
+            w.free_writer();
+            return false;
+        }
+    }
 
     // Written beside the real file and moved into place, so a snapshot
     // interrupted halfway never replaces a good one with a truncated one.
@@ -1203,7 +1306,13 @@ bool archive::snapshot_load()
     doc.init();
 
     bool ok = false;
-    if (doc.parse((const char*)blob.c_str(), (int)blob.size) && doc.r()->type == JTYPE_OBJ)
+    if (!doc.parse((const char*)blob.c_str(), (int)blob.size) || !doc.r() ||
+        doc.r()->type != JTYPE_OBJ)
+    {
+        log_line("archive: снимок не разобран (%u байт), серверы подтянутся с сети",
+                 blob.size);
+    }
+    else
     {
         const jval* root = doc.r();
         store::guard guard;

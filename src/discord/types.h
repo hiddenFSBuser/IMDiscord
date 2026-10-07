@@ -343,6 +343,17 @@ struct doverwrite
     unsigned long long deny;
 };
 
+// One tag a forum channel offers for its posts: picked at creation and
+// shown on the post. Emoji is the unicode character or custom emoji name
+// discord sent, or null.
+struct dforumtag
+{
+    snowflake id;
+    const char* name;
+    const char* emoji;
+    bool moderated;
+};
+
 struct dchannel
 {
     snowflake id;
@@ -391,6 +402,15 @@ struct dchannel
     bool locked;              // threads
     int member_count;         // threads
     int message_count;        // threads
+
+    // A thread discord reported as deleted. The object stays: its messages
+    // are still on disk, and the forum still lists it, marked.
+    bool deleted;
+
+    // Forum channels carry the tags posts may take; posts carry the ones
+    // they took. Both arrive as channel fields, so both live here.
+    ulist<dforumtag> tags;         // available_tags, forum channels
+    ulist<snowflake> applied_tags; // applied_tags, posts
 
     bool unread() const
     {

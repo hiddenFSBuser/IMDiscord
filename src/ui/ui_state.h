@@ -274,6 +274,8 @@ enum ui_icon
     ICON_SEARCH,     // message search
     ICON_PIN,        // pinned messages
     ICON_IMAGE,      // media listing
+    ICON_FORUM,      // forum channel
+    ICON_ARCHIVE,    // saved copy on disk
 };
 
 bool ui_glyph_button(const char* id, ui_icon icon, bool crossed, const ImVec2& size,

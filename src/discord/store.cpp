@@ -27,6 +27,18 @@ namespace
     // Channels whose pins fetch failed. A failed channel shows an error
     // with a retry instead of loading forever.
     ulist<snowflake> g_pins_failed;
+
+    // Forum posts in the order the search returned them (by recent activity),
+    // as last fetched. The post bodies live in their thread channels; this
+    // is only the order to show them in, plus whether older pages remain.
+    struct forum_list
+    {
+        snowflake forum;
+        ulist<snowflake> ids;
+        bool has_more;
+    };
+    ulist<forum_list> g_forums;
+    ulist<snowflake> g_forums_failed;
     ulist<snowflake> g_guild_order;
     ulist<snowflake> g_dm_order;
 
@@ -54,6 +66,8 @@ void store::init()
     g_relationships = ulist<drelationship>();
     g_pins = ulist<pin_list>();
     g_pins_failed = ulist<snowflake>();
+    g_forums = ulist<forum_list>();
+    g_forums_failed = ulist<snowflake>();
     g_voice = ulist<dvoice_state>();
     g_guild_order = ulist<snowflake>();
     g_dm_order = ulist<snowflake>();
@@ -90,6 +104,11 @@ void store::reset()
     g_pins = ulist<pin_list>();
     g_pins_failed.dispose();
     g_pins_failed = ulist<snowflake>();
+    for (unsigned int i = 0; i < g_forums.count; i++) g_forums[i].ids.dispose();
+    g_forums.dispose();
+    g_forums = ulist<forum_list>();
+    g_forums_failed.dispose();
+    g_forums_failed = ulist<snowflake>();
     g_voice = ulist<dvoice_state>();
     g_guild_order = ulist<snowflake>();
     g_dm_order = ulist<snowflake>();
@@ -293,6 +312,8 @@ dchannel* store::upsert_channel(const jval* v, snowflake guild_id)
         c->messages = ulist<dmessage>();
         c->recipients = ulist<snowflake>();
         c->overwrites = ulist<doverwrite>();
+        c->tags = ulist<dforumtag>();
+        c->applied_tags = ulist<snowflake>();
         g_channels.insert(id, c);
     }
 
@@ -310,6 +331,7 @@ dchannel* store::upsert_channel(const jval* v, snowflake guild_id)
     if (v->has("bitrate")) c->bitrate = v->i32("bitrate", 0);
     if (v->has("rate_limit_per_user")) c->rate_limit_per_user = v->i32("rate_limit_per_user", 0);
     if (v->has("nsfw")) c->nsfw = v->boolean("nsfw", false);
+    if (v->has("deleted")) c->deleted = v->boolean("deleted", false);
 
     // Threads carry their state in a nested object.
     const jval* meta = v->obj("thread_metadata");
@@ -320,6 +342,38 @@ dchannel* store::upsert_channel(const jval* v, snowflake guild_id)
     }
     if (v->has("member_count")) c->member_count = v->i32("member_count", 0);
     if (v->has("message_count")) c->message_count = v->i32("message_count", 0);
+
+    // Forum channels offer tags; posts carry the ones they took. Both are
+    // replaced whole, the way overwrites are: discord always sends the
+    // full set with the channel.
+    const jval* atags = v->arr("available_tags");
+    if (atags->type == JTYPE_ARR)
+    {
+        c->tags.clear_fast();
+        for (unsigned int i = 0; i < atags->count; i++)
+        {
+            const jval* t = atags->at(i);
+            dforumtag tag;
+            ccfset(&tag, 0, sizeof(tag));
+            tag.id = t->sf("id");
+            tag.name = dup_field(t, "name");
+            tag.emoji = dup_field(t, "emoji_name");
+            if (!tag.emoji) tag.emoji = dup_field(t, "emoji_id");
+            tag.moderated = t->boolean("moderated", false);
+            if (tag.id) c->tags.push(tag);
+        }
+    }
+
+    const jval* utags = v->arr("applied_tags");
+    if (utags->type == JTYPE_ARR)
+    {
+        c->applied_tags.clear_fast();
+        for (unsigned int i = 0; i < utags->count; i++)
+        {
+            snowflake tid = utags->at(i)->as_snowflake();
+            if (tid) c->applied_tags.push(tid);
+        }
+    }
 
     // A DM carries either full user objects in "recipients" (REST, older
     // gateway payloads) or bare ids in "recipient_ids", with the users listed
@@ -449,8 +503,25 @@ dguild* store::upsert_guild(const jval* v)
         sort_guild_channels(g);
     }
 
-    const jval* members = v->arr("members");
-    if (members->type == JTYPE_ARR && members->count)
+    // Threads the account is in ride along with the guild, outside the
+    // channel list. They open like any channel once held, and they are
+    // registered with the guild so the snapshot keeps them.
+    const jval* threads = v->arr("threads");
+    if (threads->type == JTYPE_ARR)
+    {
+        for (unsigned int i = 0; i < threads->count; i++)
+        {
+            dchannel* t = upsert_channel(threads->at(i), id);
+            if (!t) continue;
+
+            bool known = false;
+            for (unsigned int k = 0; k < g->channels.count; k++)
+                if (g->channels[k] == t->id) { known = true; break; }
+            if (!known) g->channels.push(t->id);
+        }
+    }
+
+    const jval* members = v->arr("members");    if (members->type == JTYPE_ARR && members->count)
     {
         for (unsigned int i = 0; i < members->count; i++)
         {
@@ -1211,6 +1282,9 @@ dmessage* store::upsert_message(const jval* v)
         ch->type = CH_DM;
         ch->messages = ulist<dmessage>();
         ch->recipients = ulist<snowflake>();
+        ch->overwrites = ulist<doverwrite>();
+        ch->tags = ulist<dforumtag>();
+        ch->applied_tags = ulist<snowflake>();
         g_channels.insert(channel_id, ch);
     }
 
@@ -1516,6 +1590,173 @@ bool store::is_channel_pinned(snowflake channel_id, snowflake message_id)
         if ((*ids)[i] == message_id) return true;
 
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// forum posts
+// ---------------------------------------------------------------------------
+
+void store::fail_forum_posts(snowflake forum_id)
+{
+    for (unsigned int i = 0; i < g_forums_failed.count; i++)
+        if (g_forums_failed[i] == forum_id) return;
+
+    g_forums_failed.push(forum_id);
+    bump_revision();
+}
+
+bool store::forum_posts_failed(snowflake forum_id)
+{
+    for (unsigned int i = 0; i < g_forums_failed.count; i++)
+        if (g_forums_failed[i] == forum_id) return true;
+
+    return false;
+}
+
+void store::set_forum_posts(snowflake forum_id, const snowflake* ids, int count,
+                            bool has_more, bool append)
+{
+    for (unsigned int i = 0; i < g_forums_failed.count; i++)
+    {
+        if (g_forums_failed[i] != forum_id) continue;
+        g_forums_failed.delete_at(i);
+        break;
+    }
+
+    for (unsigned int i = 0; i < g_forums.count; i++)
+    {
+        if (g_forums[i].forum != forum_id) continue;
+
+        if (!append) g_forums[i].ids.clear_fast();
+        for (int k = 0; k < count; k++)
+        {
+            bool known = false;
+            for (unsigned int q = 0; q < g_forums[i].ids.count; q++)
+                if (g_forums[i].ids[q] == ids[k]) { known = true; break; }
+            if (!known) g_forums[i].ids.push(ids[k]);
+        }
+        g_forums[i].has_more = has_more;
+        bump_revision();
+        return;
+    }
+
+    forum_list f;
+    ccfset(&f, 0, sizeof(f));
+    f.forum = forum_id;
+    f.ids = ulist<snowflake>();
+    for (int k = 0; k < count; k++) f.ids.push(ids[k]);
+    f.has_more = has_more;
+    g_forums.push(f);
+    bump_revision();
+}
+
+const ulist<snowflake>* store::forum_posts(snowflake forum_id)
+{
+    for (unsigned int i = 0; i < g_forums.count; i++)
+        if (g_forums[i].forum == forum_id) return &g_forums[i].ids;
+
+    return 0;
+}
+
+bool store::forum_has_more(snowflake forum_id)
+{
+    for (unsigned int i = 0; i < g_forums.count; i++)
+        if (g_forums[i].forum == forum_id) return g_forums[i].has_more;
+
+    return false;
+}
+
+void store::prepend_forum_post(snowflake forum_id, snowflake post_id)
+{
+    if (!forum_id || !post_id) return;
+
+    for (unsigned int i = 0; i < g_forums.count; i++)
+    {
+        if (g_forums[i].forum != forum_id) continue;
+
+        for (unsigned int q = 0; q < g_forums[i].ids.count; q++)
+            if (g_forums[i].ids[q] == post_id) return;
+
+        // Order is newest activity first; a fresh post leads.
+        g_forums[i].ids.push(post_id);
+        for (unsigned int q = g_forums[i].ids.count - 1; q > 0; q--)
+            g_forums[i].ids[q] = g_forums[i].ids[q - 1];
+        g_forums[i].ids[0] = post_id;
+        bump_revision();
+        return;
+    }
+}
+
+void store::remove_forum_post(snowflake forum_id, snowflake post_id)
+{
+    if (!post_id) return;
+
+    for (unsigned int i = 0; i < g_forums.count; i++)
+    {
+        if (forum_id && g_forums[i].forum != forum_id) continue;
+
+        for (unsigned int q = 0; q < g_forums[i].ids.count; q++)
+        {
+            if (g_forums[i].ids[q] != post_id) continue;
+            g_forums[i].ids.delete_at(q);
+            bump_revision();
+            break;
+        }
+        if (forum_id) return;
+    }
+}
+
+void store::clear_forum_posts(snowflake forum_id)
+{
+    for (unsigned int i = 0; i < g_forums.count; i++)
+    {
+        if (g_forums[i].forum != forum_id) continue;
+        g_forums[i].ids.dispose();
+        g_forums.delete_at(i);
+        break;
+    }
+
+    for (unsigned int i = 0; i < g_forums_failed.count; i++)
+    {
+        if (g_forums_failed[i] != forum_id) continue;
+        g_forums_failed.delete_at(i);
+        break;
+    }
+
+    bump_revision();
+}
+
+int store::forum_posts_known(snowflake forum_id, snowflake* out, int cap)
+{
+    if (!forum_id || !out || cap <= 0) return 0;
+
+    int n = 0;
+    for (unsigned int i = 0; i < g_guild_order.count && n < cap; i++)
+    {
+        dguild* g = find_guild(g_guild_order[i]);
+        if (!g) continue;
+
+        for (unsigned int k = 0; k < g->channels.count && n < cap; k++)
+        {
+            dchannel* c = find_channel(g->channels[k]);
+            if (!c || !c->id || c->parent_id != forum_id) continue;
+
+            // Newest activity first; threads that never spoke sink by id.
+            snowflake key = c->last_message_id ? c->last_message_id : c->id;
+            int at = n;
+            while (at > 0)
+            {
+                dchannel* o = find_channel(out[at - 1]);
+                snowflake okey = (o && o->last_message_id) ? o->last_message_id : (o ? o->id : 0);
+                if (okey >= key) break;
+                out[at] = out[at - 1];
+                at--;
+            }
+            out[at] = c->id;
+            n++;
+        }
+    }
+    return n;
 }
 
 // ---------------------------------------------------------------------------

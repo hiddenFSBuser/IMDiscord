@@ -90,7 +90,22 @@ namespace api
     // there is none. Reaching it - or running out before it - is what proves
     // the stretch is whole, and that gets written down so the hole is not
     // offered again.
-    void fetch_messages_after(snowflake channel_id, snowflake after_id, snowflake until_id);
+    //
+    // budget caps one pass at this many messages, pulled page by page (100
+    // per request, which is discord's maximum). Zero or negative closes the
+    // hole completely, up to a safety cap inside the job: a "17 days" hole
+    // on a busy server is thousands of messages, and one page of fifty
+    // barely scratches it.
+    void fetch_messages_after(snowflake channel_id, snowflake after_id, snowflake until_id,
+                              int budget = 0);
+    // The mirror walk: from the hole's far side backwards, down to stop_id
+    // (the near side) or the budget. Same paging, same progress slot.
+    void fetch_gap_backward(snowflake channel_id, snowflake before_id, snowflake stop_id,
+                            int budget = 0);
+    // Progress of a hole fill in flight, for its marker to show. Returns
+    // false when no fill is running for the channel; wanted is zero when
+    // the fill runs to the far side rather than to a count.
+    bool fill_progress(snowflake channel_id, int* fetched, int* wanted);
     void send_message(snowflake channel_id, const char* content, snowflake reply_to);
     // Takes ownership of every file buffer in the list, and of the list storage.
     void send_message_with_files(snowflake channel_id, const char* content, ulist<upload_file>* files);
@@ -251,6 +266,26 @@ namespace api
     void fetch_pins(snowflake channel_id);
     void pin_message(snowflake channel_id, snowflake message_id);
     void unpin_message(snowflake channel_id, snowflake message_id);
+
+    // ---- forums ----
+    // Posts: the search-ordered thread list with first messages, page by
+    // page (25). The offset is whatever is already held. history_loading on
+    // the forum channel is the in-flight guard, the way it is for history.
+    void fetch_forum_posts(snowflake forum_id);
+    // A new post: name, starter text and tag ids. The result is picked up
+    // once with take_forum_post_result; forum_post_busy is set meanwhile
+    // (separate from history_loading, which the post list uses).
+    void create_forum_post(snowflake forum_id, const char* name, const char* content,
+                          const snowflake* tags, int tag_count);
+    bool forum_post_busy(snowflake forum_id);
+    // Takes the creation result for the forum, once. False when there is
+    // none yet (or it belongs to another forum); ok tells success, thread
+    // the new post's id, error the server's words on failure.
+    bool take_forum_post_result(snowflake forum_id, bool* ok, snowflake* thread_id,
+                               char* error, int error_cap);
+    // Membership in a thread: idempotent, fire and forget. Reading usually
+    // works without it; writing does not.
+    void join_thread(snowflake thread_id);
     // ---- an invite sitting in a message ----------------------------------
     //
     // Discord draws those as a panel with the server on it rather than as a

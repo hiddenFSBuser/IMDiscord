@@ -100,6 +100,25 @@ namespace store
     void fail_channel_pins(snowflake channel_id);
     bool pins_failed(snowflake channel_id);
 
+    // Forum posts in search order (newest activity first), as last fetched.
+    // Null when nobody asked yet. Appended page by page; a fresh post or a
+    // created one goes first.
+    void set_forum_posts(snowflake forum_id, const snowflake* ids, int count,
+                         bool has_more, bool append);
+    const ulist<snowflake>* forum_posts(snowflake forum_id);
+    bool forum_has_more(snowflake forum_id);
+    void prepend_forum_post(snowflake forum_id, snowflake post_id);
+    void remove_forum_post(snowflake forum_id, snowflake post_id);
+    // Drops the whole list (and the failure mark), so the next frame pulls
+    // it from scratch.
+    void clear_forum_posts(snowflake forum_id);
+    // Posts known without any search: thread channels held with this parent,
+    // newest activity first. What a forum view shows when there is no list
+    // to show - offline, or before the first fetch. Returns ids stored.
+    int forum_posts_known(snowflake forum_id, snowflake* out, int cap);
+    void fail_forum_posts(snowflake forum_id);
+    bool forum_posts_failed(snowflake forum_id);
+
     // ---- voice ----
     void set_voice_state(const jval* v, snowflake guild_id);
     // Null when the user is not in any voice channel we know about.

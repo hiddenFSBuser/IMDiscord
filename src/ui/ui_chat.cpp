@@ -7,6 +7,7 @@
 #include "textures.h"
 
 #include "core/app.h"
+#include "core/storage.h"
 #include "stb/stb_image.h"
 #include "core/log.h"
 #include "discord/store.h"
@@ -863,9 +864,14 @@ namespace
         // taken back out of the scroll or the view jumps.
         float last_height;
         bool grew_upwards;
+
+        // "No gaps" mode cut the window last frame. While it holds, scrolling
+        // to the top must not creep the anchor into the hidden stretch -
+        // there is nothing to see there, only the load-older button.
+        bool no_gaps_cut;
     };
 
-    chat_window g_win = { 0, 0, true, false, 0, 0.0f, 0.0f, false };
+    chat_window g_win = { 0, 0, true, false, 0, 0.0f, 0.0f, false, false };
 
     // Index of the first message with an id at least this one. The list is
     // sorted, so this is a binary search - a linear one runs per frame over
@@ -964,6 +970,17 @@ namespace
         return false;
     }
 
+    // How many messages one press of the button below pulls. A "17 days"
+    // hole on a busy server is thousands of messages; the choice stays
+    // for the session and applies to every hole marker.
+    static int g_hole_depth = 1;
+
+    // "No gaps" mode lives in the settings and reads here, every frame.
+    bool ui_no_gaps_mode()
+    {
+        return storage::settings_get_int("no_gaps_mode", 0) != 0;
+    }
+
     void draw_hole(dchannel* ch, snowflake after_id, snowflake until_id,
                    unsigned long long span_ms)
     {
@@ -993,9 +1010,45 @@ namespace
         ImGui::Indent(16.0f);
         ImGui::PushID((int)(after_id & 0x7FFFFFFF));
 
-        if (ch->history_loading) ui_text_muted(tr("Загрузка..."));
-        else if (ImGui::SmallButton(tr("Проверить, нет ли пропуска")))
-            api::fetch_messages_after(ch->id, after_id, until_id);
+        int fill_fetched = 0, fill_wanted = 0;
+        if (ch->history_loading &&
+            api::fill_progress(ch->id, &fill_fetched, &fill_wanted))
+        {
+            // A fill for this hole is bringing pages in: say how far along
+            // it is, so a hole of thousands does not read as stuck.
+            char progress[96];
+            if (fill_wanted > 0)
+                cnprint(progress, sizeof(progress), tr("Тяну пропуск... %d из %d"),
+                        fill_fetched, fill_wanted);
+            else
+                cnprint(progress, sizeof(progress), tr("Тяну пропуск... %d"),
+                        fill_fetched);
+            ui_text_muted(progress);
+        }
+        else if (ch->history_loading)
+        {
+            ui_text_muted(tr("Загрузка..."));
+        }
+        else
+        {
+            ImGui::SetNextItemWidth(120.0f);
+            ImGui::Combo("##holedepth", &g_hole_depth,
+                         tr("100 сообщений\000500 сообщений\0002000 сообщений\000до конца\0"));
+            if (g_hole_depth < 0 || g_hole_depth > 3) g_hole_depth = 1;
+            ImGui::SameLine();
+
+            static const int budgets[4] = { 100, 500, 2000, 0 };
+            int budget = budgets[g_hole_depth];
+
+            // Forward from where the hole starts, or backwards from where
+            // it ends: a hole of thousands closes from whichever side is
+            // nearer to what is wanted.
+            if (ImGui::SmallButton(tr("Подтянуть сверху")))
+                api::fetch_messages_after(ch->id, after_id, until_id, budget);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(tr("Подтянуть снизу")))
+                api::fetch_gap_backward(ch->id, until_id, after_id, budget);
+        }
 
         ImGui::PopID();
         ImGui::Unindent(16.0f);
@@ -4153,6 +4206,391 @@ void ui_downloads_init()
     downloads_registry_init();
 }
 
+// ---- forums -----------------------------------------------------------
+//
+// A forum channel reads posts, not messages: the search-ordered thread
+// list with starter snippets, opening a post like any other chat. The
+// post bodies live in their thread channels; here is only the order to
+// show them in.
+
+static snowflake g_forum_compose = 0;   // forum with the dialog open
+static bool g_forum_compose_open = false;
+static char g_forum_name[128];
+static char g_forum_text[2048];
+static bool g_forum_tagsel[24];
+static bool g_forum_creating = false;
+static char g_forum_error[256];
+
+void ui_open_forum_compose(snowflake forum_id)
+{
+    dchannel* f = store::find_channel(forum_id);
+    if (!f) return;
+
+    g_forum_compose = forum_id;
+    g_forum_compose_open = true;
+    g_forum_name[0] = 0;
+    g_forum_text[0] = 0;
+    ccfset(g_forum_tagsel, 0, sizeof(g_forum_tagsel));
+    g_forum_creating = false;
+    g_forum_error[0] = 0;
+}
+
+static void open_forum_post(dchannel* forum, dchannel* post)
+{
+    if (!forum || !post || !post->id) return;
+
+    g_ui.active_channel = post->id;
+    g_ui.active_guild = forum->guild_id ? forum->guild_id : post->guild_id;
+    g_ui.scroll_to_bottom = true;
+    g_ui.reply_to = 0;
+    api::join_thread(post->id);
+    science::channel_opened(post->id, g_ui.active_guild);
+}
+
+static const char* forum_tag_name(const dchannel* forum, snowflake tag_id)
+{
+    if (!forum) return 0;
+    for (unsigned int i = 0; i < forum->tags.count; i++)
+        if (forum->tags[i].id == tag_id) return forum->tags[i].name;
+    return 0;
+}
+
+static void forum_snippet(const char* content, char* out, int cap)
+{
+    if (cap < 8) { if (cap > 0) out[0] = 0; return; }
+
+    unsigned int n = 0;
+    unsigned int max = (unsigned int)(cap - 5);
+    if (max > 220) max = 220;
+    if (!content) content = "";
+    while (content[n] && n < max) n++;
+    while (n > 0 && (((unsigned char)content[n] & 0xC0) == 0x80)) n--;
+
+    for (unsigned int k = 0; k < n; k++)
+    {
+        char c = content[k];
+        out[k] = (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+    }
+    out[n] = 0;
+    if (content[n]) ccstrncpy(out + n, "...", 4);
+}
+
+void ui_view_forum_compose()
+{
+    if (!g_forum_compose) return;
+
+    if (g_forum_compose_open)
+    {
+        ImGui::OpenPopup("##newpost");
+        g_forum_compose_open = false;
+    }
+
+    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopup("##newpost", ImGuiWindowFlags_NoResize))
+        return;
+
+    dchannel* forum = store::find_channel(g_forum_compose);
+    if (!forum)
+    {
+        ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        g_forum_compose = 0;
+        g_forum_creating = false;
+        return;
+    }
+
+    ImGui::TextUnformatted(tr("Новый пост"));
+    ImGui::Separator();
+
+    bool busy = api::forum_post_busy(forum->id);
+
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextWithHint("##postname", tr("Название поста"),
+                             g_forum_name, sizeof(g_forum_name));
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputTextMultiline("##posttext", g_forum_text, sizeof(g_forum_text),
+                             ImVec2(-1.0f, 120.0f));
+
+    if (forum->tags.count)
+    {
+        ui_text_muted(tr("Теги"));
+        int shown = 0;
+        for (unsigned int i = 0; i < forum->tags.count && i < 24; i++)
+        {
+            if (shown && (shown % 3)) ImGui::SameLine();
+            shown++;
+
+            char label[160];
+            if (forum->tags[i].emoji && forum->tags[i].emoji[0])
+                cnprint(label, sizeof(label), "%s %s", forum->tags[i].emoji,
+                        forum->tags[i].name ? forum->tags[i].name : "?");
+            else
+                cnprint(label, sizeof(label), "%s",
+                        forum->tags[i].name ? forum->tags[i].name : "?");
+            ImGui::Checkbox(label, &g_forum_tagsel[i]);
+        }
+    }
+
+    if (g_forum_error[0])
+    {
+        ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextWrapped("%s", g_forum_error);
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+    }
+
+    bool can = !busy && !g_forum_creating && g_forum_name[0] && g_forum_text[0];
+    if (!can) ImGui::BeginDisabled();
+    bool go = ImGui::Button(tr("Создать"), ImVec2(140, 30));
+    if (!can) ImGui::EndDisabled();
+
+    if (go && can)
+    {
+        snowflake tags[12];
+        int tag_count = 0;
+        for (unsigned int i = 0; i < forum->tags.count && i < 24 && tag_count < 12; i++)
+            if (g_forum_tagsel[i] && forum->tags[i].id) tags[tag_count++] = forum->tags[i].id;
+
+        g_forum_error[0] = 0;
+        g_forum_creating = true;
+        api::create_forum_post(forum->id, g_forum_name, g_forum_text, tags, tag_count);
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Отмена"), ImVec2(140, 30)))
+    {
+        ImGui::CloseCurrentPopup();
+        g_forum_compose = 0;
+        g_forum_creating = false;
+    }
+
+    if (g_forum_creating)
+    {
+        ui_text_muted(tr("Создание..."));
+
+        bool ok = false;
+        snowflake thread = 0;
+        char err[256];
+        err[0] = 0;
+        if (api::take_forum_post_result(forum->id, &ok, &thread, err, sizeof(err)))
+        {
+            g_forum_creating = false;
+            if (ok && thread)
+            {
+                dchannel* post = store::find_channel(thread);
+                ImGui::CloseCurrentPopup();
+                g_forum_compose = 0;
+                if (post) open_forum_post(forum, post);
+            }
+            else
+            {
+                ccstrncpy(g_forum_error, err[0] ? err : tr("Пост не создан"),
+                          sizeof(g_forum_error) - 1);
+            }
+        }
+    }
+
+    ImGui::EndPopup();
+}
+
+void ui_view_forum(dchannel* forum, float width, float height)
+{
+    ImDrawList* fdl = ImGui::GetWindowDrawList();
+    ImVec2 forigin = ImGui::GetWindowPos();
+
+    const float header_h = 46.0f;
+    char title[256];
+    ui_channel_display_name(forum, title, sizeof(title));
+
+    fdl->AddRectFilled(forigin, ImVec2(forigin.x + width, forigin.y + header_h), col::bg_chat);
+    fdl->AddLine(ImVec2(forigin.x, forigin.y + header_h),
+                 ImVec2(forigin.x + width, forigin.y + header_h), col::separator);
+
+    ImGui::SetCursorPos(ImVec2(16, 13));
+    ImGui::PushFont(g_app.font_bold);
+    ImGui::TextUnformatted(title);
+    ImGui::PopFont();
+
+    ImGui::SetCursorPos(ImVec2(width - 8.0f - 248.0f, 8.0f));
+    if (offline::active())
+    {
+        ui_text_muted(tr("Архив"));
+    }
+    else
+    {
+        if (ImGui::Button(tr("Новый пост"), ImVec2(136, 30)))
+            ui_open_forum_compose(forum->id);
+        ImGui::SameLine(0, 6);
+        if (ImGui::Button(tr("Обновить"), ImVec2(106, 30)))
+        {
+            store::clear_forum_posts(forum->id);
+            api::fetch_forum_posts(forum->id);
+        }
+    }
+
+    float list_h = height - header_h;
+    if (list_h < 80.0f) list_h = 80.0f;
+
+    ImGui::SetCursorPos(ImVec2(0, header_h));
+    ImGui::BeginChild("##forumposts", ImVec2(width, list_h), false);
+    ImGui::Indent(12.0f);
+
+    // Rows come from the live search list when there is one. Otherwise -
+    // offline, or access lost - what the snapshot and the disk hold with
+    // this parent is what there is, newest activity first, deleted posts
+    // among them.
+    static snowflake fb_forum = 0;
+    static unsigned int fb_rev = 0;
+    static snowflake fb_ids[256];
+    static int fb_n = 0;
+
+    const ulist<snowflake>* ids = store::forum_posts(forum->id);
+    const snowflake* rows = 0;
+    int nrows = 0;
+    bool live_list = false;
+
+    bool list_failed = !offline::active() && store::forum_posts_failed(forum->id);
+
+    if (ids)
+    {
+        rows = (const snowflake*)ids->listPTR;
+        nrows = (int)ids->count;
+        live_list = true;
+    }
+    else if (offline::active() || list_failed)
+    {
+        if (fb_forum != forum->id || fb_rev != store::revision())
+        {
+            fb_forum = forum->id;
+            fb_rev = store::revision();
+            fb_n = store::forum_posts_known(forum->id, fb_ids, 256);
+        }
+        rows = fb_ids;
+        nrows = fb_n;
+    }
+    else if (!forum->history_loading)
+    {
+        api::fetch_forum_posts(forum->id);
+    }
+
+    if (!rows && forum->history_loading)
+    {
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Indent(16.0f);
+        ui_text_muted(tr("Загрузка постов..."));
+        ImGui::Unindent(16.0f);
+    }
+    else if (!rows && list_failed)
+    {
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Indent(16.0f);
+        ui_text_muted(tr("Посты не загрузились."));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("Повторить")))
+            api::fetch_forum_posts(forum->id);
+        ImGui::Unindent(16.0f);
+    }
+    else if (rows && !nrows)
+    {
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Indent(16.0f);
+        ui_text_muted(offline::active() ? tr("В архиве постов нет.") : tr("Постов нет."));
+        ImGui::Unindent(16.0f);
+    }
+    else if (rows)
+    {
+        for (int i = 0; i < nrows; i++)
+        {
+            dchannel* post = store::find_channel(rows[i]);
+            if (!post) continue;
+
+            ImGui::PushID(i);
+
+            const dmessage* starter = post->messages.count ? &post->messages[0] : 0;
+            duser* author = starter ? store::find_user(starter->author_id) : 0;
+            if (!author) author = store::find_user(post->owner_id);
+
+            // The starter's face, the way every chat row shows who is talking.
+            if (author) ui_avatar(author, 28.0f, false);
+            else ImGui::Dummy(ImVec2(28.0f, 28.0f));
+            ImGui::SameLine(0, 10.0f);
+            ImGui::BeginGroup();
+
+            char head[256];
+            cnprint(head, sizeof(head), "%s%s%s",
+                    post->name ? post->name : tr("Пост"),
+                    post->archived ? tr(" · архив") : "",
+                    post->deleted ? tr(" · удалён") : "");
+            ImGui::PushFont(g_app.font_bold);
+            if (ImGui::Selectable(head, false, 0, ImVec2(0, 0)))
+                open_forum_post(forum, post);
+            ImGui::PopFont();
+
+            // Tags, starter author and reply count on one muted line.
+            {
+                char tags[192];
+                tags[0] = 0;
+                for (unsigned int t = 0; t < post->applied_tags.count; t++)
+                {
+                    const char* tn = forum_tag_name(forum, post->applied_tags[t]);
+                    if (!tn) continue;
+                    if (tags[0]) ccstrncpy(tags + ccslenf(tags), ", ", sizeof(tags) - ccslenf(tags) - 1);
+                    ccstrncpy(tags + ccslenf(tags), tn, sizeof(tags) - ccslenf(tags) - 1);
+                }
+
+                char meta[320];
+                if (tags[0])
+                    cnprint(meta, sizeof(meta), "%s · %s · сообщений: %d",
+                            tags, author ? author->display_name() : "?", post->message_count);
+                else
+                    cnprint(meta, sizeof(meta), "%s · сообщений: %d",
+                            author ? author->display_name() : "?", post->message_count);
+                ui_text_muted(meta);
+            }
+
+            if (starter && starter->content && starter->content[0])
+            {
+                char snippet[256];
+                forum_snippet(starter->content, snippet, sizeof(snippet));
+                ImGui::TextWrapped("%s", snippet);
+            }
+
+            ImGui::EndGroup();
+            ImGui::Separator();
+            ImGui::PopID();
+        }
+
+        if (live_list && store::forum_has_more(forum->id))
+        {
+            ImGui::Dummy(ImVec2(0, 4));
+            ImGui::Indent(16.0f);
+            if (forum->history_loading)
+                ui_text_muted(tr("Загрузка..."));
+            else if (ImGui::SmallButton(tr("Загрузить ещё")))
+                api::fetch_forum_posts(forum->id);
+            ImGui::Unindent(16.0f);
+        }
+        else if (!live_list && list_failed && !forum->history_loading)
+        {
+            // Stale rows above, from the disk; the network may be back.
+            ImGui::Dummy(ImVec2(0, 4));
+            ImGui::Indent(16.0f);
+            if (ImGui::SmallButton(tr("Повторить")))
+            {
+                store::clear_forum_posts(forum->id);
+                api::fetch_forum_posts(forum->id);
+            }
+            ImGui::Unindent(16.0f);
+        }
+    }
+
+    ImGui::Unindent(12.0f);
+    ImGui::EndChild();
+
+    ui_view_forum_compose();
+}
+
 // Downloads in flight, bottom right, above the message box. One line each:
 // a spinner, the name, and done-of-total for archives. Single files have a
 // total of one, so they read as a spinner plus a name until they land.
@@ -4213,6 +4651,13 @@ void ui_view_chat(float width, float height)
     {
         ImGui::SetCursorPos(ImVec2(width * 0.5f - 90.0f, height * 0.5f));
         ui_text_muted(tr("Выберите канал слева"));
+        return;
+    }
+
+    // A forum reads posts, not messages: its own view instead of the chat.
+    if (ch->type == CH_FORUM)
+    {
+        ui_view_forum(ch, width, height);
         return;
     }
 
@@ -4385,18 +4830,6 @@ void ui_view_chat(float width, float height)
         }
         ImGui::Unindent(16.0f);
     }
-    else if (!ch->history_exhausted && ch->messages.count > 0 &&
-             (g_win.pinned || !g_win.anchor || g_win.anchor == ch->messages[0].id))
-    {
-        // Offered only at the true start of what is held. Higher up there are
-        // still messages in memory, and scrolling reaches them without asking
-        // discord for anything.
-        ImGui::Dummy(ImVec2(0, 8));
-        ImGui::Indent(16.0f);
-        if (ImGui::SmallButton(tr("Загрузить более старые сообщения")))
-            api::fetch_messages(ch->id, ch->messages[0].id);
-        ImGui::Unindent(16.0f);
-    }
 
     ImGui::Indent(12.0f);
 
@@ -4411,6 +4844,7 @@ void ui_view_chat(float width, float height)
         g_win.jump_settle = 0;
         g_win.last_height = 0.0f;
         g_win.grew_upwards = false;
+        g_win.no_gaps_cut = false;
     }
 
     // A jump requested from elsewhere (pins, search): land the window on
@@ -4480,8 +4914,10 @@ void ui_view_chat(float width, float height)
     // This is what makes scrolling up work at all - the button below only
     // asks discord for messages that are not here yet. Not while a jump is
     // holding the top: that scroll is programmatic, and answering it here
-    // would eat the fresh anchor a hundred messages at a time.
-    if (!g_win.jump_hold && ImGui::GetScrollY() <= 2.0f && first > 0 && ImGui::GetScrollMaxY() > 0.0f)
+    // would eat the fresh anchor a hundred messages at a time. Nor while a
+    // "no gaps" cut holds: the anchor would creep into the hidden stretch
+    // with nothing changing on screen.
+    if (!g_win.jump_hold && !g_win.no_gaps_cut && ImGui::GetScrollY() <= 2.0f && first > 0 && ImGui::GetScrollMaxY() > 0.0f)
     {
         unsigned int step = MAX_RENDERED_MESSAGES / 3;
         first = first > step ? first - step : 0;
@@ -4507,6 +4943,51 @@ void ui_view_chat(float width, float height)
         g_win.anchor = first < total ? ch->messages[first].id : 0;
     }
 
+    // "No gaps" mode: never render across a proven hole. The window starts
+    // past the first real one, and the load-older button below offers the
+    // older side instead - the hole marker sits at the cut edge and is
+    // never drawn. A pull that bridges the hole opens it up on its own.
+    unsigned int show_from = first;
+    bool truncated = false;
+    if (ui_no_gaps_mode() && !g_win.pinned && first < total)
+    {
+        for (unsigned int i = first + 1; i < total; i++)
+        {
+            snowflake previous = ch->messages[i - 1].id;
+            snowflake cur = ch->messages[i].id;
+            if (run_covers(previous, cur)) continue;
+
+            int state = api::gap_status(ch->id, previous);
+            if (state == api::GAP_REAL) { show_from = i; truncated = true; break; }
+
+            // Not probed yet: ask once and keep rendering until the verdict
+            // lands. check_gap drops anything past three in flight, so this
+            // is one probe per frame at most.
+            if (state == api::GAP_UNKNOWN) api::check_gap(ch->id, previous, cur);
+            break;
+        }
+    }
+
+    // A bridged hole uncuts the window: the older stretch is back, and the
+    // usual upwards-growth compensation below is what keeps the reader on
+    // the message they were looking at.
+    if (g_win.no_gaps_cut && !truncated) g_win.grew_upwards = true;
+    g_win.no_gaps_cut = truncated;
+
+    // The older side, on demand. Offered at the true start of what is held,
+    // or over a cut hole in "no gaps" mode - pulling from the truncated
+    // top, never from the messages hidden above it.
+    if (!ch->history_loading && !ch->history_exhausted && ch->messages.count > 0 &&
+        (truncated || g_win.pinned || !g_win.anchor || g_win.anchor == ch->messages[0].id))
+    {
+        ImGui::Dummy(ImVec2(0, 8));
+        ImGui::Indent(16.0f);
+        if (ImGui::SmallButton(tr("Загрузить более старые сообщения")))
+            api::fetch_messages(ch->id, truncated ? ch->messages[show_from].id
+                                                 : ch->messages[0].id);
+        ImGui::Unindent(16.0f);
+    }
+
     // Every word drawn this frame is written down again from scratch: the
     // layout is what decides where they land, and it runs anew each frame.
     g_span_count = 0;
@@ -4516,12 +4997,12 @@ void ui_view_chat(float width, float height)
 
     g_win.anchor_y = 0.0f;
 
-    for (unsigned int i = first; i < ch->messages.count; i++)
+    for (unsigned int i = show_from; i < ch->messages.count; i++)
     {
         dmessage* m = &ch->messages[i];
         unsigned long long t = snowflake_time_ms(m->id);
 
-        if (i > first)
+        if (i > show_from)
         {
             snowflake previous = ch->messages[i - 1].id;
 

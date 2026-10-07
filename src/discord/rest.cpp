@@ -645,6 +645,7 @@ namespace
         snowflake channel;
         snowflake after;
         snowflake until;
+        int budget;   // max messages this pass pulls, <=0 runs to the far side
     };
 
     // ---- what has been asked about a boundary -----------------------------
@@ -663,6 +664,14 @@ namespace
     volatile long g_gap_checks = 0;
     CRITICAL_SECTION g_gap_lock;
     bool g_gap_ready = false;
+
+    // One hole fill at a time per channel (history_loading guards that), so
+    // one slot is enough for its progress: what the marker shows while the
+    // pages arrive. Written by the worker, read by the interface.
+    volatile long g_fill_active = 0;
+    snowflake g_fill_channel = 0;
+    volatile long g_fill_fetched = 0;
+    volatile long g_fill_wanted = 0;
 
     void gap_lock_ready()
     {
@@ -752,54 +761,141 @@ namespace
     {
         job_after* j = (job_after*)user;
 
-        char path[256];
-        cnprint(path, sizeof(path), "/channels/%llu/messages?limit=50&after=%llu",
-                j->channel, j->after);
+        // Discord hands over at most a hundred per request, so a hole of
+        // thousands is walked page by page: after=cursor, newest first
+        // within each page, the cursor advancing to what just arrived.
+        const int PAGE = 100;
 
-        http_response res;
-        res.init();
+        // Unbounded ("to the far side") still ends somewhere: past this many
+        // messages the hole is either bottomless or the account is being
+        // throttled, and either way the marker stays for another pass.
+        const int HARD_CAP = 10000;
 
-        if (api::call("GET", path, 0, &res) && res.ok())
+        int remaining = (j->budget > 0) ? j->budget : HARD_CAP;
+
+        // A breath between pages. Fifty back-to-back requests are exactly
+        // what earns a 429 that then applies to everything else too.
+        const unsigned int BETWEEN_PAGES_MS = 200;
+
+        InterlockedExchange(&g_fill_fetched, 0);
+        InterlockedExchange(&g_fill_wanted, (j->budget > 0) ? j->budget : 0);
+        g_fill_channel = j->channel;
+        InterlockedExchange(&g_fill_active, 1);
+
+        snowflake cursor = j->after;
+        snowflake newest = 0;
+        int fetched = 0;
+        int idle429 = 0;
+        bool reached = false;
+        bool failed = false;
+
+        while (remaining > 0 && !reached && !failed)
         {
+            int want = remaining < PAGE ? remaining : PAGE;
+
+            char path[256];
+            cnprint(path, sizeof(path), "/channels/%llu/messages?limit=%d&after=%llu",
+                    j->channel, want, cursor);
+
+            http_response res;
+            res.init();
+
+            bool ok = api::call("GET", path, 0, &res);
+
+            if (ok && res.status == 429)
+            {
+                int wait = res.retry_after_ms > 0 ? res.retry_after_ms : 1000;
+                res.free_response();
+
+                // Told to slow down: wait it out and ask for the same page
+                // again, a few times. Past that something is wrong and
+                // hammering on only makes it worse.
+                if (++idle429 > 5) { failed = true; break; }
+                Sleep((DWORD)(wait + 200));
+                continue;
+            }
+
+            if (!ok || !res.ok())
+            {
+                if (!ok || res.status != 429)
+                    record_api_error(tr("Не удалось загрузить историю"), &res);
+                res.free_response();
+                failed = true;
+                break;
+            }
+
+            idle429 = 0;
+
             jdoc doc;
             doc.init();
-            if (doc.parse(res.text(), (int)res.body.size) && doc.root->type == JTYPE_ARR)
+            bool parsed = doc.parse(res.text(), (int)res.body.size) &&
+                          doc.root->type == JTYPE_ARR;
+            unsigned int count = parsed ? doc.root->count : 0;
+
+            if (parsed && count)
             {
-                snowflake oldest = 0, newest = 0;
+                snowflake page_newest = 0;
 
                 {
                     store::guard g;
-                    for (unsigned int i = 0; i < doc.root->count; i++)
+                    for (unsigned int i = 0; i < count; i++)
                     {
                         dmessage* m = store::upsert_message(doc.root->at(i));
                         if (!m) continue;
-                        if (!oldest || m->id < oldest) oldest = m->id;
-                        if (m->id > newest) newest = m->id;
+                        if (!newest || m->id < newest) newest = m->id;
+                        if (m->id > page_newest) page_newest = m->id;
                     }
                     store::bump_revision();
                 }
 
-                for (unsigned int i = 0; i < doc.root->count; i++)
+                for (unsigned int i = 0; i < count; i++)
                     archive::put_json(doc.root->at(i));
 
-                // The run has to include the message it started from, or the
-                // stretch it closes is still recorded as two separate ones and
-                // the hole is drawn again over nothing.
-                snowflake from = j->after;
-                snowflake to = newest;
+                fetched += (int)count;
+                remaining -= (int)count;
+                cursor = page_newest;
+                InterlockedExchange(&g_fill_fetched, fetched);
 
-                // Fewer than a page means there was nothing else after the
-                // starting point, so the far side of the hole is reached too -
-                // even when it produced no messages of its own, which is what
-                // a hole over a quiet week looks like.
-                if (doc.root->count < 50 && j->until > to) to = j->until;
-
-                if (to > from) archive::note_range(j->channel, from, to);
-                else if (j->until > from) archive::note_range(j->channel, from, j->until);
+                // The far side showed up inside this page: the hole is shut.
+                if (j->until && page_newest >= j->until) reached = true;
+                // A short page means the server has nothing more after the
+                // cursor - whatever the far side held past that is gone.
+                else if ((int)count < want) reached = true;
             }
+            else if (parsed)
+            {
+                // Nothing at all after the cursor: a hole over a stretch
+                // nobody wrote in, or a far side that has since been deleted.
+                reached = true;
+            }
+            else
+            {
+                failed = true;
+            }
+
             doc.free_doc();
+            res.free_response();
+
+            if (!reached && !failed && remaining > 0) Sleep(BETWEEN_PAGES_MS);
         }
-        else record_api_error(tr("Не удалось загрузить историю"), &res);
+
+        // The run has to include the message it started from, or the
+        // stretch it closes is still recorded as two separate ones and
+        // the hole is drawn again over nothing.
+        snowflake from = j->after;
+        snowflake to = newest;
+
+        // Fewer than a page means there was nothing else after the
+        // starting point, so the far side of the hole is reached too -
+        // even when it produced no messages of its own, which is what
+        // a hole over a quiet week looks like.
+        if (reached && j->until > to) to = j->until;
+
+        if (to > from) archive::note_range(j->channel, from, to);
+        else if (!fetched && j->until > from) archive::note_range(j->channel, from, j->until);
+
+        InterlockedExchange(&g_fill_active, 0);
+        g_fill_channel = 0;
 
         {
             store::guard g;
@@ -807,7 +903,148 @@ namespace
             if (ch) ch->history_loading = false;
         }
 
-        res.free_response();
+        memfree(j);
+    }
+
+    struct job_gap_back
+    {
+        snowflake channel;
+        snowflake before;   // hole's far side: first page ends here, going down
+        snowflake stop;     // hole's near side: reaching it shuts the hole
+        int budget;
+    };
+
+    // The mirror of job_fetch_after: walks the hole backwards, page by page
+    // older than the cursor, until the near side shows up, the budget runs
+    // out, or the server runs dry. Same guards, same progress slot: one
+    // fill per channel at a time either way.
+    void job_fetch_gap_before(void* user)
+    {
+        job_gap_back* j = (job_gap_back*)user;
+
+        const int PAGE = 100;
+        const int HARD_CAP = 10000;
+        const unsigned int BETWEEN_PAGES_MS = 200;
+
+        int remaining = (j->budget > 0) ? j->budget : HARD_CAP;
+
+        InterlockedExchange(&g_fill_fetched, 0);
+        InterlockedExchange(&g_fill_wanted, (j->budget > 0) ? j->budget : 0);
+        g_fill_channel = j->channel;
+        InterlockedExchange(&g_fill_active, 1);
+
+        snowflake cursor = j->before;
+        snowflake oldest = 0;
+        int fetched = 0;
+        int idle429 = 0;
+        bool reached = false;
+        bool failed = false;
+
+        while (remaining > 0 && !reached && !failed)
+        {
+            int want = remaining < PAGE ? remaining : PAGE;
+
+            char path[256];
+            cnprint(path, sizeof(path), "/channels/%llu/messages?limit=%d&before=%llu",
+                    j->channel, want, cursor);
+
+            http_response res;
+            res.init();
+
+            bool ok = api::call("GET", path, 0, &res);
+
+            if (ok && res.status == 429)
+            {
+                int wait = res.retry_after_ms > 0 ? res.retry_after_ms : 1000;
+                res.free_response();
+
+                if (++idle429 > 5) { failed = true; break; }
+                Sleep((DWORD)(wait + 200));
+                continue;
+            }
+
+            if (!ok || !res.ok())
+            {
+                if (!ok || res.status != 429)
+                    record_api_error(tr("Не удалось загрузить историю"), &res);
+                res.free_response();
+                failed = true;
+                break;
+            }
+
+            idle429 = 0;
+
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) &&
+                          doc.root->type == JTYPE_ARR;
+            unsigned int count = parsed ? doc.root->count : 0;
+
+            if (parsed && count)
+            {
+                snowflake page_oldest = 0;
+
+                {
+                    store::guard g;
+                    for (unsigned int i = 0; i < count; i++)
+                    {
+                        dmessage* m = store::upsert_message(doc.root->at(i));
+                        if (!m) continue;
+                        if (!oldest || m->id < oldest) oldest = m->id;
+                        if (!page_oldest || m->id < page_oldest) page_oldest = m->id;
+                    }
+                    store::bump_revision();
+                }
+
+                for (unsigned int i = 0; i < count; i++)
+                    archive::put_json(doc.root->at(i));
+
+                fetched += (int)count;
+                remaining -= (int)count;
+                cursor = page_oldest;
+                InterlockedExchange(&g_fill_fetched, fetched);
+
+                // The near side showed up inside this page: the hole is shut.
+                if (j->stop && page_oldest <= j->stop) reached = true;
+                // A short page means the server has nothing older past the
+                // cursor - whatever sat between is gone with it.
+                else if ((int)count < want) reached = true;
+            }
+            else if (parsed)
+            {
+                reached = true;
+            }
+            else
+            {
+                failed = true;
+            }
+
+            doc.free_doc();
+            res.free_response();
+
+            if (!reached && !failed && remaining > 0) Sleep(BETWEEN_PAGES_MS);
+        }
+
+        // Mirror image of the forward fill: the filled run is what sits
+        // between the oldest arrival and the side the walk started from.
+        snowflake from = oldest;
+        snowflake to = j->before;
+
+        if (reached && j->stop > from) from = j->stop;
+
+        if (to > from) archive::note_range(j->channel, from, to);
+        else if (!fetched && j->stop && j->before > j->stop)
+            archive::note_range(j->channel, j->stop, j->before);
+
+        InterlockedExchange(&g_fill_active, 0);
+        g_fill_channel = 0;
+
+        {
+            store::guard g;
+            dchannel* ch = store::find_channel(j->channel);
+            if (ch) ch->history_loading = false;
+        }
+
         memfree(j);
     }
 
@@ -1533,9 +1770,286 @@ namespace
         memfree(j);
     }
 
-    void job_fetch_pins(void* user)
+    struct job_forum_list
+    {
+        snowflake forum;
+        int offset;
+    };
+
+    struct job_forum_post
+    {
+        snowflake forum;
+        char name[128];
+        char content[4096];
+        snowflake tags[12];
+        int tag_count;
+    };
+
+    // The last forum-post creation, read once by the interface. Keyed by
+    // forum because two of them can be in flight at once.
+    snowflake g_forum_post_forum = 0;
+    snowflake g_forum_post_thread = 0;
+    bool g_forum_post_have = false;
+    bool g_forum_post_ok = false;
+    char g_forum_post_error[256];
+    // A creation in flight, by forum. Separate from history_loading (which
+    // the post list uses): composing while the list loads must not wedge
+    // either of them.
+    snowflake g_forum_post_busy = 0;
+
+    void job_fetch_forum_list(void* user)
+    {
+        job_forum_list* j = (job_forum_list*)user;
+
+        snowflake guild = 0;
+        {
+            store::guard g;
+            dchannel* f = store::find_channel(j->forum);
+            if (f) guild = f->guild_id;
+        }
+
+        const int LIMIT = 25;
+        int attempt = 0;
+        bool done = false;
+
+        while (!done && attempt < 6)
+        {
+            attempt++;
+
+            char path[256];
+            if (j->offset > 0)
+                cnprint(path, sizeof(path), "/channels/%llu/threads/search?sort_by=last_message_time&sort_order=desc&limit=%d&offset=%d",
+                        j->forum, LIMIT, j->offset);
+            else
+                cnprint(path, sizeof(path), "/channels/%llu/threads/search?sort_by=last_message_time&sort_order=desc&limit=%d",
+                        j->forum, LIMIT);
+
+            http_response res;
+            res.init();
+            bool ok = api::call("GET", path, 0, &res);
+
+            if (ok && res.status == 202)
+            {
+                // The search index is still building: discord says in the
+                // body when to come back.
+                double wait = 1.0;
+                jdoc doc;
+                doc.init();
+                if (doc.parse(res.text(), (int)res.body.size))
+                    wait = doc.root->dbl("retry_after", 1.0);
+                doc.free_doc();
+                res.free_response();
+                if (wait < 1.0) wait = 1.0;
+                if (wait > 30.0) wait = 30.0;
+                log_line("forum: канал %llu, индекс не готов, повтор через %.0f с",
+                         j->forum, wait);
+                Sleep((DWORD)(wait * 1000.0));
+                continue;
+            }
+
+            if (ok && res.status == 429)
+            {
+                int wait = res.retry_after_ms > 0 ? res.retry_after_ms : 1000;
+                res.free_response();
+                log_line("forum: канал %llu, 429, пауза %d мс", j->forum, wait);
+                Sleep((DWORD)(wait + 200));
+                continue;
+            }
+
+            done = true;
+
+            if (ok && res.ok())
+            {
+                jdoc doc;
+                doc.init();
+                bool parsed = doc.parse(res.text(), (int)res.body.size) &&
+                              doc.root && doc.root->type == JTYPE_OBJ;
+                const jval* threads = parsed ? doc.root->arr("threads") : 0;
+
+                if (parsed && threads && threads->type == JTYPE_ARR)
+                {
+                    snowflake ids[32];
+                    int n = 0;
+
+                    {
+                        store::guard g;
+                        for (unsigned int i = 0; i < threads->count && n < 32; i++)
+                        {
+                            dchannel* t = store::upsert_channel(threads->at(i), guild);
+                            if (t && t->id) ids[n++] = t->id;
+                        }
+
+                        const jval* firsts = doc.root->arr("first_messages");
+                        if (firsts && firsts->type == JTYPE_ARR)
+                        {
+                            for (unsigned int i = 0; i < firsts->count; i++)
+                            {
+                                store::upsert_message(firsts->at(i));
+                                archive::put_json(firsts->at(i));
+                            }
+                        }
+                    }
+
+                    bool more = doc.root->boolean("has_more", false);
+                    store::set_forum_posts(j->forum, ids, n, more, j->offset > 0);
+                    store::bump_revision();
+                    log_line("forum: канал %llu, постов %d, has_more %d",
+                             j->forum, n, more ? 1 : 0);
+                }
+                else
+                {
+                    log_line("forum: канал %llu, ответ не разобран (http %d)",
+                             j->forum, res.status);
+                    if (j->offset == 0) store::fail_forum_posts(j->forum);
+                }
+                doc.free_doc();
+            }
+            else
+            {
+                log_line("forum: канал %llu, запрос не удался (http %d)",
+                         j->forum, res.status);
+                if (j->offset == 0) store::fail_forum_posts(j->forum);
+                record_api_error(tr("Посты форума не загрузились"), &res);
+            }
+
+            res.free_response();
+        }
+
+        {
+            store::guard g;
+            dchannel* ch = store::find_channel(j->forum);
+            if (ch) ch->history_loading = false;
+        }
+
+        memfree(j);
+    }
+
+    void job_create_forum_post(void* user)
+    {
+        job_forum_post* j = (job_forum_post*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("name", j->name);
+        w.kv_i64("auto_archive_duration", 1440);
+        w.key("applied_tags");
+        w.begin_arr();
+        for (int i = 0; i < j->tag_count; i++)
+        {
+            char id[24];
+            cnprint(id, sizeof(id), "%llu", j->tags[i]);
+            w.val_str(id);
+        }
+        w.end_arr();
+        w.key("message");
+        w.begin_obj();
+        w.kv_str("content", j->content);
+        w.end_obj();
+        w.end_obj();
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/threads?use_nested_fields=true", j->forum);
+
+        snowflake guild = 0;
+        {
+            store::guard g;
+            dchannel* f = store::find_channel(j->forum);
+            if (f) guild = f->guild_id;
+        }
+
+        http_response res;
+        res.init();
+
+        bool posted = false;
+        snowflake thread_id = 0;
+
+        if (api::call("POST", path, w.c_str(), &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) &&
+                doc.root && doc.root->type == JTYPE_OBJ)
+            {
+                const jval* t = doc.root->obj("thread");
+                if (t && t->type == JTYPE_OBJ)
+                {
+                    store::guard g;
+                    dchannel* tc = store::upsert_channel(t, guild);
+                    const jval* m = doc.root->obj("message");
+                    if (m && m->type == JTYPE_OBJ)
+                    {
+                        store::upsert_message(m);
+                        archive::put_json(m);
+                    }
+                    if (tc && tc->id)
+                    {
+                        thread_id = tc->id;
+                        store::prepend_forum_post(j->forum, thread_id);
+                        posted = true;
+                    }
+                    store::bump_revision();
+                }
+            }
+            doc.free_doc();
+
+            if (posted) log_line("forum: пост создан (%llu в %llu)", thread_id, j->forum);
+            else log_line("forum: пост не разобран (http %d)", res.status);
+        }
+
+        if (!posted)
+        {
+            // The server's own words for the dialog, when there are any.
+            char detail[256];
+            detail[0] = 0;
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                const char* m = doc.root->str("message", 0);
+                if (m) ccstrncpy(detail, m, sizeof(detail) - 1);
+            }
+            doc.free_doc();
+
+            record_api_error(tr("Пост не создан"), &res);
+            log_line("forum: пост не создан (http %d)", res.status);
+
+            if (detail[0]) ccstrncpy(g_forum_post_error, detail, sizeof(g_forum_post_error) - 1);
+            else cnprint(g_forum_post_error, sizeof(g_forum_post_error), "%s", tr("Пост не создан"));
+        }
+
+        g_forum_post_forum = j->forum;
+        g_forum_post_thread = thread_id;
+        g_forum_post_ok = posted;
+        g_forum_post_have = true;
+        g_forum_post_busy = 0;
+
+        w.free_writer();
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_join_thread(void* user)
     {
         job_ids* j = (job_ids*)user;
+
+        char path[128];
+        cnprint(path, sizeof(path), "/channels/%llu/thread-members/@me", j->a);
+
+        http_response res;
+        res.init();
+
+        // Idempotent: joining twice is fine, and reading usually works
+        // without it - this just makes sure writing does too.
+        if (!(api::call("PUT", path, 0, &res) && res.ok()))
+            log_line("thread: не вступили в %llu (http %d)", j->a, res.status);
+
+        res.free_response();
+        memfree(j);
+    }
+
+    void job_fetch_pins(void* user)
+    {        job_ids* j = (job_ids*)user;
 
         char path[128];
         cnprint(path, sizeof(path), "/channels/%llu/messages/pins?limit=25", j->a);
@@ -4812,7 +5326,8 @@ void api::check_gap(snowflake channel_id, snowflake after_id, snowflake until_id
     jobs::post(job_check_gap, j);
 }
 
-void api::fetch_messages_after(snowflake channel_id, snowflake after_id, snowflake until_id)
+void api::fetch_messages_after(snowflake channel_id, snowflake after_id, snowflake until_id,
+                               int budget)
 {
     if (!channel_id || !after_id || offline::active()) return;
 
@@ -4826,11 +5341,45 @@ void api::fetch_messages_after(snowflake channel_id, snowflake after_id, snowfla
     job_after* j = (job_after*)memalloc(sizeof(job_after));
     if (!j) return;
 
+    ccfset(j, 0, sizeof(*j));
     j->channel = channel_id;
     j->after = after_id;
     j->until = until_id;
+    j->budget = budget;
 
     jobs::post(job_fetch_after, j);
+}
+
+bool api::fill_progress(snowflake channel_id, int* fetched, int* wanted)
+{
+    if (!channel_id || !g_fill_active || g_fill_channel != channel_id) return false;
+    if (fetched) *fetched = (int)g_fill_fetched;
+    if (wanted) *wanted = (int)g_fill_wanted;
+    return true;
+}
+
+void api::fetch_gap_backward(snowflake channel_id, snowflake before_id, snowflake stop_id,
+                             int budget)
+{
+    if (!channel_id || !before_id || offline::active()) return;
+
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(channel_id);
+        if (!ch || ch->history_loading) return;
+        ch->history_loading = true;
+    }
+
+    job_gap_back* j = (job_gap_back*)memalloc(sizeof(job_gap_back));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel = channel_id;
+    j->before = before_id;
+    j->stop = stop_id;
+    j->budget = budget;
+
+    jobs::post(job_fetch_gap_before, j);
 }
 
 void api::delete_message(snowflake channel_id, snowflake message_id)
@@ -4952,6 +5501,86 @@ void api::fetch_pins(snowflake channel_id)
     if (!channel_id) return;
     job_ids* j = make_ids(channel_id, 0);
     if (j) jobs::post(job_fetch_pins, j);
+}
+
+void api::fetch_forum_posts(snowflake forum_id)
+{
+    if (!forum_id || offline::active()) return;
+
+    {
+        store::guard g;
+        dchannel* ch = store::find_channel(forum_id);
+        if (!ch || ch->history_loading) return;
+        ch->history_loading = true;
+    }
+
+    job_forum_list* j = (job_forum_list*)memalloc(sizeof(job_forum_list));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    j->forum = forum_id;
+
+    const ulist<snowflake>* have = store::forum_posts(forum_id);
+    j->offset = have ? (int)have->count : 0;
+
+    jobs::post(job_fetch_forum_list, j);
+}
+
+void api::create_forum_post(snowflake forum_id, const char* name, const char* content,
+                           const snowflake* tags, int tag_count)
+{
+    if (!forum_id || !name || !name[0] || offline::active()) return;
+    if (g_forum_post_busy) return;
+
+    {
+        store::guard g;
+        if (!store::find_channel(forum_id)) return;
+    }
+
+    job_forum_post* j = (job_forum_post*)memalloc(sizeof(job_forum_post));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    j->forum = forum_id;
+    ccstrncpy(j->name, name, sizeof(j->name) - 1);
+    if (content) ccstrncpy(j->content, content, sizeof(j->content) - 1);
+    if (tags && tag_count > 0)
+    {
+        if (tag_count > 12) tag_count = 12;
+        for (int i = 0; i < tag_count; i++) j->tags[i] = tags[i];
+        j->tag_count = tag_count;
+    }
+
+    g_forum_post_have = false;
+    g_forum_post_busy = forum_id;
+    jobs::post(job_create_forum_post, j);
+}
+
+bool api::forum_post_busy(snowflake forum_id)
+{
+    return forum_id && g_forum_post_busy == forum_id;
+}
+
+bool api::take_forum_post_result(snowflake forum_id, bool* ok, snowflake* thread_id,
+                                char* error, int error_cap)
+{
+    if (!g_forum_post_have || g_forum_post_forum != forum_id) return false;
+
+    if (ok) *ok = g_forum_post_ok;
+    if (thread_id) *thread_id = g_forum_post_thread;
+    if (error && error_cap > 0)
+    {
+        if (g_forum_post_ok) error[0] = 0;
+        else ccstrncpy(error, g_forum_post_error, error_cap - 1);
+    }
+
+    g_forum_post_have = false;
+    return true;
+}
+
+void api::join_thread(snowflake thread_id)
+{
+    if (!thread_id || offline::active()) return;
+    job_ids* j = make_ids(thread_id, 0);
+    if (j) jobs::post(job_join_thread, j);
 }
 
 void api::pin_message(snowflake channel_id, snowflake message_id)
