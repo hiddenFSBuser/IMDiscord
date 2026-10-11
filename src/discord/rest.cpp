@@ -1165,6 +1165,18 @@ namespace
         res.free_response();
     }
 
+    // Captcha-aware request helpers, defined further below beside the
+    // friend request that grew them. Declared here so the message jobs
+    // above can already retry through the browser harness.
+    bool solve_response_captcha(http_response* res, const char* action,
+                                captcha::challenge* ch, char* token_out, int token_cap,
+                                bool stash = true);
+    void build_captcha_extra(const captcha::challenge* ch, const char* token,
+                             char* extra, int extra_cap);
+    bool call_captcha_aware(const char* method, const char* path, const char* json_body,
+                            http_response* res, const char* location, const char* action,
+                            captcha::challenge* solved, bool stash = true);
+
     void job_send_message(void* user)
     {
         job_text* j = (job_text*)user;
@@ -1191,10 +1203,22 @@ namespace
         char path[128];
         cnprint(path, sizeof(path), "/channels/%llu/messages", j->channel_id);
 
+        // The first message to a stranger is the one discord answers with a
+        // captcha demand. The nonce below de-duplicates the retry, so solving
+        // it cannot post twice.
         http_response res;
         res.init();
-        if (api::call("POST", path, w.c_str(), &res) && res.ok())
+
+        captcha::challenge solved;
+        ccfset(&solved, 0, sizeof(solved));
+
+        bool sent = call_captcha_aware("POST", path, w.c_str(), &res, 0,
+                                       tr("Отправка сообщения"), &solved, false);
+        if (sent)
         {
+            if (solved.sitekey[0])
+                science::captcha_verified(solved.sitekey, solved.session);
+
             jdoc doc;
             doc.init();
             if (doc.parse(res.text(), (int)res.body.size))
@@ -1273,8 +1297,37 @@ namespace
 
         http_response res;
         res.init();
-        if (http::request("POST", url, headers.c_str(), body.data, body.size, &res) && res.ok())
+        // Files go up inside one multipart body, and a 400 on it is most
+        // often the stranger-tax captcha: the first message to someone new.
+        // The body is already built, so only the headers grow for the retry.
+        bool sent = http::request("POST", url, headers.c_str(), body.data, body.size, &res) &&
+                      res.ok();
+        captcha::challenge solved;
+        ccfset(&solved, 0, sizeof(solved));
+        if (!sent)
         {
+            char token[4096];
+            token[0] = 0;
+            if (solve_response_captcha(&res, tr("Отправка файла"), &solved,
+                                       token, sizeof(token), false))
+            {
+                char extra[4608];
+                build_captcha_extra(&solved, token, extra, sizeof(extra));
+                headers.append_str(extra);
+                ccfset(extra, 0, sizeof(extra));
+
+                res.free_response();
+                res.init();
+                sent = http::request("POST", url, headers.c_str(), body.data, body.size,
+                                      &res) && res.ok();
+                ccfset(token, 0, sizeof(token));
+            }
+        }
+        if (sent)
+        {
+            if (solved.sitekey[0])
+                science::captcha_verified(solved.sitekey, solved.session);
+
             jdoc doc;
             doc.init();
             if (doc.parse(res.text(), (int)res.body.size))
@@ -2196,63 +2249,89 @@ namespace
     // way; solved, when given, is the demand that was answered. The demand
     // is also stashed in the globals, so the manual paste fallback in the
     // friends UI still has something to show when the solve is cancelled.
+    // A 400 carrying a captcha demand, solved in the default browser.
+    // True with the demand in ch and a header-safe token in token_out.
+    // Stashes the demand in the globals too, for the manual paste fallback
+    // (friends UI) - unless the caller passes stash = false.
+    bool solve_response_captcha(http_response* res, const char* action,
+                                captcha::challenge* ch, char* token_out, int token_cap,
+                                bool stash)
+    {
+        if (!res || res->status != 400 || !ch || !token_out || token_cap <= 0)
+            return false;
+
+        jdoc doc;
+        doc.init();
+        bool demanded = doc.parse(res->text(), (int)res->body.size) &&
+                        captcha::parse_demand(doc.root, ch);
+        doc.free_doc();
+        if (!demanded) return false;
+
+        if (stash)
+        {
+        ccfset(g_captcha_sitekey, 0, sizeof(g_captcha_sitekey));
+        ccfset(g_captcha_rqtoken, 0, sizeof(g_captcha_rqtoken));
+        ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
+        ccstrncpy(g_captcha_sitekey, ch->sitekey, sizeof(g_captcha_sitekey) - 1);
+        ccstrncpy(g_captcha_rqtoken, ch->rqtoken, sizeof(g_captcha_rqtoken) - 1);
+        ccstrncpy(g_captcha_session, ch->session, sizeof(g_captcha_session) - 1);
+
+        }
+        log_line("captcha: %s, demand (%s)", action ? action : "?", ch->sitekey);
+
+        token_out[0] = 0;
+        if (!captcha::solve_blocking(ch, action, token_out, token_cap))
+            return false;
+
+        // The token rides a header line: anything with a line break in it is
+        // refused rather than sent.
+        for (const char* p = token_out; *p; p++)
+        {
+            if (*p == '\r' || *p == '\n')
+            {
+                ccfset(token_out, 0, token_cap);
+                return false;
+            }
+        }
+        return token_out[0] != 0;
+    }
+
+    void build_captcha_extra(const captcha::challenge* ch, const char* token,
+                             char* extra, int extra_cap)
+    {
+        // What the browser sends on a solved login: the key, the rqtoken
+        // the demand carried, and the session it belongs to. Absent parts
+        // are left out rather than sent empty.
+        if (ch->rqtoken[0] && ch->session[0])
+            cnprint(extra, extra_cap, "X-Captcha-Key: %s\r\nX-Captcha-Rqtoken: %s\r\n"
+                                      "X-Captcha-Session-Id: %s\r\n",
+                    token, ch->rqtoken, ch->session);
+        else if (ch->rqtoken[0])
+            cnprint(extra, extra_cap, "X-Captcha-Key: %s\r\nX-Captcha-Rqtoken: %s\r\n",
+                    token, ch->rqtoken);
+        else if (ch->session[0])
+            cnprint(extra, extra_cap, "X-Captcha-Key: %s\r\nX-Captcha-Session-Id: %s\r\n",
+                    token, ch->session);
+        else
+            cnprint(extra, extra_cap, "X-Captcha-Key: %s\r\n", token);
+    }
+
     bool call_captcha_aware(const char* method, const char* path, const char* json_body,
                             http_response* res, const char* location, const char* action,
-                            captcha::challenge* solved)
+                            captcha::challenge* solved, bool stash)
     {
         if (api::call(method, path, json_body, res, location) && res->ok())
             return true;
         if (res->status != 400) return false;
 
-        jdoc doc;
-        doc.init();
         captcha::challenge ch;
-        bool demanded = doc.parse(res->text(), (int)res->body.size) &&
-                        captcha::parse_demand(doc.root, &ch);
-        doc.free_doc();
-        if (!demanded) return false;
-
-        ccfset(g_captcha_sitekey, 0, sizeof(g_captcha_sitekey));
-        ccfset(g_captcha_rqtoken, 0, sizeof(g_captcha_rqtoken));
-        ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
-        ccstrncpy(g_captcha_sitekey, ch.sitekey, sizeof(g_captcha_sitekey) - 1);
-        ccstrncpy(g_captcha_rqtoken, ch.rqtoken, sizeof(g_captcha_rqtoken) - 1);
-        ccstrncpy(g_captcha_session, ch.session, sizeof(g_captcha_session) - 1);
-
-        log_line("captcha: %s, demand (%s)", action ? action : "?", ch.sitekey);
-
+        ccfset(&ch, 0, sizeof(ch));
         char token[4096];
-        token[0] = 0;
-        if (!captcha::solve_blocking(&ch, action, token, sizeof(token)))
+        if (!solve_response_captcha(res, action, &ch, token, sizeof(token), stash))
             return false;
 
-        // The token rides a header line: anything with a line break in it is
-        // refused rather than sent.
-        for (const char* p = token; *p; p++)
-        {
-            if (*p == '\r' || *p == '\n')
-            {
-                ccfset(token, 0, sizeof(token));
-                return false;
-            }
-        }
-
         char extra[4608];
-        // What the browser sends on a solved login: the key, the rqtoken
-        // the demand carried, and the session it belongs to. Absent parts
-        // are left out rather than sent empty.
-        if (ch.rqtoken[0] && ch.session[0])
-            cnprint(extra, sizeof(extra), "X-Captcha-Key: %s\r\nX-Captcha-Rqtoken: %s\r\n"
-                                          "X-Captcha-Session-Id: %s\r\n",
-                    token, ch.rqtoken, ch.session);
-        else if (ch.rqtoken[0])
-            cnprint(extra, sizeof(extra), "X-Captcha-Key: %s\r\nX-Captcha-Rqtoken: %s\r\n",
-                    token, ch.rqtoken);
-        else if (ch.session[0])
-            cnprint(extra, sizeof(extra), "X-Captcha-Key: %s\r\nX-Captcha-Session-Id: %s\r\n",
-                    token, ch.session);
-        else
-            cnprint(extra, sizeof(extra), "X-Captcha-Key: %s\r\n", token);
+        build_captcha_extra(&ch, token, extra, sizeof(extra));
 
         res->free_response();
         res->init();
@@ -5300,6 +5379,10 @@ void api::ack_message(snowflake channel_id, snowflake message_id)
 
 void api::trigger_typing(snowflake channel_id)
 {
+    // Anonymous typing: with it on, nothing is ever sent, so nobody sees
+    // the other side writing. Incoming indicators are untouched.
+    if (storage::settings_get_int("anonymous_typing", 0) != 0) return;
+
     job_ids* j = make_ids(channel_id, 0);
     if (j) jobs::post(job_typing, j);
 }
@@ -5549,6 +5632,7 @@ namespace
     {
         char login[128];
         char password[256];
+        bool undelete;
     };
 
     struct job_login_code
@@ -5599,12 +5683,15 @@ namespace
     void login_outcome_fail(const char* error)
     {
         g_login_outcome_have = true;
+        store::bump_revision();
         g_login_outcome.ok = false;
         g_login_outcome.need_mfa = false;
         g_login_outcome.need_email_check = false;
+        g_login_outcome.need_undelete = false;
         g_login_outcome.token[0] = 0;
         ccstrncpy(g_login_outcome.error, error ? error : "",
                   sizeof(g_login_outcome.error) - 1);
+        store::bump_revision();
     }
 
     // First code out of errors.<field>._errors[0].code, or null.
@@ -5630,13 +5717,31 @@ namespace
             return;
         }
 
+        // Scheduled for deletion: a top-level code, no errors object. The
+        // same request with undelete cancels it.
+        if (root && root->i64("code", 0) == 20011)
+        {
+            g_login_outcome_have = true;
+            store::bump_revision();
+            g_login_outcome.ok = false;
+            g_login_outcome.need_mfa = false;
+            g_login_outcome.need_email_check = false;
+            g_login_outcome.need_undelete = true;
+            g_login_outcome.token[0] = 0;
+            ccstrncpy(g_login_outcome.error, tr("Аккаунт запланирован к удалению"),
+                      sizeof(g_login_outcome.error) - 1);
+            return;
+        }
+
         const char* code = login_form_code(root, "login");
         if (code && ccscmp(code, "ACCOUNT_LOGIN_VERIFICATION_EMAIL") == 0)
         {
             g_login_outcome_have = true;
+            store::bump_revision();
             g_login_outcome.ok = false;
             g_login_outcome.need_mfa = false;
             g_login_outcome.need_email_check = true;
+            g_login_outcome.need_undelete = false;
             g_login_outcome.token[0] = 0;
             ccstrncpy(g_login_outcome.error, tr("Новое место входа: проверь почту и повтори"),
                       sizeof(g_login_outcome.error) - 1);
@@ -5670,7 +5775,9 @@ namespace
         w.begin_obj();
         w.kv_str("login", j->login);
         w.kv_str("password", j->password);
-        w.kv_bool("undelete", false);
+        w.kv_bool("undelete", j->undelete);
+        w.kv_null("login_source");
+        w.kv_null("gift_code_sku_id");
         w.end_obj();
 
         ccfset(g_login_ticket, 0, sizeof(g_login_ticket));
@@ -5695,9 +5802,11 @@ namespace
                 if (token && token[0])
                 {
                     g_login_outcome_have = true;
+                    store::bump_revision();
                     g_login_outcome.ok = true;
                     g_login_outcome.need_mfa = false;
                     g_login_outcome.need_email_check = false;
+                    g_login_outcome.need_undelete = false;
                     ccstrncpy(g_login_outcome.token, token, sizeof(g_login_outcome.token) - 1);
                     g_login_outcome.error[0] = 0;
                     log_line("login: токен получен");
@@ -5711,9 +5820,11 @@ namespace
                     g_login_backup = doc.root->boolean("backup", false);
 
                     g_login_outcome_have = true;
+                    store::bump_revision();
                     g_login_outcome.ok = false;
                     g_login_outcome.need_mfa = g_login_ticket[0] != 0;
                     g_login_outcome.need_email_check = false;
+                    g_login_outcome.need_undelete = false;
                     g_login_outcome.token[0] = 0;
                     if (!g_login_outcome.need_mfa)
                         ccstrncpy(g_login_outcome.error, tr("Двухфакторка без кода из письма"),
@@ -5787,9 +5898,11 @@ namespace
             if (token && token[0])
             {
                 g_login_outcome_have = true;
+                store::bump_revision();
                 g_login_outcome.ok = true;
                 g_login_outcome.need_mfa = false;
                 g_login_outcome.need_email_check = false;
+                g_login_outcome.need_undelete = false;
                 ccstrncpy(g_login_outcome.token, token, sizeof(g_login_outcome.token) - 1);
                 g_login_outcome.error[0] = 0;
                 ccfset(g_login_ticket, 0, sizeof(g_login_ticket));
@@ -5847,6 +5960,7 @@ namespace
                                0, tr("Двухфакторка"), 0) && res.ok())
         {
             g_sms_sent = true;
+            store::bump_revision();
             log_line("login: SMS-код запрошен");
         }
         else
@@ -5881,6 +5995,7 @@ namespace
                 method = doc.root->str("method", 0);
 
             g_forgot_outcome.have = true;
+            store::bump_revision();
             g_forgot_outcome.ok = true;
             if (method && method[0])
                 ccstrncpy(g_forgot_outcome.text, method, sizeof(g_forgot_outcome.text) - 1);
@@ -5894,6 +6009,7 @@ namespace
             jdoc doc;
             doc.init();
             g_forgot_outcome.have = true;
+            store::bump_revision();
             g_forgot_outcome.ok = false;
             if (doc.parse(res.text(), (int)res.body.size) && doc.root)
             {
@@ -5942,6 +6058,7 @@ namespace
                 token = doc.root->str("token", 0);
 
             g_password_outcome.have = true;
+            store::bump_revision();
             if (token && token[0])
             {
                 g_password_outcome.ok = true;
@@ -5964,6 +6081,7 @@ namespace
             jdoc doc;
             doc.init();
             g_password_outcome.have = true;
+            store::bump_revision();
             g_password_outcome.ok = false;
             g_password_outcome.token[0] = 0;
 
@@ -6027,7 +6145,7 @@ void api::clear_captcha()
     ccfset(g_captcha_session, 0, sizeof(g_captcha_session));
 }
 
-void api::login_password(const char* login, const char* password)
+void api::login_password(const char* login, const char* password, bool undelete)
 {
     if (offline::active())
     {
@@ -6048,6 +6166,7 @@ void api::login_password(const char* login, const char* password)
     ccfset(j, 0, sizeof(*j));
     ccstrncpy(j->login, login, sizeof(j->login) - 1);
     ccstrncpy(j->password, password, sizeof(j->password) - 1);
+    j->undelete = undelete;
 
     jobs::post(job_login_password, j);
 }
@@ -6113,6 +6232,7 @@ void api::login_forgot(const char* login)
     if (offline::active())
     {
         g_forgot_outcome.have = true;
+        store::bump_revision();
         g_forgot_outcome.ok = false;
         ccstrncpy(g_forgot_outcome.text, tr("Нет соединения с discord.com"),
                   sizeof(g_forgot_outcome.text) - 1);
@@ -6144,6 +6264,7 @@ void api::change_password(const char* old_password, const char* new_password)
     if (offline::active())
     {
         g_password_outcome.have = true;
+        store::bump_revision();
         g_password_outcome.ok = false;
         g_password_outcome.token[0] = 0;
         ccstrncpy(g_password_outcome.error, tr("Нет соединения с discord.com"),
@@ -6175,12 +6296,823 @@ bool api::take_password_result(bool* ok, char* token_out, int token_cap,
     return true;
 }
 
+
 void api::accept_friend_request(snowflake user_id, bool confirm)
 {
     job_ids* j = make_ids(user_id, confirm ? 1 : 0);
     if (j) jobs::post(job_simple_put_relationship, j);
 }
 
+namespace
+{
+    struct op_slot
+    {
+        bool have;
+        bool ok;
+        char error[256];
+    };
+
+    void op_fail(op_slot* slot, const char* error)
+    {
+        slot->have = true;
+        slot->ok = false;
+        ccstrncpy(slot->error, error ? error : "", sizeof(slot->error) - 1);
+        // Outcomes are consumed by polling: without this the frame that
+        // would pick one up never comes, and the spinner waits forever.
+        store::bump_revision();
+    }
+
+    void op_done(op_slot* slot)
+    {
+        slot->have = true;
+        slot->ok = true;
+        slot->error[0] = 0;
+        store::bump_revision();
+    }
+
+    bool op_take(op_slot* slot, bool* ok, char* error, int error_cap)
+    {
+        if (!slot->have) return false;
+        if (ok) *ok = slot->ok;
+        if (error && error_cap > 0)
+            ccstrncpy(error, slot->error, error_cap - 1);
+        slot->have = false;
+        return true;
+    }
+
+    // Server detail or a fallback, for small flows that only show text.
+    void op_fail_detail(op_slot* slot, const jval* root, const char* fallback)
+    {
+        const char* detail = (root && root->type == JTYPE_OBJ) ? root->str("message", 0) : 0;
+        if (detail && detail[0]) op_fail(slot, detail);
+        else op_fail(slot, fallback);
+    }
+
+    op_slot g_email_code;
+    op_slot g_email_verify;
+    op_slot g_email_apply;
+    op_slot g_profile_outcome;
+    op_slot g_account_outcome;
+    op_slot g_delete_outcome;
+
+    struct username_slot
+    {
+        bool have;
+        bool taken;
+        char error[128];
+    };
+    username_slot g_username_check;
+
+    // The token step 2 returns: step 3 carries it, nothing else does.
+    char g_email_token[2048];
+
+    struct avatar_entry
+    {
+        char id[32];
+        char hash[64];
+        char desc[128];
+    };
+    avatar_entry g_avatar_list[24];
+    int g_avatar_count = 0;
+    volatile long g_avatars_busy = 0;
+    bool g_avatars_failed = false;
+
+    struct job_email_code
+    {
+        char code[16];
+    };
+
+    struct job_email_run
+    {
+        char email[128];
+        char password[256];
+    };
+
+    struct job_profile_text
+    {
+        char bio[512];
+        bool has_bio;
+        char pronouns[64];
+        bool has_pronouns;
+    };
+
+    struct job_account_display
+    {
+        char name[64];
+        bool has_name;
+        // Exactly one of these: a data:image/...;base64 upload, or a
+        // history id to restore.
+        char* avatar_data;
+        char avatar_id[32];
+    };
+
+    struct job_username_new
+    {
+        char username[64];
+        char password[256];
+    };
+
+    struct job_username_ask
+    {
+        char username[64];
+    };
+
+    struct job_delete_args
+    {
+        char password[256];
+    };
+
+    void refresh_self(const jval* root)
+    {
+        if (!root || root->type != JTYPE_OBJ) return;
+        store::guard g;
+        store::upsert_user(root);
+        store::bump_revision();
+    }
+
+    void job_email_send_code(void* user)
+    {
+        (void)user;
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PUT", "/users/@me/email", 0, &res,
+                               0, tr("Смена почты"), 0) && res.ok())
+        {
+            op_done(&g_email_code);
+            log_line("email: код запрошен");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_email_code, doc.root, tr("Не удалось запросить код"));
+            else
+                op_fail(&g_email_code, tr("Не удалось запросить код"));
+            doc.free_doc();
+        }
+
+        res.free_response();
+    }
+
+    void job_email_verify_code(void* user)
+    {
+        job_email_code* j = (job_email_code*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("code", j->code);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/users/@me/email/verify-code", w.c_str(),
+                               &res, 0, tr("Смена почты"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* token = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                token = doc.root->str("token", 0);
+
+            if (token && token[0])
+            {
+                ccstrncpy(g_email_token, token, sizeof(g_email_token) - 1);
+                op_done(&g_email_verify);
+                log_line("email: код принят");
+            }
+            else
+            {
+                op_fail(&g_email_verify, tr("Неожиданный ответ сервера"));
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                const char* code = login_form_code(doc.root, "code");
+                if (code && ccscmp(code, "CODE_INVALID") == 0)
+                    op_fail(&g_email_verify, tr("Неверный код, попробуй ещё"));
+                else if (code && ccscmp(code, "BASE_TYPE_MAX_LENGTH") == 0)
+                    op_fail(&g_email_verify, tr("Код — не больше 6 символов"));
+                else
+                    op_fail_detail(&g_email_verify, doc.root, tr("Код не принят"));
+            }
+            else
+            {
+                op_fail(&g_email_verify, tr("Код не принят"));
+            }
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_email_apply(void* user)
+    {
+        job_email_run* j = (job_email_run*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("email", j->email);
+        w.kv_str("email_token", g_email_token);
+        w.kv_str("password", j->password);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/@me", w.c_str(), &res,
+                               0, tr("Смена почты"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                refresh_self(doc.root);
+            doc.free_doc();
+
+            ccfset(g_email_token, 0, sizeof(g_email_token));
+            op_done(&g_email_apply);
+            log_line("email: смена подтверждена, ждёт письма на новую почту");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_email_apply, doc.root, tr("Почта не сменена"));
+            else
+                op_fail(&g_email_apply, tr("Почта не сменена"));
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_profile_patch(void* user)
+    {
+        job_profile_text* j = (job_profile_text*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        if (j->has_bio) w.kv_str("bio", j->bio);
+        if (j->has_pronouns) w.kv_str("pronouns", j->pronouns);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/%40me/profile", w.c_str(), &res,
+                               0, tr("Смена профиля"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                // The answer is shaped like the profile, not like a user:
+                // fold what it says into the owner's object by hand.
+                const char* bio = doc.root->str("bio", 0);
+                const char* pronouns = doc.root->str("pronouns", 0);
+                if (bio || pronouns)
+                {
+                    store::guard g;
+                    duser* me = store::self();
+                    if (me)
+                    {
+                        if (bio) me->bio = store::intern(bio);
+                        if (pronouns) me->pronouns = store::intern(pronouns);
+                    }
+                    store::bump_revision();
+                }
+            }
+            doc.free_doc();
+
+            op_done(&g_profile_outcome);
+            log_line("profile: описание/местоимения сохранены");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_profile_outcome, doc.root, tr("Профиль не сохранён"));
+            else
+                op_fail(&g_profile_outcome, tr("Профиль не сохранён"));
+            doc.free_doc();
+
+            record_api_error(tr("Смена профиля"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_update_account_display(void* user)
+    {
+        job_account_display* j = (job_account_display*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        if (j->has_name) w.kv_str("global_name", j->name);
+        if (j->avatar_data) w.kv_str("avatar", j->avatar_data);
+        else if (j->avatar_id[0]) w.kv_str("avatar_id", j->avatar_id);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/@me", w.c_str(), &res,
+                               0, tr("Смена профиля"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                refresh_self(doc.root);
+            doc.free_doc();
+
+            op_done(&g_account_outcome);
+            log_line("profile: ник/аватарка сохранены");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_account_outcome, doc.root, tr("Ник/аватарка не сохранены"));
+            else
+                op_fail(&g_account_outcome, tr("Ник/аватарка не сохранены"));
+            doc.free_doc();
+
+            record_api_error(tr("Смена ника/аватарки"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        if (j->avatar_data) memfree(j->avatar_data);
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_username_probe(void* user)
+    {
+        job_username_ask* j = (job_username_ask*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("username", j->username);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/users/@me/pomelo-attempt", w.c_str(),
+                               &res, 0, tr("Проверка юзернейма"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            g_username_check.have = true;
+            store::bump_revision();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                g_username_check.taken = doc.root->boolean("taken", false);
+                g_username_check.error[0] = 0;
+            }
+            else
+            {
+                g_username_check.taken = false;
+                ccstrncpy(g_username_check.error, tr("Неожиданный ответ сервера"),
+                          sizeof(g_username_check.error) - 1);
+            }
+            doc.free_doc();
+        }
+        else
+        {
+            g_username_check.have = true;
+            store::bump_revision();
+            g_username_check.taken = false;
+            ccstrncpy(g_username_check.error, tr("Не удалось проверить юзернейм"),
+                      sizeof(g_username_check.error) - 1);
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_username_set(void* user)
+    {
+        job_username_new* j = (job_username_new*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("username", j->username);
+        w.kv_str("password", j->password);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("PATCH", "/users/@me", w.c_str(), &res,
+                               0, tr("Смена юзернейма"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                refresh_self(doc.root);
+            doc.free_doc();
+
+            op_done(&g_account_outcome);
+            log_line("profile: юзернейм сменён");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                op_fail_detail(&g_account_outcome, doc.root, tr("Юзернейм не сменён"));
+            else
+                op_fail(&g_account_outcome, tr("Юзернейм не сменён"));
+            doc.free_doc();
+
+            record_api_error(tr("Смена юзернейма"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_delete_account(void* user)
+    {
+        job_delete_args* j = (job_delete_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("password", j->password);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        // One request, no confirmation round-trip: 204 with an empty body
+        // means the account is gone and the token died with it.
+        if (call_captcha_aware("POST", "/users/@me/delete", w.c_str(), &res,
+                               0, tr("Удаление аккаунта"), 0) && res.ok())
+        {
+            op_done(&g_delete_outcome);
+            log_line("account: удалён");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool mapped = false;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+            {
+                // Wrong password comes back as a bare code, no errors object.
+                long long code = doc.root->i64("code", 0);
+                if (code == 50018)
+                {
+                    op_fail(&g_delete_outcome, tr("Пароль неверный"));
+                    mapped = true;
+                }
+                else
+                {
+                    op_fail_detail(&g_delete_outcome, doc.root, tr("Аккаунт не удалён"));
+                    mapped = true;
+                }
+            }
+            if (!mapped)
+                op_fail(&g_delete_outcome, tr("Аккаунт не удалён"));
+            doc.free_doc();
+
+            record_api_error(tr("Удаление аккаунта"), &res);
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_fetch_avatars(void* user)
+    {
+        (void)user;
+
+        http_response res;
+        res.init();
+
+        if (api::call("GET", "/users/@me/avatars", 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            g_avatar_count = 0;
+            g_avatars_failed = false;
+
+            bool parsed = doc.parse(res.text(), (int)res.body.size) &&
+                          doc.root && doc.root->type == JTYPE_OBJ;
+            const jval* list = parsed ? doc.root->arr("avatars") : 0;
+            if (parsed && list && list->type == JTYPE_ARR)
+            {
+                for (unsigned int i = 0; i < list->count && g_avatar_count < 24; i++)
+                {
+                    const jval* a = list->at(i);
+                    avatar_entry* e = &g_avatar_list[g_avatar_count];
+
+                    const char* id = a->str("id", 0);
+                    const char* hash = a->str("storage_hash", 0);
+                    const char* desc = a->str("description", 0);
+                    if (!id || !id[0] || !hash || !hash[0]) continue;
+
+                    ccstrncpy(e->id, id, sizeof(e->id) - 1);
+                    ccstrncpy(e->hash, hash, sizeof(e->hash) - 1);
+                    if (desc) ccstrncpy(e->desc, desc, sizeof(e->desc) - 1);
+                    else e->desc[0] = 0;
+                    g_avatar_count++;
+                }
+            }
+            else
+            {
+                g_avatars_failed = true;
+            }
+            doc.free_doc();
+            log_line("profile: история аватарок, %d", g_avatar_count);
+        }
+        else
+        {
+            g_avatars_failed = true;
+        }
+
+        res.free_response();
+        InterlockedExchange(&g_avatars_busy, 0);
+        store::bump_revision();
+    }
+}
+
+void api::email_send_code()
+{
+    if (offline::active())
+    {
+        op_fail(&g_email_code, tr("Нет соединения с discord.com"));
+        return;
+    }
+    jobs::post(job_email_send_code, 0);
+}
+
+bool api::take_email_code_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_email_code, ok, error, error_cap);
+}
+
+void api::email_verify_code(const char* code)
+{
+    if (offline::active())
+    {
+        op_fail(&g_email_verify, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!code || !code[0]) return;
+
+    job_email_code* j = (job_email_code*)memalloc(sizeof(job_email_code));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->code, code, sizeof(j->code) - 1);
+
+    g_email_verify.have = false;
+    jobs::post(job_email_verify_code, j);
+}
+
+bool api::take_email_verify_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_email_verify, ok, error, error_cap);
+}
+
+void api::email_apply(const char* new_email, const char* password)
+{
+    if (offline::active())
+    {
+        op_fail(&g_email_apply, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!new_email || !new_email[0] || !password || !password[0]) return;
+    if (!g_email_token[0])
+    {
+        op_fail(&g_email_apply, tr("Сначала подтверди код"));
+        return;
+    }
+
+    job_email_run* j = (job_email_run*)memalloc(sizeof(job_email_run));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->email, new_email, sizeof(j->email) - 1);
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+
+    g_email_apply.have = false;
+    jobs::post(job_email_apply, j);
+}
+
+bool api::take_email_apply_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_email_apply, ok, error, error_cap);
+}
+
+void api::fetch_avatars()
+{
+    if (offline::active()) return;
+    if (InterlockedCompareExchange(&g_avatars_busy, 1, 0) != 0) return;
+    g_avatars_failed = false;
+    jobs::post(job_fetch_avatars, 0);
+}
+
+int api::avatar_history(avatar_item* out, int cap)
+{
+    if (!out || cap <= 0) return 0;
+    int n = g_avatar_count < cap ? g_avatar_count : cap;
+    for (int i = 0; i < n; i++)
+    {
+        ccstrncpy(out[i].id, g_avatar_list[i].id, sizeof(out[i].id) - 1);
+        ccstrncpy(out[i].hash, g_avatar_list[i].hash, sizeof(out[i].hash) - 1);
+        ccstrncpy(out[i].desc, g_avatar_list[i].desc, sizeof(out[i].desc) - 1);
+    }
+    return n;
+}
+
+bool api::avatars_loading()
+{
+    return InterlockedCompareExchange(&g_avatars_busy, 0, 0) != 0;
+}
+
+bool api::avatars_failed()
+{
+    return g_avatars_failed && g_avatar_count == 0;
+}
+
+void api::check_username(const char* name)
+{
+    if (offline::active()) return;
+    if (!name || !name[0]) return;
+
+    job_username_ask* j = (job_username_ask*)memalloc(sizeof(job_username_ask));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->username, name, sizeof(j->username) - 1);
+
+    g_username_check.have = false;
+    jobs::post(job_username_probe, j);
+}
+
+bool api::take_username_check(username_check* out)
+{
+    if (!g_username_check.have || !out) return false;
+    out->have = true;
+    out->taken = g_username_check.taken;
+    ccstrncpy(out->error, g_username_check.error, sizeof(out->error) - 1);
+    g_username_check.have = false;
+    return true;
+}
+
+void api::update_profile(const char* bio, const char* pronouns)
+{
+    if (offline::active())
+    {
+        op_fail(&g_profile_outcome, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!bio && !pronouns) return;
+
+    job_profile_text* j = (job_profile_text*)memalloc(sizeof(job_profile_text));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    if (bio)
+    {
+        ccstrncpy(j->bio, bio, sizeof(j->bio) - 1);
+        j->has_bio = true;
+    }
+    if (pronouns)
+    {
+        ccstrncpy(j->pronouns, pronouns, sizeof(j->pronouns) - 1);
+        j->has_pronouns = true;
+    }
+
+    g_profile_outcome.have = false;
+    jobs::post(job_profile_patch, j);
+}
+
+bool api::take_profile_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_profile_outcome, ok, error, error_cap);
+}
+
+void api::update_account_display(const char* global_name, const char* avatar_datauri,
+                                 const char* avatar_id)
+{
+    if (offline::active())
+    {
+        op_fail(&g_account_outcome, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if ((!global_name || !global_name[0]) && (!avatar_datauri || !avatar_datauri[0]) &&
+        (!avatar_id || !avatar_id[0])) return;
+    if (avatar_datauri && avatar_datauri[0] && avatar_id && avatar_id[0]) return;
+
+    job_account_display* j = (job_account_display*)memalloc(sizeof(job_account_display));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    if (global_name && global_name[0])
+    {
+        ccstrncpy(j->name, global_name, sizeof(j->name) - 1);
+        j->has_name = true;
+    }
+    if (avatar_datauri && avatar_datauri[0])
+    {
+        unsigned int len = (unsigned int)ccslenf(avatar_datauri);
+        j->avatar_data = (char*)memalloc((int)len + 1);
+        if (!j->avatar_data)
+        {
+            op_fail(&g_account_outcome, tr("Не хватило памяти"));
+            memfree(j);
+            return;
+        }
+        ccpy(j->avatar_data, avatar_datauri, len + 1);
+    }
+    else if (avatar_id && avatar_id[0])
+    {
+        ccstrncpy(j->avatar_id, avatar_id, sizeof(j->avatar_id) - 1);
+    }
+
+    g_account_outcome.have = false;
+    jobs::post(job_update_account_display, j);
+}
+
+void api::update_account_username(const char* username, const char* password)
+{
+    if (offline::active())
+    {
+        op_fail(&g_account_outcome, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!username || !username[0] || !password || !password[0]) return;
+
+    job_username_new* j = (job_username_new*)memalloc(sizeof(job_username_new));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->username, username, sizeof(j->username) - 1);
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+
+    g_account_outcome.have = false;
+    jobs::post(job_username_set, j);
+}
+
+bool api::take_account_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_account_outcome, ok, error, error_cap);
+}
+
+void api::delete_account(const char* password)
+{
+    if (offline::active())
+    {
+        op_fail(&g_delete_outcome, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!password || !password[0]) return;
+
+    job_delete_args* j = (job_delete_args*)memalloc(sizeof(job_delete_args));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+
+    g_delete_outcome.have = false;
+    jobs::post(job_delete_account, j);
+}
+
+bool api::take_delete_account_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_delete_outcome, ok, error, error_cap);
+}
 void api::group_add_members(snowflake channel_id, const snowflake* user_ids, int count)
 {
     if (!channel_id || !user_ids || count <= 0) return;

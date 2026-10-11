@@ -208,12 +208,46 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS* info)
              (unsigned int)info->ExceptionRecord->ExceptionCode, pc,
              pc >= base ? pc - base : 0);
 
+    // Which module the faulting instruction lives in. An exe-relative
+    // offset resolves through bin\IMDiscord_new.map; anything else names
+    // its DLL outright.
+    {
+        HMODULE mod = 0;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)pc, &mod) && mod)
+        {
+            wchar_t name[MAX_PATH];
+            name[0] = 0;
+            GetModuleFileNameW(mod, name, MAX_PATH);
+            char narrow[MAX_PATH];
+            narrow[0] = 0;
+            WideCharToMultiByte(CP_UTF8, 0, name, -1, narrow, MAX_PATH, 0, 0);
+            narrow[MAX_PATH - 1] = 0;
+            log_line("    module %s base+0x%llX",
+                     narrow, pc - (unsigned __int64)mod);
+        }
+    }
+
     if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
         info->ExceptionRecord->NumberParameters >= 2)
     {
         log_line("    %s at 0x%llX",
                  info->ExceptionRecord->ExceptionInformation[0] ? "write" : "read",
                  (unsigned __int64)info->ExceptionRecord->ExceptionInformation[1]);
+    }
+
+    // Return addresses, exe-relative where they land in the image (small
+    // numbers) — those resolve through the .map file to functions.
+    {
+        void* frames[24];
+        unsigned short n = CaptureStackBackTrace(0, 24, frames, 0);
+        for (unsigned short i = 0; i < n; i++)
+        {
+            unsigned __int64 a = (unsigned __int64)frames[i];
+            log_line("    #%d 0x%llX (image+0x%llX)", (int)i, a,
+                     a >= base ? a - base : 0);
+        }
     }
 
     log_shutdown();

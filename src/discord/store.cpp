@@ -225,6 +225,7 @@ duser* store::upsert_user(const jval* v)
     if (v->has("avatar")) u->avatar = dup_field(v, "avatar");
     if (v->has("banner")) u->banner = dup_field(v, "banner");
     if (v->has("bio")) u->bio = dup_field(v, "bio");
+    if (v->has("pronouns")) u->pronouns = dup_field(v, "pronouns");
     if (v->has("accent_color")) u->accent_color = (unsigned int)v->i64("accent_color", 0);
     if (v->has("public_flags")) u->public_flags = v->i32("public_flags", 0);
     if (v->has("premium_type")) u->premium_type = v->i32("premium_type", 0);

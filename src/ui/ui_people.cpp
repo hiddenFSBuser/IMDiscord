@@ -1727,90 +1727,27 @@ void ui_view_profile_popup()
     int rel = store::relationship_type(u->id);
     bool is_self = (u->id == store::self_id());
 
-    // Editing, but only ever of one's own profile. The fields open filled with
-    // what is there now, so a change is an edit rather than a retype.
+    // Editing, but only ever of one's own profile. Everything is staged
+    // locally in the editor window; the requests only go out on Apply.
     if (is_self)
     {
-        static bool editing = false;
-        static snowflake editing_who = 0;
-        static char edit_name[128];
-        static char edit_bio[1024];
+        if (ImGui::Button(tr("Изменить профиль"), ImVec2(-1, 30)))
+            ui_open_profile_editor();
 
-        if (editing && editing_who != u->id) editing = false;
+        if (offline::active())
+            ui_text_muted(tr("Пока нет связи, изменения не уйдут"));
 
-        if (!editing)
+        ImGui::Dummy(ImVec2(0, 6));
+        ui_text_muted(tr("Баннер заменяется сразу, отдельно от профиля"));
+
+        if (ImGui::Button(tr("Баннер..."), ImVec2(160, 26)))
         {
-            if (ImGui::Button(tr("Изменить профиль"), ImVec2(-1, 30)))
-            {
-                editing = true;
-                editing_who = u->id;
-
-                ccfset(edit_name, 0, sizeof(edit_name));
-                ccfset(edit_bio, 0, sizeof(edit_bio));
-                ccstrncpy(edit_name, u->display_name(), sizeof(edit_name) - 1);
-                if (u->bio) ccstrncpy(edit_bio, u->bio, sizeof(edit_bio) - 1);
-            }
-
-            if (offline::active())
-                ui_text_muted(tr("Пока нет связи, изменения не уйдут"));
+            wchar_t chosen[MAX_PATH];
+            if (ufile::open_dialog(chosen, MAX_PATH))
+                api::update_self_image(true, chosen);
         }
-        else
-        {
-            ImGui::Separator();
-            ImGui::Dummy(ImVec2(0, 4));
-
-            ui_text_muted(tr("Отображаемое имя"));
-            ImGui::SetNextItemWidth(-1);
-            ImGui::InputText("##editname", edit_name, sizeof(edit_name));
-
-            ui_text_muted(tr("О себе"));
-            ImGui::InputTextMultiline("##editbio", edit_bio, sizeof(edit_bio),
-                                      ImVec2(-1, 90));
-
-            ImGui::Dummy(ImVec2(0, 4));
-
-            bool blocked = offline::active();
-            if (blocked) ui_text_muted(tr("Нет связи — сохранить нельзя"));
-
-            if (!blocked && ImGui::Button(tr("Сохранить"), ImVec2(160, 30)))
-            {
-                // The name is only sent when it actually changed: discord
-                // rejects a display name equal to the username, and sending
-                // the same value back is exactly how that happens by accident.
-                const char* current = u->display_name();
-                bool name_changed = ccscmp(edit_name, current) != 0;
-
-                api::update_self_profile(name_changed ? edit_name : 0, edit_bio);
-                editing = false;
-            }
-
-            if (!blocked) ImGui::SameLine();
-            if (ImGui::Button(tr("Отмена"), ImVec2(160, 30))) editing = false;
-
-            if (!blocked)
-            {
-                ImGui::Dummy(ImVec2(0, 6));
-                ui_text_muted(tr("Картинки заменяются сразу, отдельно от имени"));
-
-                if (ImGui::Button(tr("Аватарка..."), ImVec2(160, 26)))
-                {
-                    wchar_t chosen[MAX_PATH];
-                    if (ufile::open_dialog(chosen, MAX_PATH))
-                        api::update_self_image(false, chosen);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button(tr("Баннер..."), ImVec2(160, 26)))
-                {
-                    wchar_t chosen[MAX_PATH];
-                    if (ufile::open_dialog(chosen, MAX_PATH))
-                        api::update_self_image(true, chosen);
-                }
-
-                if (ImGui::SmallButton(tr("убрать аватарку"))) api::update_self_image(false, 0);
-                ImGui::SameLine();
-                if (ImGui::SmallButton(tr("убрать баннер"))) api::update_self_image(true, 0);
-            }
-        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("убрать баннер"))) api::update_self_image(true, 0);
 
         ImGui::Dummy(ImVec2(0, 6));
     }

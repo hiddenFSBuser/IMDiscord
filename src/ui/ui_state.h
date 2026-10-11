@@ -143,6 +143,11 @@ struct ui_state
     snowflake friend_accept_id;
     bool open_friend_accept_popup;
 
+    // Deleting the account outlives the settings popup it starts from: the
+    // outcome is consumed at the top of the frame, whatever is open.
+    bool delete_account_busy;
+    char delete_account_error[256];
+
     // The share setup box, which doubles as the censor picker while a stream
     // is already running.
     bool open_share_popup;
@@ -363,6 +368,9 @@ void ui_view_rename_popup();
 void ui_view_onboarding_popup();
 void ui_view_token_popup();
 void ui_open_token(int account_index);
+void ui_open_profile_editor();
+void ui_view_profile_editor();
+void ui_view_avatar_crop();
 // Re-signs in as the current account under a fresh token (password change
 // rotates it). Keeps voice, like an account switch without switching.
 void ui_relogin_with(const char* token);
@@ -435,6 +443,9 @@ float ui_voice_panel_height();
 
 void ui_view_voice_panel(float width);
 void ui_view_settings_popup();
+// Wipes the delete-account confirmation (armed flag + password) after the
+// account is gone, so the form never reopens stale under another account.
+void ui_reset_delete_account_form();
 // The remembered sign-ins: switch between them, add one, forget one.
 void ui_view_accounts_popup();
 // The bar that says the client is running on what it saved, and why. Tall

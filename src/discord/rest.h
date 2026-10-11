@@ -227,8 +227,10 @@ namespace api
     // Step 1: mail/phone + password. The outcome is picked up once with
     // take_login_result: ok carries a token for begin_login, need_mfa opens
     // step 2, need_email_check means a verification mail went out and the
-    // login has to be repeated after it. Captcha demands open the harness.
-    void login_password(const char* login, const char* password);
+    // login has to be repeated after it, need_undelete means the account is
+    // scheduled for deletion and the same call with undelete Cancels that.
+    // Captcha demands open the harness.
+    void login_password(const char* login, const char* password, bool undelete = false);
     struct login_mfa_methods
     {
         bool totp;
@@ -248,6 +250,7 @@ namespace api
         bool ok;
         bool need_mfa;
         bool need_email_check;
+        bool need_undelete;
         char token[512];
         char error[256];
     };
@@ -264,6 +267,58 @@ namespace api
     void change_password(const char* old_password, const char* new_password);
     bool take_password_result(bool* ok, char* token_out, int token_cap,
                               char* error, int error_cap);
+    // Deletes the signed-in account for good. Password-confirmed, one
+    // request: 204 with an empty body. The token dies with it, so a success
+    // means forgetting the account and signing out.
+    void delete_account(const char* password);
+    bool take_delete_account_result(bool* ok, char* error, int error_cap);
+
+    // ---- email change ----
+    // Step 1: asks for the code (PUT, no body - it goes to the current
+    // address). Step 2 verifies it and stashes the email token. Step 3
+    // applies the new address with the current password; the change then
+    // waits on the link in the mail to the NEW address (out of scope).
+    void email_send_code();
+    bool take_email_code_result(bool* ok, char* error, int error_cap);
+    void email_verify_code(const char* code);
+    bool take_email_verify_result(bool* ok, char* error, int error_cap);
+    void email_apply(const char* new_email, const char* password);
+    bool take_email_apply_result(bool* ok, char* error, int error_cap);
+
+    // ---- profile ----
+    struct avatar_item
+    {
+        char id[32];      // history id: PATCH {"avatar_id": id} restores it
+        char hash[64];    // storage_hash: shown as cdn avatars/<self>/<hash>
+        char desc[128];
+    };
+    // Last avatar uploads, newest first. Empty until fetched.
+    void fetch_avatars();
+    int avatar_history(avatar_item* out, int cap);
+    bool avatars_loading();
+    bool avatars_failed();
+    // True when name is already taken. False also covers "free" and
+    // "no answer yet" - take_username_check tells them apart.
+    void check_username(const char* name);
+    struct username_check
+    {
+        bool have;
+        bool taken;
+        char error[128];
+    };
+    bool take_username_check(username_check* out);
+    // Bio and pronouns in one PATCH to users/%40me/profile. Null skips.
+    void update_profile(const char* bio, const char* pronouns);
+    bool take_profile_result(bool* ok, char* error, int error_cap);
+    // Display name and/or avatar in one PATCH to users/@me. avatar_datauri
+    // is a data:image/...;base64 upload, avatar_id restores a history id;
+    // passing both is refused client-side. Null/empty skips.
+    void update_account_display(const char* global_name, const char* avatar_datauri,
+                                const char* avatar_id);
+    // Username with the current password, its own PATCH. Token does not
+    // rotate on any of these; the returned user object refreshes the store.
+    void update_account_username(const char* username, const char* password);
+    bool take_account_result(bool* ok, char* error, int error_cap);
 
     // What the last refusal asked for. Empty when nothing is pending.
     // The identifiers this run of the client reports in its properties.

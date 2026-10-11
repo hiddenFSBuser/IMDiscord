@@ -66,6 +66,7 @@ struct duser
     const char* avatar;         // hash, may be null
     const char* banner;
     const char* bio;
+    const char* pronouns;
     unsigned int accent_color;
     int public_flags;
     int premium_type;

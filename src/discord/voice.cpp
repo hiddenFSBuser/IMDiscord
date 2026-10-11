@@ -29,8 +29,10 @@
 #include "dave/tls_codec.h"
 #include "system/io/ufile.h"
 #include <timeapi.h>
+#include <avrt.h>
 
 #pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "avrt.lib")
 
 // Voice gateway v8 + RTP over UDP.
 //
@@ -166,6 +168,13 @@ namespace
         // this speaker silent - a short pause once beats a hole in every
         // other device buffer, which is what jitter turns into without it.
         bool dry;
+
+        // The last buffer handed to the device ended mid-fade (a partial fill
+        // whose tail was ramped to silence). The next buffer must fade back in
+        // even when no cushion hold follows - otherwise a full-amplitude start
+        // right after a faded tail is a step, which is heard as a click.
+        // Set on every partial fill, consumed (cleared) by the next mix.
+        bool fade_next;
 
         // Only opened when IMD_AUDIODUMP is set.
         wavdump::sink dump;
@@ -2272,9 +2281,12 @@ namespace
 
             // Resuming at full amplitude mid-waveform is the same click as
             // cutting to silence was, so both edges of a dry spell are slid
-            // over a couple of milliseconds.
+            // over a couple of milliseconds. A partial fill's faded tail
+            // needs the same treatment on the way back in even when no hold
+            // follows (see fade_next below).
             const int EDGE = 192;   // 2 ms, stereo
-            bool fading_in = s->dry;
+            bool fading_in = s->dry || s->fade_next;
+            s->fade_next = false;
             s->dry = false;
 
             int n = avail < samples ? avail : samples;
@@ -2305,7 +2317,16 @@ namespace
             }
             s->read_pos = pos;
             s->volume_now = vol_to;
-            if (n < samples) s->dry = true;     // ran dry mid-buffer: refill first
+            // A short buffer leaves a faded tail behind (see the ramp above)
+            // and asks the next buffer to fade back in - but it does NOT
+            // re-arm the 60 ms hold. Requiring a full cushion after every
+            // short buffer turned a single late packet into a self-sustaining
+            // play/mute oscillation: play one device buffer, sit out three
+            // frames, play one again - heard as every second 20 ms frame
+            // missing. The hold stays for true starvation only (avail == 0,
+            // handled at the top); a partial gap is exactly as long as the
+            // audio that was actually missing, no longer.
+            if (n < samples) s->fade_next = true;
         }
         LeaveCriticalSection(&g_speakers_lock);
     }
@@ -2830,6 +2851,17 @@ namespace
         CoInitializeEx(0, COINIT_MULTITHREADED);
         timeBeginPeriod(1);
 
+        // The capture and render threads already run under MMCSS "Pro Audio":
+        // a scheduling stall on either is a hole in the audio. This thread is
+        // on the same critical path - one tick owes one 20 ms microphone frame
+        // and one drain of the receive socket - but ran at a normal priority,
+        // so any busy spell in the process pre-empted it into 30-40 ms ticks.
+        // At that pace the sender emits ~33 frames/s instead of 50 and the far
+        // side hears every second 20 ms frame missing, in episodes, exactly
+        // the reported lag. Same MMCSS class as capture/render.
+        DWORD mmcss_task = 0;
+        HANDLE mmcss = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcss_task);
+
         LARGE_INTEGER freq, start;
         QueryPerformanceFrequency(&freq);
         QueryPerformanceCounter(&start);
@@ -2905,8 +2937,25 @@ namespace
                 QueryPerformanceCounter(&start);
                 ticks_done = 0;
             }
+            else if (remain_ms < -25)
+            {
+                // Moderately late (one to a few frames): the capture ring kept
+                // being fed by the device clock while this tick stalled, so
+                // there is a backlog waiting (trim_capture keeps up to four
+                // frames). Sending the usual single frame per tick from here
+                // runs the sender at a fraction of real time until the backlog
+                // happens to drain - the far side keeps hearing every second
+                // 20 ms frame missing for the whole episode. Drain it now:
+                // up to two extra microphone frames back to back. Each extra
+                // pump advances seq/timestamp by exactly one frame, so the
+                // stream stays continuous; VAD/speaking state carries across
+                // the calls. Capped at two so a single tick cannot spiral.
+                pump_outgoing();
+                if (remain_ms < -60) pump_outgoing();
+            }
         }
 
+        if (mmcss) AvRevertMmThreadCharacteristics(mmcss);
         timeEndPeriod(1);
         CoUninitialize();
         return 0;

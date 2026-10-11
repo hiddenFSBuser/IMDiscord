@@ -1042,6 +1042,7 @@ namespace
         if (u->avatar) w->kv_str("avatar", u->avatar);
         if (u->banner) w->kv_str("banner", u->banner);
         if (u->bio) w->kv_str("bio", u->bio);
+        if (u->pronouns) w->kv_str("pronouns", u->pronouns);
         if (u->accent_color) w->kv_i64("accent_color", (long long)u->accent_color);
         if (u->public_flags) w->kv_i64("public_flags", u->public_flags);
         if (u->premium_type) w->kv_i64("premium_type", u->premium_type);

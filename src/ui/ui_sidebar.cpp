@@ -1749,7 +1749,6 @@ namespace
     bool g_pw_busy = false;
     bool g_pw_ok = false;
     char g_pw_info[256];
-
     void ui_change_password_block()
     {
         bool ok = false;
@@ -1834,6 +1833,287 @@ namespace
             }
         }
     }
+
+    // ---- email change wizard ----
+    // Confirm -> code on the current address -> reason (interface only) ->
+    // new address + current password -> the link in the mail to the NEW
+    // address finishes it, out of scope here.
+    int g_em_step = 0;          // 0 confirm, 1 code, 2 reason, 3 apply, 4 done
+    bool g_em_want_open = false;
+    bool g_em_busy = false;
+    char g_em_error[256];
+    char g_em_code[16];
+    int g_em_reason = 2;
+    char g_em_new[128];
+    char g_em_pass[256];
+
+    void ui_open_email_change()
+    {
+        // Drain stale outcomes from an abandoned run, or the first frame
+        // would consume them and skip steps on its own.
+        bool drop_ok = false;
+        char drop[256];
+        drop[0] = 0;        api::take_email_code_result(&drop_ok, drop, sizeof(drop));
+        api::take_email_verify_result(&drop_ok, drop, sizeof(drop));
+        api::take_email_apply_result(&drop_ok, drop, sizeof(drop));
+
+        g_em_step = 0;
+        g_em_want_open = true;
+        g_em_busy = false;
+        g_em_error[0] = 0;
+        g_em_code[0] = 0;
+        g_em_reason = 2;
+        g_em_new[0] = 0;
+        g_em_pass[0] = 0;
+    }
+
+    // Deleting the account: a red button, then the password, then no
+    // account. The outcome is consumed at the top of the frame (it outlives
+    // this popup); here is only the busy flag and the error line.
+    bool g_del_armed = false;
+    char g_del_pass[256];
+
+    void ui_delete_account_block()
+    {
+        if (!g_del_armed)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button, col::red);
+            if (ImGui::Button(tr("Удалить аккаунт"), ImVec2(-1, 0)))
+            {
+                g_del_armed = true;
+                ccfset(g_ui.delete_account_error, 0, sizeof(g_ui.delete_account_error));
+                g_del_pass[0] = 0;
+            }
+            ImGui::PopStyleColor();
+            ui_text_muted(tr("Навсегда, без восстановления"));
+            return;
+        }
+
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+        ImGui::TextUnformatted(tr("Удаление не мгновенное: аккаунт встанет в очередь, "
+                                  "и войти в него будет нельзя. Если в течение 14 дней "
+                                  "войти обратно, удаление отменится само. Иначе аккаунт "
+                                  "исчезнет навсегда без возможности восстановления. "
+                                  "Введи пароль для подтверждения."));
+        ImGui::PopStyleColor();
+        ImGui::PopTextWrapPos();
+
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##delpass", tr("текущий пароль"),
+                                 g_del_pass, sizeof(g_del_pass),
+                                 ImGuiInputTextFlags_Password);
+
+        if (g_ui.delete_account_error[0])
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+            ImGui::TextWrapped("%s", g_ui.delete_account_error);
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::Dummy(ImVec2(0, 4));
+        if (g_ui.delete_account_busy)
+        {
+            ui_text_muted(tr("Удаляем..."));
+            return;
+        }
+
+        ImGui::PushStyleColor(ImGuiCol_Button, col::red);
+        bool go = ImGui::Button(tr("Да, удалить навсегда"), ImVec2(-1, 0));
+        ImGui::PopStyleColor();
+        if (go && g_del_pass[0])
+        {
+            g_ui.delete_account_busy = true;
+            ccfset(g_ui.delete_account_error, 0, sizeof(g_ui.delete_account_error));
+            api::delete_account(g_del_pass);
+        }
+
+        if (ImGui::SmallButton(tr("Отмена")))
+        {
+            g_del_armed = false;
+            g_del_pass[0] = 0;
+            ccfset(g_ui.delete_account_error, 0, sizeof(g_ui.delete_account_error));
+        }
+    }
+
+    void ui_view_email_popup()
+    {
+        if (g_em_want_open)
+        {
+            ImGui::OpenPopup("##emailchange");
+            g_em_want_open = false;
+        }
+
+        ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Appearing);
+        if (!ImGui::BeginPopup("##emailchange", ImGuiWindowFlags_NoResize))
+            return;
+
+        // One frame, three possible answers: the sends below each clear the
+        // busy flag when their outcome is consumed.
+        bool ok = false;
+        char err[256];
+        err[0] = 0;
+        if (api::take_email_code_result(&ok, err, sizeof(err)))
+        {
+            g_em_busy = false;
+            if (ok) { g_em_step = 1; g_em_error[0] = 0; }
+            else ccstrncpy(g_em_error, err[0] ? err : "?", sizeof(g_em_error) - 1);
+        }
+        if (api::take_email_verify_result(&ok, err, sizeof(err)))
+        {
+            g_em_busy = false;
+            if (ok) { g_em_step = 2; g_em_error[0] = 0; }
+            else ccstrncpy(g_em_error, err[0] ? err : "?", sizeof(g_em_error) - 1);
+        }
+        if (api::take_email_apply_result(&ok, err, sizeof(err)))
+        {
+            g_em_busy = false;
+            if (ok) { g_em_step = 4; g_em_error[0] = 0; }
+            else ccstrncpy(g_em_error, err[0] ? err : "?", sizeof(g_em_error) - 1);
+        }
+
+        if (g_em_step == 0)
+        {
+            ImGui::TextUnformatted(tr("Смена почты"));
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(tr("Код придёт на текущую почту. Продолжить?"));
+            ImGui::PopTextWrapPos();
+            ImGui::Dummy(ImVec2(0, 8));
+
+            if (g_em_busy)
+            {
+                ui_text_muted(tr("Отправляем..."));
+            }
+            else
+            {
+                if (ImGui::Button(tr("Да, отправить код"), ImVec2(200, 30)))
+                {
+                    g_em_busy = true;
+                    g_em_error[0] = 0;
+                    api::email_send_code();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Отмена"), ImVec2(140, 30)))
+                    ImGui::CloseCurrentPopup();
+            }
+        }
+        else if (g_em_step == 1)
+        {
+            ImGui::TextUnformatted(tr("Код из письма"));
+            ImGui::Separator();
+            ui_text_muted(tr("Шесть символов с текущей почты"));
+
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##emcode", tr("код"), g_em_code, sizeof(g_em_code));
+
+            if (g_em_error[0])
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+                ImGui::TextWrapped("%s", g_em_error);
+                ImGui::PopStyleColor();
+            }
+
+            ImGui::Dummy(ImVec2(0, 4));
+            if (g_em_busy)
+            {
+                ui_text_muted(tr("Проверяем..."));
+            }
+            else
+            {
+                if (ImGui::Button(tr("Проверить"), ImVec2(160, 30)) && g_em_code[0])
+                {
+                    g_em_busy = true;
+                    g_em_error[0] = 0;
+                    api::email_verify_code(g_em_code);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton(tr("Отправить заново")))
+                {
+                    g_em_busy = true;
+                    g_em_error[0] = 0;
+                    api::email_send_code();
+                }
+            }
+        }
+        else if (g_em_step == 2)
+        {
+            ImGui::TextUnformatted(tr("Почему меняешь почту?"));
+            ImGui::Separator();
+
+            ImGui::RadioButton(tr("Просит сотрудник Discord"), &g_em_reason, 0);
+            ImGui::RadioButton(tr("Просит кто-то другой"), &g_em_reason, 1);
+            ImGui::RadioButton(tr("Создал новую почту"), &g_em_reason, 2);
+            ImGui::RadioButton(tr("Иная причина"), &g_em_reason, 3);
+
+            ImGui::Dummy(ImVec2(0, 8));
+            if (ImGui::Button(tr("Дальше"), ImVec2(160, 30)))
+            {
+                g_em_step = 3;
+                g_em_error[0] = 0;
+            }
+        }
+        else if (g_em_step == 3)
+        {
+            ImGui::TextUnformatted(tr("Новая почта"));
+            ImGui::Separator();
+
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##emnew", tr("новая почта"),
+                                     g_em_new, sizeof(g_em_new));
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##empass", tr("текущий пароль"),
+                                     g_em_pass, sizeof(g_em_pass),
+                                     ImGuiInputTextFlags_Password);
+
+            if (g_em_error[0])
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+                ImGui::TextWrapped("%s", g_em_error);
+                ImGui::PopStyleColor();
+            }
+
+            ImGui::Dummy(ImVec2(0, 4));
+            if (g_em_busy)
+            {
+                ui_text_muted(tr("Подтверждаем..."));
+            }
+            else
+            {
+                if (ImGui::Button(tr("Подтвердить"), ImVec2(160, 30)) &&
+                    g_em_new[0] && g_em_pass[0])
+                {
+                    g_em_busy = true;
+                    g_em_error[0] = 0;
+                    api::email_apply(g_em_new, g_em_pass);
+                }
+            }
+        }
+        else
+        {
+            ImGui::TextUnformatted(tr("Почти готово"));
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(tr("Письмо улетело на новую почту. Перейди по ссылке "
+                                      "из него — только она меняет почту. Токен не меняется."));
+            ImGui::PopTextWrapPos();
+            ImGui::Dummy(ImVec2(0, 8));
+
+            if (ImGui::Button(tr("Закрыть"), ImVec2(160, 30)))
+                ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+// Wipes the delete-account confirmation after the account is gone. Defined at
+// file scope (external linkage) so ui_frame can call it; the anonymous
+// namespace's implicit using keeps the form state reachable here.
+void ui_reset_delete_account_form()
+{
+    g_del_armed = false;
+    ccfset(g_del_pass, 0, sizeof(g_del_pass));
 }
 
 void ui_view_settings_popup()
@@ -2429,6 +2709,11 @@ void ui_view_settings_popup()
             storage::settings_set_int("no_gaps_mode", nogaps ? 1 : 0);
         ui_text_muted(tr("Вид никогда не перешагивает через пропуск: выше него "
                          "ничего не грузится, только кнопка подгрузки"));
+
+        bool anon_type = storage::settings_get_int("anonymous_typing", 0) != 0;
+        if (ImGui::Checkbox(tr("Анонимный набор текста"), &anon_type))
+            storage::settings_set_int("anonymous_typing", anon_type ? 1 : 0);
+        ui_text_muted(tr("Собеседники не видят, что вы пишете. Выключено по умолчанию"));
     }
 
     ImGui::Dummy(ImVec2(0, 10));
@@ -2599,6 +2884,19 @@ void ui_view_settings_popup()
             ImGui::Separator();
 
             ui_change_password_block();
+
+            ImGui::Dummy(ImVec2(0, 10));
+            ImGui::TextUnformatted(tr("Смена почты"));
+            ImGui::Separator();
+
+            if (ImGui::Button(tr("Сменить почту"), ImVec2(-1, 0)))
+                ui_open_email_change();
+
+            ImGui::Dummy(ImVec2(0, 10));
+            ImGui::TextUnformatted(tr("Удаление аккаунта"));
+            ImGui::Separator();
+
+            ui_delete_account_block();
         }
     }
 
@@ -2773,6 +3071,8 @@ void ui_view_settings_popup()
 
     ImGui::Dummy(ImVec2(0, 4));
     if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30))) ImGui::CloseCurrentPopup();
+
+    ui_view_email_popup();
 
     ImGui::EndPopup();
 }

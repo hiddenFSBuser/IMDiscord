@@ -67,6 +67,7 @@ namespace
     bool g_forgot_ok;
     bool g_email_check;
     char g_email_text[256];
+    bool g_undelete_offer;
     bool g_sms_info_have;
     char g_sms_info[64];
 
@@ -239,7 +240,14 @@ namespace
         // it is what made the voice server hang up with 4014.
         bool call_up = keep_media && voice::state() != VOICE_IDLE;
         if (call_up) gateway::detach_for_voice();
-        else         gateway::stop();
+        else
+        {
+            // A connection held for an earlier call belongs to an account
+            // being left behind too: without this it keeps heartbeating with
+            // a dead token, dropped and redialled forever.
+            gateway::release_hold();
+            gateway::stop();
+        }
 
         if (!keep_media)
         {
@@ -2101,6 +2109,7 @@ void ui_view_login()
                 ccfset(g_cred_pass, 0, sizeof(g_cred_pass));
                 ccfset(g_cred_code, 0, sizeof(g_cred_code));
                 g_email_check = false;
+                g_undelete_offer = false;
                 begin_login(oc.token, false);
             }
             else if (oc.need_mfa)
@@ -2111,11 +2120,19 @@ void ui_view_login()
             else if (oc.need_email_check)
             {
                 g_email_check = true;
+                g_undelete_offer = false;
+                ccstrncpy(g_email_text, oc.error, sizeof(g_email_text) - 1);
+            }
+            else if (oc.need_undelete)
+            {
+                g_email_check = false;
+                g_undelete_offer = true;
                 ccstrncpy(g_email_text, oc.error, sizeof(g_email_text) - 1);
             }
             else
             {
                 g_email_check = false;
+                g_undelete_offer = false;
                 ccstrncpy(g_ui.login_error, oc.error, sizeof(g_ui.login_error) - 1);
             }
         }
@@ -2182,6 +2199,23 @@ void ui_view_login()
             ImGui::PopStyleColor();
         }
 
+        if (g_undelete_offer && !busy)
+        {
+            ImGui::Dummy(ImVec2(0, 4));
+            ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+            ImGui::TextWrapped("%s", g_email_text);
+            ImGui::PopStyleColor();
+            ImGui::Dummy(ImVec2(0, 4));
+            if (ImGui::Button(tr("Восстановить аккаунт"), ImVec2(220, 34)))
+            {
+                g_undelete_offer = false;
+                g_email_check = false;
+                InterlockedExchange(&g_ui.login_busy, 1);
+                ccfset(g_ui.login_error, 0, sizeof(g_ui.login_error));
+                api::login_password(g_cred_login, g_cred_pass, true);
+            }
+        }
+
         ImGui::Dummy(ImVec2(0, 4));
 
         if (busy)
@@ -2197,6 +2231,7 @@ void ui_view_login()
                 if (can)
                 {
                     g_email_check = false;
+                    g_undelete_offer = false;
                     g_forgot_ok = false;
                     g_forgot_info[0] = 0;
                     g_sms_info_have = false;
@@ -2430,6 +2465,8 @@ void ui_init()
     g_ui.show_friends = true;
     g_ui.proxy_editing = -1;
 
+    log_line("IMDiscord build %s %s", __DATE__, __TIME__);
+
     storage::settings_load();
     audio::set_input_gain((float)storage::settings_get_int("input_gain", 100) / 100.0f);
     audio::set_output_gain((float)storage::settings_get_int("output_gain", 100) / 100.0f);
@@ -2570,6 +2607,41 @@ void ui_frame()
         tear_down_session();
         begin_login(token, bot);
         ccfset(token, 0, sizeof(token));
+    }
+
+    // Deleting the account outlives the settings popup it starts from: the
+    // entry is forgotten and the session torn down here, whatever is open.
+    // Without this, closing the settings mid-request orphaned the outcome
+    // and left a dead token reconnecting forever. The teardown is immediate
+    // rather than deferred to the next frame: with the token dead the gateway
+    // starts its 4004 reconnect loop at once, and a whole frame of that -
+    // plus the stuck "Удаляем..." spinner behind it - is what the delay
+    // looked like.
+    {
+        bool ok = false;
+        char err[256];
+        err[0] = 0;
+        if (api::take_delete_account_result(&ok, err, sizeof(err)))
+        {
+            g_ui.delete_account_busy = false;
+            if (ok)
+            {
+                int active = storage::active_account();
+                if (active >= 0) storage::account_forget(active);
+                // The form (armed flag + password) lives in the settings
+                // popup; wipe it now so reopening settings under another
+                // account does not show a stale confirmation.
+                ui_reset_delete_account_form();
+                ccfset(g_ui.delete_account_error, 0, sizeof(g_ui.delete_account_error));
+                logout();
+            }
+            else
+            {
+                ccstrncpy(g_ui.delete_account_error,
+                          err[0] ? err : tr("Аккаунт не удалён"),
+                          sizeof(g_ui.delete_account_error) - 1);
+            }
+        }
     }
 
     // Every quarter hour the friend list, the servers and everybody's profile
@@ -2800,6 +2872,8 @@ void ui_frame()
     ui_view_search_popup();
     ui_view_media_popup();
     ui_view_captcha_popup();
+    ui_view_profile_editor();
+    ui_view_avatar_crop();
 
     // Global shortcut: logging out is always available.
     ImGuiIO& io = ImGui::GetIO();
