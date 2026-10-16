@@ -366,6 +366,10 @@ int app_main()
     wc.style = CS_CLASSDC;
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
+    // The exe icon (app.rc, IDI_APPICON 1, built from icon.png): class icons
+    // cover the title bar and Alt-Tab, WM_SETICON below covers the taskbar.
+    wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+    wc.hIconSm = LoadIconW(inst, MAKEINTRESOURCEW(1));
     wc.hCursor = LoadCursorW(0, IDC_ARROW);
     wc.lpszClassName = WINDOW_CLASS;
     RegisterClassExW(&wc);
@@ -378,6 +382,17 @@ int app_main()
     {
         UnregisterClassW(WINDOW_CLASS, inst);
         return 1;
+    }
+
+    // Belt and suspenders next to the class icons: the taskbar button takes
+    // its picture from the window, and this is the call that sets it.
+    // (Named icon_big/icon_small: plain `small` is a rpcndr.h macro.)
+    {
+        HICON icon_big = LoadIconW(inst, MAKEINTRESOURCEW(1));
+        HICON icon_small = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON,
+                                             16, 16, LR_DEFAULTCOLOR);
+        if (icon_big) SendMessageW(g_app.hwnd, WM_SETICON, ICON_BIG, (LPARAM)icon_big);
+        if (icon_small) SendMessageW(g_app.hwnd, WM_SETICON, ICON_SMALL, (LPARAM)icon_small);
     }
 
     if (!create_device(g_app.hwnd))

@@ -1,6 +1,7 @@
 #include "pch.h"
 #include <d3d11.h>
 #include "ui_state.h"
+#include "ui_wallpaper.h"
 #include "emoji.h"
 #include "video/player.h"
 #include "theme.h"
@@ -2322,6 +2323,8 @@ namespace
         {
             if (author && ImGui::MenuItem(tr("Профиль автора")))
                 ui_open_profile(author->id, m->guild_id);
+            if (author && ImGui::MenuItem(tr("Открыть аватарку")))
+                ui_open_user_avatar(author);
 
             bool mine = author && author->id == store::self_id();
             bool may_delete = mine;
@@ -3042,6 +3045,7 @@ namespace
         {
             if (ImGui::MenuItem(tr("Ответить"))) g_ui.reply_to = m->id;
             if (author && ImGui::MenuItem(tr("Профиль автора"))) ui_open_profile(author->id, m->guild_id);
+            if (author && ImGui::MenuItem(tr("Открыть аватарку"))) ui_open_user_avatar(author);
             if (m->content && ImGui::MenuItem(tr("Копировать текст"))) ImGui::SetClipboardText(m->content);
 
             if (store::is_channel_pinned(m->channel_id, m->id))
@@ -4403,7 +4407,7 @@ void ui_view_forum(dchannel* forum, float width, float height)
     char title[256];
     ui_channel_display_name(forum, title, sizeof(title));
 
-    fdl->AddRectFilled(forigin, ImVec2(forigin.x + width, forigin.y + header_h), col::bg_chat);
+    fdl->AddRectFilled(forigin, ImVec2(forigin.x + width, forigin.y + header_h), wallpaper::panel(col::bg_chat));
     fdl->AddLine(ImVec2(forigin.x, forigin.y + header_h),
                  ImVec2(forigin.x + width, forigin.y + header_h), col::separator);
 
@@ -4644,7 +4648,7 @@ void ui_view_chat(float width, float height)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetWindowPos();
-    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), col::bg_chat);
+    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), wallpaper::panel(col::bg_chat));
 
     dchannel* ch = store::find_channel(g_ui.active_channel);
     if (!ch)
@@ -4666,7 +4670,7 @@ void ui_view_chat(float width, float height)
     char title[256];
     ui_channel_display_name(ch, title, sizeof(title));
 
-    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + header_h), col::bg_chat);
+    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + header_h), wallpaper::panel(col::bg_chat));
     dl->AddLine(ImVec2(origin.x, origin.y + header_h), ImVec2(origin.x + width, origin.y + header_h), col::separator);
 
     ImGui::SetCursorPos(ImVec2(16, 13));
@@ -5294,9 +5298,16 @@ void ui_view_chat(float width, float height)
     ImGui::SameLine();
     ImGui::SetNextItemWidth(width - 60.0f);
 
+    // Wallpaper: the edit frame comes from FrameBg, not from any panel
+    // fill, so without this it sits opaque over the picture like a hole.
+    bool wp_frame = wallpaper::active();
+    if (wp_frame)
+        ImGui::PushStyleColor(ImGuiCol_FrameBg,
+                              wallpaper::tint(ImGui::GetStyleColorVec4(ImGuiCol_FrameBg)));
     ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CtrlEnterForNewLine;
     bool send = ImGui::InputTextMultiline("##input", g_ui.message_input, sizeof(g_ui.message_input),
                                           ImVec2(width - 60.0f, 32.0f), flags);
+    if (wp_frame) ImGui::PopStyleColor();
 
     bool input_active = ImGui::IsItemActive() || ImGui::IsItemFocused();
 

@@ -258,6 +258,9 @@ void ui_set_embed_direct_gifs(bool on);
 
 // ---- shared drawing helpers ----
 void ui_avatar(const duser* u, float size, bool show_status = false);
+// Opens the user's avatar at full size in the image viewer. Null-safe, so
+// context menus can call it on whatever user pointer they have.
+void ui_open_user_avatar(const duser* u);
 void ui_guild_bubble(const dguild* g, float size, bool active);
 void ui_text_muted(const char* text);
 bool ui_icon_button(const char* label, const ImVec2& size, ImU32 bg, ImU32 bg_hover);

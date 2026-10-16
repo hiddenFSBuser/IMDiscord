@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "ui_state.h"
+#include "ui_wallpaper.h"
 #include "discord/warmup.h"
 #include "theme.h"
 #include "textures.h"
@@ -468,6 +469,8 @@ namespace
 
         if (ImGui::MenuItem(tr("Профиль"))) ui_open_profile(u->id, guild_id);
 
+        if (ImGui::MenuItem(tr("Открыть аватарку"))) ui_open_user_avatar(u);
+
         // Turning our own playback down would silence the room, not us, and
         // muting ourselves already has its own button.
         if (!self)
@@ -773,6 +776,7 @@ namespace
             if (peer)
             {
                 if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(peer->id, 0);
+                if (ImGui::MenuItem(tr("Открыть аватарку"))) ui_open_user_avatar(peer);
             }
             else if (c->recipients.count && ImGui::BeginMenu(tr("Открыть профиль")))
             {
@@ -920,6 +924,8 @@ namespace
 
                     if (ImGui::MenuItem(tr("Профиль"))) ui_open_profile(u->id, 0);
 
+                    if (ImGui::MenuItem(tr("Открыть аватарку"))) ui_open_user_avatar(u);
+
                     if (!self)
                     {
                         bool muted = voice::user_muted(u->id);
@@ -1064,7 +1070,7 @@ void ui_view_channel_list(float width, float height)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetWindowPos();
-    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), col::bg_panel);
+    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), wallpaper::panel(col::bg_panel));
 
     ImGui::BeginChild("##listscroll", ImVec2(width, height), false);
     ImGui::Dummy(ImVec2(0, 6));
@@ -1523,17 +1529,33 @@ void ui_view_channel_list(float width, float height)
 float ui_voice_panel_height()
 {
     bool in_voice = voice::state() == VOICE_CONNECTED || voice::state() == VOICE_CONNECTING;
-    if (in_voice) return USER_ROW_HEIGHT + VOICE_ROW_HEIGHT;
-
+    float h = USER_ROW_HEIGHT;
+    if (in_voice) h += VOICE_ROW_HEIGHT;
     // Room for the one line explaining why the last call ended.
-    if (voice::last_stop_reason()[0]) return USER_ROW_HEIGHT + STOPPED_ROW_HEIGHT;
-    return USER_ROW_HEIGHT;
+    else if (voice::last_stop_reason()[0]) h += STOPPED_ROW_HEIGHT;
+    // The unproxied-media band draws inside this panel too; without room
+    // reserved for it the user row slides down past the block and leaves
+    // raw wallpaper showing as a bright slit.
+    if (in_voice && voice::media_unproxied()) h += 16.0f;
+    return h;
 }
 
 void ui_view_voice_panel(float width)
 {
+    // The block this panel owns, from the window geometry rather than the
+    // cursor: a few stray pixels of cursor drift between the channel list
+    // and this panel used to leave raw wallpaper showing as a bright slit
+    // right above the account row. Sealed first, rows drawn on top.
+    float reserved = ui_voice_panel_height();
+    ImVec2 wpos = ImGui::GetWindowPos();
+    ImVec2 wsize = ImGui::GetWindowSize();
+    ImVec2 top(wpos.x, wpos.y + wsize.y - reserved);
+    ImGui::SetCursorScreenPos(top);
+
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2 p = ImGui::GetCursorScreenPos();
+    dl->AddRectFilled(top, ImVec2(top.x + width, top.y + reserved),
+                      wallpaper::panel(col::bg_deep));
+    ImVec2 p = top;
 
     bool in_voice = voice::state() == VOICE_CONNECTED || voice::state() == VOICE_CONNECTING;
 
@@ -1541,7 +1563,7 @@ void ui_view_voice_panel(float width)
     // inside the panel instead of being clipped by the window edge.
     if (in_voice)
     {
-        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + VOICE_ROW_HEIGHT), col::bg_deep);
+        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + VOICE_ROW_HEIGHT), wallpaper::panel(col::bg_deep));
         dl->AddLine(ImVec2(p.x + 8.0f, p.y + VOICE_ROW_HEIGHT),
                     ImVec2(p.x + width - 8.0f, p.y + VOICE_ROW_HEIGHT), col::separator);
 
@@ -1659,7 +1681,7 @@ void ui_view_voice_panel(float width)
     {
         const float BAND = 16.0f;
 
-        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + BAND), col::bg_deep);
+        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + BAND), wallpaper::panel(col::bg_deep));
         dl->PushClipRect(p, ImVec2(p.x + width - 8.0f, p.y + BAND), true);
         dl->AddText(ImVec2(p.x + 10.0f, p.y + 1.0f), col::red, tr("голос идёт мимо прокси"));
         dl->PopClipRect();
@@ -1676,7 +1698,7 @@ void ui_view_voice_panel(float width)
     // of the channel list and the profile row at the same time.
     if (!in_voice && voice::last_stop_reason()[0])
     {
-        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + STOPPED_ROW_HEIGHT), col::bg_deep);
+        dl->AddRectFilled(p, ImVec2(p.x + width, p.y + STOPPED_ROW_HEIGHT), wallpaper::panel(col::bg_deep));
 
         char first[96];
         char second[96];
@@ -1696,7 +1718,7 @@ void ui_view_voice_panel(float width)
     }
 
     float h = USER_ROW_HEIGHT;
-    dl->AddRectFilled(p, ImVec2(p.x + width, p.y + h), col::bg_deep);
+    dl->AddRectFilled(p, ImVec2(p.x + width, p.y + h), wallpaper::panel(col::bg_deep));
 
     duser* me = store::self();
 
@@ -1891,11 +1913,13 @@ namespace
 
         ImGui::PushTextWrapPos(0.0f);
         ImGui::PushStyleColor(ImGuiCol_Text, col::red);
-        ImGui::TextUnformatted(tr("Удаление не мгновенное: аккаунт встанет в очередь, "
-                                  "и войти в него будет нельзя. Если в течение 14 дней "
-                                  "войти обратно, удаление отменится само. Иначе аккаунт "
-                                  "исчезнет навсегда без возможности восстановления. "
-                                  "Введи пароль для подтверждения."));
+        ImGui::TextUnformatted(tr("Удаление не мгновенное: аккаунт сразу отключается "
+                                   "и встаёт в очередь на удаление. В течение 14 дней "
+                                   "его можно восстановить — достаточно войти в него "
+                                   "снова, и удаление отменится. Если за 14 дней не войти, "
+                                   "аккаунт и все его данные будут удалены навсегда "
+                                   "без возможности восстановления. "
+                                   "Введи пароль для подтверждения."));
         ImGui::PopStyleColor();
         ImGui::PopTextWrapPos();
 
@@ -2224,6 +2248,10 @@ void ui_view_settings_popup()
         ImGui::Dummy(ImVec2(0, 6));
         if (ImGui::Button(tr("Сбросить оформление"), ImVec2(220, 28))) theme::reset();
     }
+
+    ImGui::Dummy(ImVec2(0, 10));
+
+    ui_wallpaper_settings();
 
     ImGui::Dummy(ImVec2(0, 10));
 

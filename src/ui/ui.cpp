@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "ui.h"
 #include "ui_state.h"
+#include "ui_wallpaper.h"
 #include "theme.h"
 #include "textures.h"
 
@@ -836,6 +837,22 @@ void ui_avatar(const duser* u, float size, bool show_status)
     }
 
     ImGui::Dummy(ImVec2(size, size));
+}
+
+void ui_open_user_avatar(const duser* u)
+{
+    if (!u) return;
+
+    // 4096 is as large as the cdn goes, and it hands back whatever the
+    // original was if it is smaller. Same target as the avatar in the
+    // profile card, so a context menu and a click show the same picture.
+    char full[320];
+    cdn::user_avatar(u, 4096, full, sizeof(full));
+
+    char name[160];
+    cnprint(name, sizeof(name), "%s-avatar.png",
+            u->username ? u->username : "user");
+    ui_open_image_viewer(full, name);
 }
 
 void ui_guild_bubble(const dguild* g, float size, bool active)
@@ -1953,6 +1970,9 @@ void ui_view_login()
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImVec2 center(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.5f);
 
+    // Wallpaper behind the sign-in box, on the background layer.
+    wallpaper::draw_background(vp->WorkPos, vp->WorkSize);
+
     // The window grows to fit however many accounts are remembered, so signing
     // back in as one of them is a click rather than another paste.
     int remembered = storage::accounts_count();
@@ -2732,6 +2752,14 @@ void ui_frame()
     float total_w = vp->WorkSize.x;
     float total_h = vp->WorkSize.y - banner_h;
 
+    // Wallpaper first: the children below go translucent while it is on,
+    // so the picture reads through the panels instead of behind a wall.
+    wallpaper::draw_under(ImVec2(vp->WorkPos.x, vp->WorkPos.y + banner_h),
+                          ImVec2(total_w, total_h));
+    bool wp_clear = wallpaper::active();
+    if (wp_clear)
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0, 0, 0, 0));
+
     bool show_members = g_ui.active_guild != 0 && total_w > 900.0f;
     float members_w = show_members ? MEMBERS_WIDTH : 0.0f;
     float chat_w = total_w - RAIL_WIDTH - LIST_WIDTH - members_w;
@@ -2783,6 +2811,8 @@ void ui_frame()
         ui_view_members(members_w, total_h);
         ImGui::EndChild();
     }
+
+    if (wp_clear) ImGui::PopStyleColor();
 
     ImGui::End();
     ImGui::PopStyleColor();
@@ -2874,6 +2904,7 @@ void ui_frame()
     ui_view_captcha_popup();
     ui_view_profile_editor();
     ui_view_avatar_crop();
+    ui_view_wallpaper_crop();
 
     // Global shortcut: logging out is always available.
     ImGuiIO& io = ImGui::GetIO();

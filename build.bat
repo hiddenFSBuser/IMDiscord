@@ -140,6 +140,7 @@ echo "%OBJ%\miniz_tdef.obj">> "%RSP%"
 echo "%OBJ%\miniz_tinfl.obj">> "%RSP%"
 echo "%OBJ%\miniz_zip.obj">> "%RSP%"
 echo "%OBJ%\customcrt_mathalias.obj">> "%RSP%"
+echo "%OBJ%\app.res">> "%RSP%"
 set /a INDEX=0
 
 for /r "%SRC%" %%F in (*.cpp) do (
@@ -219,6 +220,14 @@ for /r "%OPUSSRC%" %%F in (*.c) do (
         echo "!O!">> "%RSP%"
     )
 )
+
+rem ---- app icon -------------------------------------------------------------
+rem icon.png in the root is the source; app.ico (32/64/128, PNG-embedded,
+rem made by tools/make_ico.py) is what ships. A resource has no CRT in it,
+rem so this changes nothing about the NoCRT story.
+echo [build] app.rc
+rc /nologo /fo "%OBJ%\app.res" "%ROOT%app.rc"
+if errorlevel 1 goto :fail
 
 rem ---- link -----------------------------------------------------------------
 echo [build] linking

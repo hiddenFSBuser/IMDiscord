@@ -309,6 +309,7 @@
     <ClCompile Include="src\ui\ui_moderate.cpp" />
     <ClCompile Include="src\ui\ui_people.cpp" />
     <ClCompile Include="src\ui\ui_sidebar.cpp" />
+    <ClCompile Include="src\ui\ui_wallpaper.cpp" />
   </ItemGroup>
 
   <ItemGroup>
@@ -462,10 +463,12 @@
     <ClInclude Include="src\video\streampreview.h" />
     <ClInclude Include="src\ui\ui.h" />
     <ClInclude Include="src\ui\ui_state.h" />
+    <ClInclude Include="src\ui\ui_wallpaper.h" />
   </ItemGroup>
 
   <ItemGroup>
     <None Include="build.bat" />
+    <ResourceCompile Include="app.rc" />
   </ItemGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

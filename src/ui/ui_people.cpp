@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "ui_state.h"
+#include "ui_wallpaper.h"
 #include "discord/people.h"
 #include "emoji.h"
 #include "textures.h"
@@ -73,6 +74,7 @@ namespace
         if (ImGui::BeginPopupContextItem("##relctx"))
         {
             if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, 0);
+            if (ImGui::MenuItem(tr("Открыть аватарку"))) ui_open_user_avatar(u);
 
             // Only into a conversation that already exists. Making one just
             // to drop a link into it would open a window this person never
@@ -185,7 +187,9 @@ void ui_view_friends(float width, float height)
 
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetWindowPos();
-    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), col::bg_chat);
+    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), wallpaper::panel(col::bg_chat));
+
+    ImGui::SetCursorPos(ImVec2(16, 12));
 
     ImGui::SetCursorPos(ImVec2(16, 12));
     ImGui::PushFont(g_app.font_bold);
@@ -564,6 +568,7 @@ static void draw_group_members(dchannel* c, float width)
             if (ImGui::BeginPopupContextItem("##gmctx"))
             {
                 if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, 0);
+                if (ImGui::MenuItem(tr("Открыть аватарку"))) ui_open_user_avatar(u);
                 ui_invite_to_server_menu(c->id);
 
                 // The owner runs the group: removing members and handing the
@@ -651,7 +656,7 @@ void ui_view_members(float width, float height)
 {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     ImVec2 origin = ImGui::GetWindowPos();
-    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), col::bg_panel);
+    dl->AddRectFilled(origin, ImVec2(origin.x + width, origin.y + height), wallpaper::panel(col::bg_panel));
 
     dguild* g = store::find_guild(g_ui.active_guild);
     if (!g)
@@ -808,6 +813,7 @@ void ui_view_members(float width, float height)
         if (ImGui::BeginPopupContextItem("##memctx"))
         {
             if (ImGui::MenuItem(tr("Открыть профиль"))) ui_open_profile(u->id, g->id);
+            if (ImGui::MenuItem(tr("Открыть аватарку"))) ui_open_user_avatar(u);
             ui_member_roles_menu(g->id, u->id);
             ui_member_moderation_menu(g->id, u->id);
             ImGui::Separator();
