@@ -4,6 +4,7 @@
 #include "core/log.h"
 #include "core/storage.h"
 #include "net/json.h"
+#include "net/http.h"
 #include "system/io/ufile.h"
 
 namespace
@@ -341,6 +342,136 @@ void archive::note_range(snowflake channel_id, snowflake from_id, snowflake to_i
         append(path, line, (unsigned int)n);
 }
 
+namespace
+{
+    struct load_job
+    {
+        snowflake channel_id;
+        snowflake expect_self;
+        wchar_t path[MAX_PATH];
+    };
+
+    // The body of a channel load. expect_self, when set, makes the walk give
+    // up the moment the account changes under it: a worker can outlive the
+    // user switching accounts, and another account's archive must not land in
+    // the new store.
+    int restore_file(const wchar_t* path, snowflake channel_id, snowflake expect_self)
+    {
+        unsigned long long started = GetTickCount64();
+
+        ubuffer blob;
+        blob.init();
+        if (!ufile::read_all(path, &blob)) { blob.free_buffer(); return 0; }
+
+        const char* text = (const char*)blob.c_str();
+        unsigned int size = blob.size;
+        int added = 0;
+
+        // The lines are walked oldest first, which means backwards through the
+        // file: a warm-up pages from newest to oldest, so that is the order it
+        // wrote them in.
+        //
+        // This is not cosmetic. The store keeps a channel's messages sorted by id
+        // and finds the insertion point by scanning back from the end, so feeding
+        // it newest first makes every insert walk the entire list. Four thousand
+        // messages took five seconds of frozen interface that way, and a busy
+        // channel would take a minute. Oldest first, every insert lands at the end
+        // and the file loads as fast as it parses.
+        ulist<unsigned int> starts;
+        starts = ulist<unsigned int>();
+
+        unsigned int scan = 0;
+        while (scan < size)
+        {
+            starts.push(scan);
+            while (scan < size && text[scan] != '\n') scan++;
+            scan++;
+        }
+
+        // One document for the whole file: the reuse variant keeps its arena
+        // between lines instead of allocating a fresh one per message.
+        jdoc doc;
+        doc.init();
+
+        // A bulk load touches the sidebar order once, not once per message.
+        store::batch_begin();
+
+        for (unsigned int line = starts.count; line > 0; line--)
+        {
+            if (expect_self && store::self_id() != expect_self) break;
+
+            unsigned int at = starts[line - 1];
+            unsigned int end = at;
+            while (end < size && text[end] != '\n') end++;
+
+            unsigned int len = end - at;
+            if (len > 2)
+            {
+                if (doc.parse_reuse(text + at, (int)len) && doc.r()->type == JTYPE_OBJ)
+                {
+                    const jval* v = doc.r();
+
+                    // The author travelled with the message so a name survives even
+                    // when the person has not been seen since.
+                    {
+                        store::guard guard;
+                        const jval* author = v->obj("author");
+                        if (author && author->type == JTYPE_OBJ) store::upsert_user(author);
+
+                        dmessage* m = store::upsert_message(v);
+                        if (m)
+                        {
+                            // Monotonic on purpose. The message's own line never
+                            // carries the flag, only the later deletion marker
+                            // does, and the marker is read FIRST (it sits closer
+                            // to the end of the file). A plain assignment here
+                            // let the unmarked original undo the deletion on
+                            // every restart.
+                            if (v->boolean("deleted", false)) m->deleted = true;
+                            added++;
+                        }
+                    }
+                }
+            }
+        }
+
+        store::batch_end();
+        doc.free_doc();
+
+        starts.dispose();
+        blob.free_buffer();
+
+        // Logged either way. A silent zero looks exactly like a channel that was
+        // never archived, and telling the two apart used to need a disk browser.
+        // The time is there because "slow" and "stuck" look the same outside.
+        log_line("archive: канал %llu, восстановлено %d сообщений из %u байт за %llu мс",
+                 channel_id, added, size, GetTickCount64() - started);
+        return added;
+    }
+
+    void load_channel_job(void* user)
+    {
+        load_job* jb = (load_job*)user;
+
+        int added = restore_file(jb->path, jb->channel_id, jb->expect_self);
+
+        {
+            store::guard guard;
+            if (store::self_id() == jb->expect_self)
+            {
+                dchannel* ch = store::find_channel(jb->channel_id);
+                if (ch)
+                {
+                    ch->archive_messages = added;
+                    if (added) store::bump_revision();
+                }
+            }
+        }
+
+        memfree(jb);
+    }
+}
+
 int archive::load_channel(snowflake channel_id)
 {
     if (!g_ready) return 0;
@@ -348,83 +479,34 @@ int archive::load_channel(snowflake channel_id)
     wchar_t path[MAX_PATH];
     if (!channel_path(channel_id, L".jsonl", path, MAX_PATH)) return 0;
 
-    ubuffer blob;
-    blob.init();
-    if (!ufile::read_all(path, &blob)) { blob.free_buffer(); return 0; }
+    return restore_file(path, channel_id, 0);
+}
 
-    const char* text = (const char*)blob.c_str();
-    unsigned int size = blob.size;
-    int added = 0;
+void archive::load_channel_async(snowflake channel_id)
+{
+    snowflake self = store::self_id();
+    if (!g_ready || !self) return;
 
-    // The lines are walked oldest first, which means backwards through the
-    // file: a warm-up pages from newest to oldest, so that is the order it
-    // wrote them in.
-    //
-    // This is not cosmetic. The store keeps a channel's messages sorted by id
-    // and finds the insertion point by scanning back from the end, so feeding
-    // it newest first makes every insert walk the entire list. Four thousand
-    // messages took five seconds of frozen interface that way, and a busy
-    // channel would take a minute. Oldest first, every insert lands at the end
-    // and the file loads as fast as it parses.
-    ulist<unsigned int> starts;
-    starts = ulist<unsigned int>();
+    load_job* jb = (load_job*)memallocf((int)sizeof(load_job));
+    if (!jb) return;
 
-    unsigned int scan = 0;
-    while (scan < size)
+    jb->channel_id = channel_id;
+    jb->expect_self = self;
+    jb->path[0] = 0;
+
+    // Resolved here, on the caller's thread, while the lock is held: an
+    // account switch moves the directory under the worker's feet.
+    EnterCriticalSection(&g_lock);
+    bool ok = g_ready && channel_path(channel_id, L".jsonl", jb->path, MAX_PATH);
+    LeaveCriticalSection(&g_lock);
+
+    if (!ok)
     {
-        starts.push(scan);
-        while (scan < size && text[scan] != '\n') scan++;
-        scan++;
+        memfree(jb);
+        return;
     }
 
-    for (unsigned int line = starts.count; line > 0; line--)
-    {
-        unsigned int at = starts[line - 1];
-        unsigned int end = at;
-        while (end < size && text[end] != '\n') end++;
-
-        unsigned int len = end - at;
-        if (len > 2)
-        {
-            jdoc doc;
-            doc.init();
-            if (doc.parse(text + at, (int)len) && doc.r()->type == JTYPE_OBJ)
-            {
-                const jval* v = doc.r();
-
-                // The author travelled with the message so a name survives even
-                // when the person has not been seen since.
-                {
-                    store::guard guard;
-                    const jval* author = v->obj("author");
-                    if (author && author->type == JTYPE_OBJ) store::upsert_user(author);
-
-                    dmessage* m = store::upsert_message(v);
-                    if (m)
-                    {
-                        // Monotonic on purpose. The message's own line never
-                        // carries the flag, only the later deletion marker
-                        // does, and the marker is read FIRST (it sits closer
-                        // to the end of the file). A plain assignment here
-                        // let the unmarked original undo the deletion on
-                        // every restart.
-                        if (v->boolean("deleted", false)) m->deleted = true;
-                        added++;
-                    }
-                }
-            }
-            doc.free_doc();
-        }
-    }
-
-    starts.dispose();
-    blob.free_buffer();
-
-    // Logged either way. A silent zero looks exactly like a channel that was
-    // never archived, and telling the two apart used to need a disk browser.
-    log_line("archive: канал %llu, восстановлено %d сообщений из %u байт",
-             channel_id, added, size);
-    return added;
+    jobs::post(load_channel_job, jb);
 }
 
 unsigned int archive::channel_count(snowflake channel_id)

@@ -168,6 +168,11 @@ namespace
     bool g_group_ready = false;
     volatile long g_e2ee_ready = 0;
 
+    // The websocket thread applies commits and welcomes; the pump unwraps
+    // frames. The lock is where they meet, and the pump never touches g_group
+    // itself - it works from its own copy, taken below the lock per frame.
+    mls::group_state g_media_group;
+
     // A commit names the proposals it carries by reference, so the ones op 27
     // announced have to be kept until the commit that applies them arrives.
     mls::cached_proposal g_known[mls::MAX_MEMBERS];
@@ -203,7 +208,39 @@ namespace
     // The handshake, the heartbeat and the pump all write to the websocket, and
     // two frames interleaved on it are two frames the server cannot read.
     CRITICAL_SECTION g_send_lock;
+    // The group side of the same split: the websocket thread moves the group,
+    // the pump reads it. Grows out of the same lifetime as the two above.
+    CRITICAL_SECTION g_group_lock;
     bool g_locks_ready = false;
+
+    // One guard, with the readiness check, so a call from a path that can run
+    // before init or after shutdown does not touch a lock that is not there.
+    struct group_guard
+    {
+        group_guard()
+        {
+            held = g_locks_ready;
+            if (held) EnterCriticalSection(&g_group_lock);
+        }
+
+        ~group_guard()
+        {
+            if (held) LeaveCriticalSection(&g_group_lock);
+        }
+
+        bool held;
+    };
+
+    // Refreshes the pump's copy of the group, and says whether there is an
+    // epoch to unwrap with. Stable address on purpose: the ratchets in
+    // dave_frames are keyed by the group pointer they were made under.
+    bool take_media_group()
+    {
+        group_guard g;
+        if (!g_group_ready) return false;
+        g_media_group = g_group;
+        return true;
+    }
 
     volatile long g_last_w = 0;
     volatile long g_last_h = 0;
@@ -565,11 +602,16 @@ namespace
         for (int i = 0; i < 8; i++)
             group_id[i] = (unsigned char)(dave_id >> (56 - i * 8));
 
-        g_group_ready = mls::create_group(&g_group, group_id, 8, &g_key_package.leaf,
-                                          g_sig_private, g_key_package_private.encryption_private);
+        bool created;
+        {
+            group_guard g;
+            created = mls::create_group(&g_group, group_id, 8, &g_key_package.leaf,
+                                        g_sig_private, g_key_package_private.encryption_private);
+            g_group_ready = created;
+        }
 
         log_line("watch/dave: local group %s (id %llu)",
-                 g_group_ready ? "created" : "FAILED", dave_id);
+                 created ? "created" : "FAILED", dave_id);
     }
 
     void send_transition_response(unsigned int transition_id, bool ready)
@@ -646,13 +688,27 @@ namespace
             // media keys from an epoch the group has already left, and nothing
             // it receives will open again.
             InterlockedIncrement(&g_op_commit);
-            if (payload_len < 3 || !g_group_ready) { g_commit_error = "группа ещё не готова"; break; }
+            if (payload_len < 3) { g_commit_error = "группа ещё не готова"; break; }
 
             unsigned int transition_id = ((unsigned int)payload[0] << 8) | payload[1];
 
             const char* why = "";
-            bool applied = mls::process_commit(&g_group, payload + 2, payload_len - 2,
-                                               g_known, g_known_count, &why);
+            bool applied = false;
+
+            {
+                group_guard g;
+                if (!g_group_ready)
+                {
+                    why = "группа ещё не готова";
+                }
+                else
+                {
+                    applied = mls::process_commit(&g_group, payload + 2, payload_len - 2,
+                                                  g_known, g_known_count, &why);
+                    if (applied) g_known_count = 0;
+                }
+            }
+
             g_commit_error = applied ? "применён" : why;
             if (applied) InterlockedIncrement(&g_commits_applied);
 
@@ -664,7 +720,6 @@ namespace
             {
                 // A new epoch means a new exporter secret, so every ratchet
                 // built on the old one is worthless.
-                g_known_count = 0;
                 dave::reset_ratchets();
                 InterlockedExchange(&g_want_keyframe, 1);
             }
@@ -684,18 +739,23 @@ namespace
 
             unsigned int transition_id = ((unsigned int)payload[0] << 8) | payload[1];
 
-            g_group_ready = mls::process_welcome(&g_group, payload + 2, payload_len - 2,
-                                                 &g_key_package, &g_key_package_private,
-                                                 g_sig_private);
+            bool opened;
+            {
+                group_guard g;
+                opened = mls::process_welcome(&g_group, payload + 2, payload_len - 2,
+                                              &g_key_package, &g_key_package_private,
+                                              g_sig_private);
+                g_group_ready = opened;
+                if (opened) g_known_count = 0;
+            }
 
             dave::reset_ratchets();
-            g_known_count = 0;
-            InterlockedExchange(&g_e2ee_ready, g_group_ready ? 1 : 0);
+            InterlockedExchange(&g_e2ee_ready, opened ? 1 : 0);
 
             log_line("watch/dave: welcome %s (transition %u)",
-                     g_group_ready ? "accepted" : "REJECTED", transition_id);
+                     opened ? "accepted" : "REJECTED", transition_id);
 
-            send_transition_response(transition_id, g_group_ready);
+            send_transition_response(transition_id, opened);
 
             // The ratchets restarted, so nothing already in flight decrypts.
             InterlockedExchange(&g_want_keyframe, 1);
@@ -1083,10 +1143,10 @@ namespace
         unsigned int prot_len = dave::protected_len(media, payload_len);
         if (prot_len)
         {
-            if (!g_e2ee_ready || !g_group_ready) return;
+            if (!g_e2ee_ready || !take_media_group()) return;
 
             unsigned int out_len = 0;
-            if (!dave::decrypt_frame(&g_group, g_user_id, media, prot_len,
+            if (!dave::decrypt_frame(&g_media_group, g_user_id, media, prot_len,
                                      plain, &out_len))
                 return;
 
@@ -1135,7 +1195,27 @@ namespace
 
     // One finished access unit: unwrap the end to end protection if it is
     // there, decode, and put the picture where the UI can pick it up.
-    unsigned char g_plain[1024 * 1024];
+    //
+    // The buffer grows to fit the frame it is asked to open. The fixed
+    // megabyte this used to be doubled as a ceiling: a big keyframe protected
+    // by DAVE can cross it, and every frame past it simply failed to open.
+    unsigned char* g_plain = 0;
+    unsigned int g_plain_cap = 0;
+
+    bool ensure_plain(unsigned int need)
+    {
+        if (g_plain_cap >= need) return true;
+
+        unsigned int cap = g_plain_cap ? g_plain_cap : (1024 * 1024);
+        while (cap < need) cap *= 2;
+
+        unsigned char* p = (unsigned char*)memallocf(cap);
+        if (!p) return false;
+        if (g_plain) memfree(g_plain);
+        g_plain = p;
+        g_plain_cap = cap;
+        return true;
+    }
 
     void handle_frame(const unsigned char* frame, unsigned int len)
     {
@@ -1147,7 +1227,7 @@ namespace
         unsigned int prot_len = dave::protected_len(frame, len);
         if (prot_len)
         {
-            if (!g_e2ee_ready || !g_group_ready)
+            if (!g_e2ee_ready || !take_media_group())
             {
                 // Protected frames before we are in the group are not an error,
                 // they are the window between the stream starting and the
@@ -1156,8 +1236,9 @@ namespace
             }
 
             unsigned int out_len = 0;
-            if (!dave::decrypt_frame_h264(&g_group, g_user_id, frame, prot_len,
-                                          g_plain, (unsigned int)sizeof(g_plain), &out_len))
+            if (!ensure_plain(prot_len) ||
+                !dave::decrypt_frame_h264(&g_media_group, g_user_id, frame, prot_len,
+                                          g_plain, g_plain_cap, &out_len))
             {
                 InterlockedIncrement(&g_decrypt_failures);
                 g_need_keyframe_ref = true;
@@ -1757,6 +1838,7 @@ void streamview::init()
     {
         InitializeCriticalSection(&g_frame_lock);
         InitializeCriticalSection(&g_send_lock);
+        InitializeCriticalSection(&g_group_lock);
         g_locks_ready = true;
     }
     rtpvid::rx_init(&g_rx);
@@ -1775,6 +1857,7 @@ void streamview::shutdown()
         g_locks_ready = false;
         DeleteCriticalSection(&g_frame_lock);
         DeleteCriticalSection(&g_send_lock);
+        DeleteCriticalSection(&g_group_lock);
     }
 }
 
@@ -1918,6 +2001,8 @@ void streamview::stop()
     vdec::stop();
     rtpvid::rx_reset(&g_rx);
 
+    if (g_plain) { memfree(g_plain); g_plain = 0; g_plain_cap = 0; }
+
     if (g_audio_decoder) { opus_decoder_destroy(g_audio_decoder); g_audio_decoder = 0; }
     g_audio_have_seq = false;
     audio::clear_stream();
@@ -1970,7 +2055,10 @@ void streamview::read_stats(stats* out)
     out->video_ssrc = (unsigned int)g_remote_video_ssrc;
     out->e2ee = g_e2ee_ready != 0;
     out->dave_error = g_last_dave_error ? g_last_dave_error : "";
-    out->epoch = g_group_ready ? (unsigned int)g_group.epoch : 0;
+    {
+        group_guard g;
+        out->epoch = g_group_ready ? (unsigned int)g_group.epoch : 0;
+    }
     out->external_sender_ops = (unsigned int)g_op_external;
     out->proposal_ops = (unsigned int)g_op_proposals;
     out->commit_ops = (unsigned int)g_op_commit;

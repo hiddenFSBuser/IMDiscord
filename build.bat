@@ -122,6 +122,16 @@ cl %COMMON% /TC /D_NO_CRT_STDIO_INLINE /wd4267 /wd4244 /wd4133 /wd4101 /wd4189 /
    /Fo"%OBJ%\miniz_zip.obj" "%SRC%\libs\miniz\miniz_zip.c"
 if errorlevel 1 goto :fail
 
+rem ---- zstd ------------------------------------------------------------------
+rem The decoder for http content-encoding: zstd. One amalgamated file from a
+rem single header (src/libs/zstd/zstd_single_sse2.h), baseline SSE2 only, C,
+rem no PCH. NDEBUG turns its asserts into nothing, which keeps _wassert out
+rem of the NoCRT link; DEBUGLEVEL stays at its default of 0.
+echo [build] zstd
+cl %COMMON% /TC /DNDEBUG /D_NO_CRT_STDIO_INLINE /wd4267 /wd4244 /wd4133 /wd4101 /wd4189 /wd4127 /wd4706 /wd4310 /wd4245 /wd4305 /wd4146 ^
+   /I"%SRC%\libs\zstd" /Fo"%OBJ%\zstd.obj" "%SRC%\libs\zstd\zstd.c"
+if errorlevel 1 goto :fail
+
 rem ---- no-intrinsics math aliases -------------------------------------------
 rem customcrt_mathalias.cpp defines names (sqrtf, pow, ...) that /Oi keeps as
 rem intrinsics; it has to be compiled with intrinsics off and without the PCH.
@@ -139,6 +149,7 @@ echo "%OBJ%\miniz.obj">> "%RSP%"
 echo "%OBJ%\miniz_tdef.obj">> "%RSP%"
 echo "%OBJ%\miniz_tinfl.obj">> "%RSP%"
 echo "%OBJ%\miniz_zip.obj">> "%RSP%"
+echo "%OBJ%\zstd.obj">> "%RSP%"
 echo "%OBJ%\customcrt_mathalias.obj">> "%RSP%"
 echo "%OBJ%\app.res">> "%RSP%"
 set /a INDEX=0

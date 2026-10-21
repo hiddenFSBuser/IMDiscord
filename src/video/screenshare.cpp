@@ -195,6 +195,33 @@ namespace
     mls::group_state g_group;
     bool g_group_ready = false;
 
+    // The websocket thread builds, applies and swaps the group; the media
+    // thread protects frames with it. The lock is where they meet, and the
+    // media thread never touches g_group itself - it works from its own copy,
+    // taken below the lock where a frame needs it.
+    CRITICAL_SECTION g_group_lock;
+    bool g_group_lock_ready = false;
+
+    // Stable address on purpose: the ratchets in dave_frames are keyed by the
+    // group pointer they were made under.
+    mls::group_state g_media_group;
+
+    struct group_guard
+    {
+        group_guard()
+        {
+            held = g_group_lock_ready;
+            if (held) EnterCriticalSection(&g_group_lock);
+        }
+
+        ~group_guard()
+        {
+            if (held) LeaveCriticalSection(&g_group_lock);
+        }
+
+        bool held;
+    };
+
     // Building a commit advances the state of the group it is built on, there
     // and then. Built on the live group - as this was - the sender jumps an
     // epoch ahead of everybody the moment a second viewer arrives, and the
@@ -225,7 +252,14 @@ namespace
     unsigned int g_pending_transition = 0;
     bool g_have_pending_commit = false;
     bool g_pending_is_ours = false;
+
+    // Owned by the media thread alone. Resets happen on the websocket side,
+    // which is a different thread, so they arrive as a bump of this counter
+    // that the media thread notices before its next frame.
     unsigned int g_dave_nonce = 0;
+    long g_nonce_seen = 0;
+    volatile long g_nonce_epoch = 0;
+
     volatile long g_protect_failures = 0;
     bool g_passthrough_logged = false;
 
@@ -262,7 +296,25 @@ namespace
 
     // One protected access unit. A keyframe at this resolution runs to tens of
     // kilobytes, and the trailer plus widened start codes add a little more.
-    unsigned char g_protected[512 * 1024];
+    // The buffer grows to fit whatever the encoder produced: a frame bigger
+    // than the old fixed half megabyte is protected rather than dropped.
+    unsigned char* g_protected = 0;
+    unsigned int g_protected_cap = 0;
+
+    bool ensure_protected(unsigned int need)
+    {
+        if (g_protected_cap >= need) return true;
+
+        unsigned int cap = g_protected_cap ? g_protected_cap : (512 * 1024);
+        while (cap < need) cap *= 2;
+
+        unsigned char* p = (unsigned char*)memallocf(cap);
+        if (!p) return false;
+        if (g_protected) memfree(g_protected);
+        g_protected = p;
+        g_protected_cap = cap;
+        return true;
+    }
 
     void set_status(screenshare_state s, const char* text)
     {
@@ -643,10 +695,15 @@ namespace
 
         log_line("share/dave: group id %llu (rtc server %s)", dave_id, g_rtc_server_id);
 
-        g_group_ready = mls::create_group(&g_group, group_id, 8, &g_key_package.leaf,
-                                          g_sig_private, g_key_package_private.encryption_private);
+        bool created;
+        {
+            group_guard g;
+            created = mls::create_group(&g_group, group_id, 8, &g_key_package.leaf,
+                                        g_sig_private, g_key_package_private.encryption_private);
+            g_group_ready = created;
+        }
 
-        log_line("share/dave: local group %s", g_group_ready ? "created" : "FAILED");
+        log_line("share/dave: local group %s", created ? "created" : "FAILED");
     }
 
     void send_transition_response(unsigned int transition_id, bool ready)
@@ -670,6 +727,7 @@ namespace
     // people are in the group is a log line that answers nothing.
     unsigned int group_members();
     unsigned int group_members_of(const mls::group_state* g);
+    unsigned long long group_epoch();
 
     void handle_proposals(const unsigned char* payload, unsigned int payload_len)
     {
@@ -689,7 +747,7 @@ namespace
         }
 
         log_line("share/dave: %u proposal(s), revoke=%d (%u ref), эпоха %llu, участников %u",
-                 count, is_revoke ? 1 : 0, revoked_count, g_group.epoch, group_members());
+                 count, is_revoke ? 1 : 0, revoked_count, group_epoch(), group_members());
 
         // Who each proposal is about. Without this the log says a proposal
         // arrived and nothing else, and the question that actually matters -
@@ -715,42 +773,71 @@ namespace
         // arriving afterwards names proposals by reference, and one that was
         // never revoked has to still be findable or the commit cannot be
         // applied at all.
-        for (unsigned int i = 0; i < revoked_count; i++)
         {
-            for (unsigned int k = 0; k < g_known_count; k++)
-            {
-                if (ccmp(g_known[k].ref, revoked[i].ref, 32) != 0) continue;
+            group_guard g;
 
-                g_known[k] = g_known[g_known_count - 1];
-                g_known_count--;
-                break;
+            for (unsigned int i = 0; i < revoked_count; i++)
+            {
+                for (unsigned int k = 0; k < g_known_count; k++)
+                {
+                    if (ccmp(g_known[k].ref, revoked[i].ref, 32) != 0) continue;
+
+                    g_known[k] = g_known[g_known_count - 1];
+                    g_known_count--;
+                    break;
+                }
+            }
+
+            // Kept whether or not our own commit is the one that lands: if
+            // another member's does, op 29 names these and we have to be able
+            // to find them.
+            for (unsigned int i = 0; i < count && !is_revoke && g_known_count < mls::MAX_MEMBERS; i++)
+            {
+                messages[i].compute_ref(g_known[g_known_count].ref);
+                g_known[g_known_count].prop = messages[i].prop;
+                g_known_count++;
             }
         }
 
-        // Kept whether or not our own commit is the one that lands: if another
-        // member's does, op 29 names these and we have to be able to find them.
-        for (unsigned int i = 0; i < count && !is_revoke && g_known_count < mls::MAX_MEMBERS; i++)
+        bool ready;
         {
-            messages[i].compute_ref(g_known[g_known_count].ref);
-            g_known[g_known_count].prop = messages[i].prop;
-            g_known_count++;
+            group_guard g;
+            ready = g_group_ready;
         }
 
-        if (is_revoke || !g_group_ready) return;
+        if (is_revoke || !ready) return;
 
         ubuffer commit, welcome;
         commit.init();
         welcome.init();
 
-        g_group_next = g_group;
-        g_own_commit_ready = false;
+        bool built = false;
+        unsigned long long epoch_from = 0;
+        unsigned long long epoch_to = 0;
+        unsigned int members_to = 0;
 
-        if (mls::build_commit(&g_group_next, messages, count, &commit, &welcome))
         {
-            g_own_commit.clear();
-            g_own_commit.append(commit.data, commit.size);
-            g_own_commit_ready = true;
+            group_guard g;
 
+            g_group_next = g_group;
+            g_own_commit_ready = false;
+
+            built = mls::build_commit(&g_group_next, messages, count, &commit, &welcome);
+
+            if (built)
+            {
+                g_own_commit.clear();
+                g_own_commit.append(commit.data, commit.size);
+                g_own_commit_ready = true;
+
+                epoch_from = g_group.epoch;
+                epoch_to = g_group_next.epoch;
+                members_to = group_members_of(&g_group_next);
+            }
+        }
+
+        if (built)
+        {
             ubuffer out;
             out.init(commit.size + welcome.size + 16);
             out.append(commit.data, commit.size);
@@ -758,8 +845,7 @@ namespace
 
             log_line("share/dave: commit+welcome (%u байт), эпоха %llu -> %llu, "
                      "участников станет %u",
-                     out.size, g_group.epoch, g_group_next.epoch,
-                     group_members_of(&g_group_next));
+                     out.size, epoch_from, epoch_to, members_to);
             // The result is checked: "the server ignored our commit" and "our
             // commit never left" look identical from the outside, and one of
             // them is a websocket problem rather than an MLS one.
@@ -780,53 +866,74 @@ namespace
     // server tells the connection to switch, not when the commit turned up.
     void apply_pending_transition(unsigned int transition_id)
     {
-        if (!g_have_pending_commit || transition_id != g_pending_transition)
+        bool have;
+        unsigned int pending;
+        bool ours;
+
+        {
+            group_guard g;
+            have = g_have_pending_commit;
+            pending = g_pending_transition;
+            ours = g_pending_is_ours;
+        }
+
+        if (!have || transition_id != pending)
         {
             // Nothing held for this one. Answering yes anyway is what lets the
             // rest of the connection move on without us, so it is answered
             // honestly instead.
-            send_transition_response(transition_id, !g_have_pending_commit);
+            send_transition_response(transition_id, !have);
             return;
         }
 
-        g_have_pending_commit = false;
-
         bool applied = false;
         const char* why = "";
+        unsigned long long epoch = 0;
+        unsigned int members = 0;
 
-        if (g_pending_is_ours)
         {
-            // A commit cannot be applied by its author - the state it leads to
-            // was built when it was written - so this is a swap.
-            if (g_own_commit_ready)
+            group_guard g;
+
+            g_have_pending_commit = false;
+
+            if (ours)
             {
-                g_group = g_group_next;
-                g_own_commit_ready = false;
-                applied = true;
+                // A commit cannot be applied by its author - the state it
+                // leads to was built when it was written - so this is a swap.
+                if (g_own_commit_ready)
+                {
+                    g_group = g_group_next;
+                    g_own_commit_ready = false;
+                    applied = true;
+                }
+                else
+                {
+                    why = "наш коммит выиграл, а подготовленного состояния нет";
+                }
             }
             else
             {
-                why = "наш коммит выиграл, а подготовленного состояния нет";
+                applied = mls::process_commit(&g_group, g_pending_commit.data,
+                                              g_pending_commit.size,
+                                              g_known, g_known_count, &why);
+                g_own_commit_ready = false;
             }
-        }
-        else
-        {
-            applied = mls::process_commit(&g_group, g_pending_commit.data,
-                                          g_pending_commit.size,
-                                          g_known, g_known_count, &why);
-            g_own_commit_ready = false;
+
+            if (applied) g_known_count = 0;
+
+            epoch = g_group.epoch;
+            members = group_members_of(&g_group);
         }
 
         log_line("share/dave: переход %u %s, эпоха %llu, участников %u%s%s",
                  transition_id, applied ? "выполнен" : "ПРОВАЛЕН",
-                 g_group.epoch, group_members(),
+                 epoch, members,
                  applied ? "" : ": ", applied ? "" : why);
 
         if (applied)
         {
-            g_known_count = 0;
             dave::reset_ratchets();
-            g_dave_nonce = 0;
+            InterlockedIncrement(&g_nonce_epoch);
             // A new epoch is a new key, so a viewer needs a frame to start from.
             InterlockedExchange(&g_want_keyframe, 1);
         }
@@ -872,7 +979,7 @@ namespace
             // Somebody else's commit won the race. Until this was applied, this
             // client kept protecting frames with the exporter of an epoch the
             // group had already left, and no viewer could open any of them.
-            if (payload_len < 3 || !g_group_ready) break;
+            if (payload_len < 3) break;
 
             unsigned int transition_id = ((unsigned int)payload[0] << 8) | payload[1];
 
@@ -893,26 +1000,43 @@ namespace
             // anything at all.
             unsigned int sender = 0xFFFFFFFF;
             bool know_sender = mls::commit_sender(commit_bytes, commit_len, &sender);
-            bool mine = know_sender && sender == g_group.my_leaf;
 
-            // Held, not applied. The announce says which commit won; the
-            // server then tells the whole connection when to switch with op
-            // 22, and until it does everybody is still sending on the old
-            // epoch. Moving early means protecting frames with keys the
-            // viewers do not have yet and being unable to read theirs - and
-            // the voice side, which is the half of this client that works,
-            // has always waited.
-            //
-            // Transition zero is the exception: nobody to stay in step with,
-            // so it takes effect at once.
-            g_pending_commit.clear();
-            g_pending_commit.append(commit_bytes, commit_len);
-            g_have_pending_commit = true;
-            g_pending_transition = transition_id;
-            g_pending_is_ours = mine;
+            bool held;
+            unsigned int my_leaf = 0xFFFFFFFF;
+            bool mine = false;
+
+            {
+                group_guard g;
+
+                held = g_group_ready;
+
+                if (held)
+                {
+                    my_leaf = g_group.my_leaf;
+                    mine = know_sender && sender == my_leaf;
+
+                    // Held, not applied. The announce says which commit won; the
+                    // server then tells the whole connection when to switch with
+                    // op 22, and until it does everybody is still sending on the
+                    // old epoch. Moving early means protecting frames with keys
+                    // the viewers do not have yet and being unable to read
+                    // theirs - and the voice side, which is the half of this
+                    // client that works, has always waited.
+                    //
+                    // Transition zero is the exception: nobody to stay in step
+                    // with, so it takes effect at once.
+                    g_pending_commit.clear();
+                    g_pending_commit.append(commit_bytes, commit_len);
+                    g_have_pending_commit = true;
+                    g_pending_transition = transition_id;
+                    g_pending_is_ours = mine;
+                }
+            }
+
+            if (!held) break;
 
             log_line("share/dave: %s коммит от листа %u (наш %u) ждёт перехода %u (%u байт)",
-                     mine ? "свой" : "чужой", sender, g_group.my_leaf,
+                     mine ? "свой" : "чужой", sender, my_leaf,
                      transition_id, commit_len);
 
             if (transition_id == 0) apply_pending_transition(0);
@@ -931,19 +1055,25 @@ namespace
             // [uint16 transition_id][Welcome]
             unsigned int transition_id = ((unsigned int)payload[0] << 8) | payload[1];
 
-            g_group_ready = mls::process_welcome(&g_group, payload + 2, payload_len - 2,
-                                                 &g_key_package, &g_key_package_private,
-                                                 g_sig_private);
+            bool opened;
+            {
+                group_guard g;
+
+                opened = mls::process_welcome(&g_group, payload + 2, payload_len - 2,
+                                              &g_key_package, &g_key_package_private,
+                                              g_sig_private);
+                g_group_ready = opened;
+                g_known_count = 0;
+            }
 
             dave::reset_ratchets();
-            g_dave_nonce = 0;
-            g_known_count = 0;
-            InterlockedExchange(&g_e2ee_ready, g_group_ready ? 1 : 0);
+            InterlockedIncrement(&g_nonce_epoch);
+            InterlockedExchange(&g_e2ee_ready, opened ? 1 : 0);
 
             log_line("share/dave: welcome %s (transition %u)",
-                     g_group_ready ? "accepted" : "REJECTED", transition_id);
+                     opened ? "accepted" : "REJECTED", transition_id);
 
-            send_transition_response(transition_id, g_group_ready);
+            send_transition_response(transition_id, opened);
             break;
         }
 
@@ -1241,8 +1371,35 @@ namespace
 
     unsigned int group_members()
     {
+        group_guard g;
         if (!g_group_ready) return 0;
         return group_members_of(&g_group);
+    }
+
+    unsigned long long group_epoch()
+    {
+        group_guard g;
+        return g_group_ready ? g_group.epoch : 0;
+    }
+
+    // Refreshes the media thread's copy of the group, and says whether there
+    // is an epoch to protect frames with. The nonce sync rides along: both
+    // belong to the same moment, the websocket side moving the group on to a
+    // new epoch.
+    bool take_media_group()
+    {
+        group_guard g;
+        if (!g_group_ready) return false;
+        g_media_group = g_group;
+
+        long epoch = g_nonce_epoch;
+        if (epoch != g_nonce_seen)
+        {
+            g_nonce_seen = epoch;
+            g_dave_nonce = 0;
+        }
+
+        return true;
     }
 
     // A Go Live stream carries two tracks, not one. A working client keeps a
@@ -1293,10 +1450,11 @@ namespace
         const unsigned char* payload = opus;
         unsigned int payload_len = (unsigned int)len;
 
-        if (g_e2ee_ready && group_members() > 1 && !g_force_passthrough)
+        if (g_e2ee_ready && !g_force_passthrough && take_media_group() &&
+            group_members_of(&g_media_group) > 1)
         {
             unsigned int out_len = 0;
-            if (dave::encrypt_frame(&g_group, g_self_id, &g_dave_nonce,
+            if (dave::encrypt_frame(&g_media_group, g_self_id, &g_dave_nonce,
                                     opus, (unsigned int)len, guarded, &out_len))
             {
                 payload = guarded;
@@ -1619,14 +1777,18 @@ namespace
 
                 const unsigned char* payload = data;
                 unsigned int payload_len = (unsigned int)len;
-                bool alone = !g_e2ee_ready || group_members() <= 1 || g_force_passthrough;
+                bool alone = !g_e2ee_ready || g_force_passthrough;
+
+                if (!alone && (!take_media_group() || group_members_of(&g_media_group) <= 1))
+                    alone = true;
 
                 if (!alone)
                 {
                     unsigned int protectedLen = 0;
-                    if (!dave::encrypt_frame_h264(&g_group, g_self_id, &g_dave_nonce,
+                    if (!ensure_protected((unsigned int)len + 256) ||
+                        !dave::encrypt_frame_h264(&g_media_group, g_self_id, &g_dave_nonce,
                                                   data, (unsigned int)len,
-                                                  g_protected, (unsigned int)sizeof(g_protected),
+                                                  g_protected, g_protected_cap,
                                                   &protectedLen))
                     {
                         InterlockedIncrement(&g_protect_failures);
@@ -1698,7 +1860,7 @@ namespace
                          "кадров %u (+%u), ключевых %u (+%u), пакетов %u, %u КБ, сбоев %u | "
                          "от сервера %u: RR %u (+%u), PLI %u (+%u), склеено %u, FIR %u, "
                          "NACK %u, ccfb %u | RTX отдано %u, поздно %u",
-                         g_group.epoch, group_members(), g_e2ee_ready ? "да" : "НЕТ",
+                         group_epoch(), group_members(), g_e2ee_ready ? "да" : "НЕТ",
                          frames_now, frames_now - g_frames_mark,
                          keys_now, keys_now - g_keyframes_mark,
                          (unsigned int)g_packets, (unsigned int)(g_bytes / 1024),
@@ -1727,6 +1889,7 @@ namespace
 
         loopback::stop();
         if (g_censor_frame) { memfree(g_censor_frame); g_censor_frame = 0; g_censor_cap = 0; }
+        if (g_protected) { memfree(g_protected); g_protected = 0; g_protected_cap = 0; }
         if (g_silence) { opus_encoder_destroy(g_silence); g_silence = 0; }
 
         for (int i = 0; i < g_layer_count; i++)
@@ -2024,6 +2187,8 @@ namespace
 void screenshare::init()
 {
     ccfset(g_status, 0, sizeof(g_status));
+    InitializeCriticalSection(&g_group_lock);
+    g_group_lock_ready = true;
     g_own_commit.init(2048);
     g_pending_commit.init(2048);
     capture::init();
@@ -2033,6 +2198,8 @@ void screenshare::init()
 void screenshare::shutdown()
 {
     stop();
+    g_group_lock_ready = false;
+    DeleteCriticalSection(&g_group_lock);
     venc::shutdown();
     capture::shutdown();
 }
@@ -2121,9 +2288,12 @@ bool screenshare::start(int monitor_index, int max_width, int max_height, int fp
     g_pli_coalesced = 0;
     g_last_pli_keyframe_ms = 0;
     g_last_rejoin_ms = 0;
-    g_have_pending_commit = false;
-    g_pending_transition = 0;
-    g_pending_is_ours = false;
+    {
+        group_guard g;
+        g_have_pending_commit = false;
+        g_pending_transition = 0;
+        g_pending_is_ours = false;
+    }
     g_frames_mark = 0;
     g_keyframes_mark = 0;
     g_rr_mark = 0;

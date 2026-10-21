@@ -47,6 +47,19 @@ void cdn::user_avatar(const duser* u, int size, char* out, int cap)
     cnprint(out, cap, "%s/embed/avatars/%d.png", CDN, index);
 }
 
+void cdn::archived_avatar(snowflake user_id, const char* avatar_id, const char* hash,
+                          int size, char* out, int cap)
+{
+    if (!user_id || !avatar_id || !avatar_id[0] || !hash || !hash[0])
+    {
+        out[0] = 0;
+        return;
+    }
+
+    cnprint(out, cap, "%s/avatars/%llu/archived/%s/%s.webp?size=%d",
+            CDN, user_id, avatar_id, hash, size);
+}
+
 void cdn::user_banner(const duser* u, int size, char* out, int cap)
 {
     if (!u || !u->banner || !u->banner[0]) { out[0] = 0; return; }

@@ -3,6 +3,9 @@
 #include "proxy.h"
 #include "httpstream.h"
 #include "core/log.h"
+// The zstd decoder, declarations only; src/libs/zstd/zstd.c is the one unit
+// that defines them.
+#include "../libs/zstd/zstd_single_sse2.h"
 
 
 // ---------------------------------------------------------------------------
@@ -136,10 +139,11 @@ namespace
     }
 
     // ---- reading -------------------------------------------------------
+    //
+    // Headers and any body bytes that shared a packet with them land in the
+    // reader buffer; the rest of the body goes from the socket straight into
+    // the response, so it is never copied twice on the way in.
 
-    // Everything read from the socket, with a cursor. Headers and body arrive
-    // in the same stream and often in the same packet, so the body has to be
-    // able to start from what the header read already pulled in.
     struct reader
     {
         http_stream* s;
@@ -149,18 +153,28 @@ namespace
         bool ended;
     };
 
-    bool pull(reader* r)
+    // Moves bytes into dst, wherever dst is. Read contract of the layer
+    // underneath: bytes moved, 0 when the peer closed, -1 on error, -2 on
+    // timeout; the last two are reported here as "nothing more will come".
+    int pull_raw(reader* r, void* dst, int cap)
     {
-        if (r->ended) return false;
+        if (r->ended) return -1;
 
         unsigned long long now = GetTickCount64();
-        if (now >= r->deadline) return false;
+        if (now >= r->deadline) return -1;
 
+        int got = httpstream::read(r->s, dst, cap, (unsigned int)(r->deadline - now));
+        if (got == 0) { r->ended = true; return -1; }
+        if (got < 0) { if (got == -1) r->ended = true; return -1; }
+
+        return got;
+    }
+
+    bool pull(reader* r)
+    {
         char chunk[16384];
-        int got = httpstream::read(r->s, chunk, (int)sizeof(chunk),
-                                   (unsigned int)(r->deadline - now));
-        if (got == 0) { r->ended = true; return false; }
-        if (got < 0) { if (got == -1) r->ended = true; return false; }
+        int got = pull_raw(r, chunk, (int)sizeof(chunk));
+        if (got <= 0) return false;
 
         r->buf.append(chunk, (unsigned int)got);
         return true;
@@ -189,17 +203,47 @@ namespace
         }
     }
 
+    // Reads at most want more body bytes, into out's own storage. The socket
+    // writes into the buffer the bytes will live in, so there is no stop in
+    // the reader on the way.
+    int pull_body(reader* r, ubuffer* out, unsigned int want)
+    {
+        if (want > 16384) want = 16384;
+
+        out->reserve(out->size + want);
+        if (out->cap < out->size + want + 1) return 0;
+
+        int got = pull_raw(r, out->data + out->size, (int)want);
+        if (got > 0) out->size += (unsigned int)got;
+        return got > 0 ? got : 0;
+    }
+
     bool read_exact(reader* r, ubuffer* out, unsigned int want)
     {
-        while (r->buf.size - r->at < want)
-            if (!pull(r)) break;
+        unsigned int have = 0;
 
-        unsigned int have = r->buf.size - r->at;
-        unsigned int take = have < want ? have : want;
+        // Whatever arrived in the same packet as the headers first.
+        if (r->at < r->buf.size)
+        {
+            unsigned int take = r->buf.size - r->at;
+            if (take > want) take = want;
 
-        if (take) out->append(r->buf.data + r->at, take);
-        r->at += take;
-        return take == want;
+            out->append(r->buf.data + r->at, take);
+            r->at += take;
+            have = take;
+        }
+
+        while (have < want)
+        {
+            int got = pull_body(r, out, want - have);
+            if (got <= 0) break;
+            have += (unsigned int)got;
+        }
+
+        // The reader buffer has done its part once it is drained.
+        if (r->at >= r->buf.size) { r->buf.clear(); r->at = 0; }
+
+        return have == want;
     }
 
     unsigned int hex_value(const char* text)
@@ -309,6 +353,169 @@ namespace
         if (*p == ':') p++;
         while (*p == ' ') p++;
         return p;
+    }
+
+    // ---- content-encoding ------------------------------------------------
+    //
+    // Requests ask for gzip, deflate or zstd. Whatever arrives in one of
+    // them is put back to plain bytes before the caller sees it: everything
+    // above here reads json, and json does not come compressed.
+
+    enum encoding_kind
+    {
+        ENC_NONE,
+        ENC_GZIP,
+        ENC_DEFLATE,
+        ENC_ZSTD
+    };
+
+    encoding_kind parse_encoding(const char* value)
+    {
+        if (ccsncmpf(value, "gzip", 4) == 0) return ENC_GZIP;
+        if (ccsncmpf(value, "x-gzip", 6) == 0) return ENC_GZIP;
+        if (ccsncmpf(value, "deflate", 7) == 0) return ENC_DEFLATE;
+        if (ccsncmpf(value, "zstd", 4) == 0) return ENC_ZSTD;
+        return ENC_NONE;
+    }
+
+    // A response would have to be extraordinary for this to bind - the
+    // largest thing fetched here is an attachment - but a decoder is not
+    // going to allocate whatever a length field tells it to.
+    const unsigned long long MAX_DECODED_BODY = 512ULL * 1024 * 1024;
+
+    // miniz's one-shot inflater, the same object file the zip writer links.
+    // Declared here rather than by including miniz.h so none of that header's
+    // configuration enters this unit.
+    extern "C" size_t tinfl_decompress_mem_to_mem(void* pOut_buf, size_t out_buf_len,
+                                                  const void* pSrc_buf, size_t src_buf_len,
+                                                  int flags);
+    const int TINFL_ZLIB_HEADER = 1;
+    const size_t TINFL_FAILED = (size_t)-1;
+
+    // hint is the decoded size when the format states one; zero means grow
+    // until the stream fits. tinfl reports a full destination and a corrupt
+    // stream the same way, so a wrong hint costs one retry, not a failure.
+    bool inflate_into(const unsigned char* src, unsigned int len, int flags,
+                      unsigned int hint, ubuffer* out)
+    {
+        unsigned int cap = hint ? hint : len * 4 + 4096;
+        if (cap < 4096) cap = 4096;
+
+        for (;;)
+        {
+            if (cap > MAX_DECODED_BODY) return false;
+
+            out->init(cap);
+            if (!out->data) return false;
+
+            size_t got = tinfl_decompress_mem_to_mem(out->data, cap, src, len, flags);
+            if (got != TINFL_FAILED)
+            {
+                out->size = (unsigned int)got;
+                return true;
+            }
+
+            out->free_buffer();
+            if (cap > (unsigned int)(MAX_DECODED_BODY / 2)) return false;
+            cap *= 2;
+        }
+    }
+
+    // Peels the gzip wrapper off and hands the deflate stream inside it to
+    // the inflater. The trailer carries the exact decoded size.
+    bool gunzip_into(const unsigned char* src, unsigned int len, ubuffer* out)
+    {
+        if (len < 20 || src[0] != 0x1f || src[1] != 0x8b || src[2] != 8) return false;
+
+        unsigned char flg = src[3];
+        if (flg & 0xE0) return false;               // reserved bits are not gzip
+
+        unsigned int at = 10;                       // magic, method, flags, stamp, xfl, os
+
+        if (flg & 0x04)                             // an extra field
+        {
+            if (at + 2 > len) return false;
+            at += 2 + (unsigned int)src[at] + ((unsigned int)src[at + 1] << 8);
+        }
+        if (flg & 0x08) { while (at < len && src[at]) at++; at++; }     // a name
+        if (flg & 0x10) { while (at < len && src[at]) at++; at++; }     // a comment
+        if (flg & 0x02) at += 2;                                       // a header crc
+
+        if (at + 8 > len) return false;             // no room for the trailer
+
+        unsigned int hint = (unsigned int)src[len - 4] | ((unsigned int)src[len - 3] << 8) |
+                            ((unsigned int)src[len - 2] << 16) | ((unsigned int)src[len - 1] << 24);
+
+        return inflate_into(src + at, len - at - 8, 0, hint, out);
+    }
+
+    bool unzstd_into(const unsigned char* src, unsigned int len, ubuffer* out)
+    {
+        unsigned long long hint = ZSTD_getFrameContentSize(src, len);
+        if (hint == ZSTD_CONTENTSIZE_ERROR) return false;
+        if (hint == ZSTD_CONTENTSIZE_UNKNOWN) hint = 0;
+        if (hint > MAX_DECODED_BODY) return false;
+
+        unsigned long long cap = hint ? hint : (unsigned long long)len * 4 + 4096;
+        if (cap < 4096) cap = 4096;
+
+        for (;;)
+        {
+            if (cap > MAX_DECODED_BODY) return false;
+
+            out->init((unsigned int)cap);
+            if (!out->data) return false;
+
+            size_t got = ZSTD_decompress(out->data, (size_t)cap, src, len);
+            if (!ZSTD_isError(got))
+            {
+                out->size = (unsigned int)got;
+                return true;
+            }
+
+            out->free_buffer();
+            cap *= 2;
+        }
+    }
+
+    // A body that cannot be decoded is left where it is and the response is
+    // marked truncated, the same as any other body that did not arrive whole.
+    void decode_body(encoding_kind kind, http_response* res)
+    {
+        if (kind == ENC_NONE || !res->body.size) return;
+
+        const unsigned char* src = res->body.data;
+        unsigned int len = res->body.size;
+
+        ubuffer plain;
+        plain.init();
+
+        bool done = false;
+        if (kind == ENC_GZIP)
+        {
+            done = gunzip_into(src, len, &plain);
+        }
+        else if (kind == ENC_DEFLATE)
+        {
+            // The spec says zlib; a server that puts the bare stream on the
+            // wire is common enough that both are tried.
+            done = inflate_into(src, len, TINFL_ZLIB_HEADER, 0, &plain);
+            if (!done) done = inflate_into(src, len, 0, 0, &plain);
+        }
+        else
+        {
+            done = unzstd_into(src, len, &plain);
+        }
+
+        if (!done)
+        {
+            plain.free_buffer();
+            res->truncated = true;
+            return;
+        }
+
+        res->body.free_buffer();
+        res->body = plain;
     }
 }
 
@@ -470,9 +677,10 @@ bool http::request(const char* method, const char* url, const char* headers_utf8
         head.append_fmt("Host: %s\r\n", u.host);
         head.append_fmt("User-Agent: %s\r\n", g_agent);
         head.append_str("Accept: */*\r\n");
-        // No compression is offered on purpose: nothing here would gain from
-        // it and every response then needs an inflater.
-        head.append_str("Accept-Encoding: identity\r\n");
+        // The api and the cdn both answer compressed when asked: json and
+        // pictures are each a decent win, and zstd is the one discord keeps
+        // ready. The other two cover anything in between that rewrites this.
+        head.append_str("Accept-Encoding: gzip, deflate, zstd\r\n");
         head.append_str("Connection: keep-alive\r\n");
 
         // Cookies are a browser's business. A bot has no session to carry and
@@ -539,6 +747,7 @@ bool http::request(const char* method, const char* url, const char* headers_utf8
         bool have_length = false;
         char location[2200];
         location[0] = 0;
+        encoding_kind encoding = ENC_NONE;
 
         for (;;)
         {
@@ -567,6 +776,8 @@ bool http::request(const char* method, const char* url, const char* headers_utf8
             }
             else if (header_is(line, "location"))
                 ccstrncpy(location, header_value(line), sizeof(location) - 1);
+            else if (header_is(line, "content-encoding"))
+                encoding = parse_encoding(header_value(line));
             else if (header_is(line, "retry-after"))
             {
                 // Seconds by the spec; discord also sends fractional ones.
@@ -606,13 +817,20 @@ bool http::request(const char* method, const char* url, const char* headers_utf8
             // No length and no chunking: the body is whatever arrives until
             // the connection ends.
             close_after = true;
-            while (pull(&r)) {}
-            if (r.buf.size > r.at) out->body.append(r.buf.data + r.at, r.buf.size - r.at);
-            r.at = r.buf.size;
+
+            if (r.buf.size > r.at)
+            {
+                out->body.append(r.buf.data + r.at, r.buf.size - r.at);
+                r.at = r.buf.size;
+            }
+
+            while (pull_body(&r, &out->body, 16384) > 0) {}
         }
 
         r.buf.free_buffer();
         give_back(e, !close_after && !r.ended && !out->truncated);
+
+        decode_body(encoding, out);
 
         // ---- redirects
         if ((status == 301 || status == 302 || status == 303 ||

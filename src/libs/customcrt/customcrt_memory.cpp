@@ -1,47 +1,48 @@
 #include "pch.h"
 #include "customcrt_memory.h"
 
-#pragma optimize( "", off )
+// customcrt_memory.h switches memcpy/memset to real calls (#pragma function)
+// so that customcrt_crtalias can provide them for the rest of the program.
+// Inside their own implementations a call would land right back here, so the
+// bulk work is done with the string intrinsics (__movsb/__movsq/__stosb/__stosq):
+// they always compile to rep movs/stos and can never become a runtime call.
+// Plain byte/word loops are off-limits here: at /O2 the compiler rewrites them
+// into memset/memcpy calls, and #pragma intrinsic does not stop that - the
+// resulting call aliases straight back into these very functions (this is what
+// used to crash the client with a stack overflow).
+#include <intrin.h>
+
 void* ccpy(void* dest, const void* src, size_t count)
 {
-    char* cdest = static_cast<char*>(dest);
-    const char* csrc = static_cast<const char*>(src);
+    unsigned char* cdest = static_cast<unsigned char*>(dest);
+    const unsigned char* csrc = static_cast<const unsigned char*>(src);
     constexpr size_t word_size = sizeof(size_t);
 
-    if (count < word_size) {
-        while (count--) {
-            *cdest++ = *csrc++;
+    if (count >= word_size) {
+        size_t align_offset = word_size - (reinterpret_cast<uintptr_t>(cdest) % word_size);
+        if (align_offset != word_size) {
+            __movsb(cdest, csrc, align_offset);
+            cdest += align_offset;
+            csrc += align_offset;
+            count -= align_offset;
         }
-        return dest;
-    }
 
-    size_t align_offset = word_size - (reinterpret_cast<uintptr_t>(cdest) % word_size);
-    if (align_offset != word_size) {
-        count -= align_offset;
-        while (align_offset--) {
-            *cdest++ = *csrc++;
+        size_t num_words = count / word_size;
+        if (num_words) {
+            __movsq(reinterpret_cast<unsigned long long*>(cdest),
+                    reinterpret_cast<const unsigned long long*>(csrc), num_words);
+            cdest += num_words * word_size;
+            csrc += num_words * word_size;
+            count -= num_words * word_size;
         }
     }
 
-    size_t* wdest = reinterpret_cast<size_t*>(cdest);
-    const size_t* wsrc = reinterpret_cast<const size_t*>(csrc);
-    size_t num_words = count / word_size;
-
-    while (num_words--) {
-        *wdest++ = *wsrc++;
-    }
-
-    cdest = reinterpret_cast<char*>(wdest);
-    csrc = reinterpret_cast<const char*>(wsrc);
-    count %= word_size;
-
-    while (count--) {
-        *cdest++ = *csrc++;
+    if (count) {
+        __movsb(cdest, csrc, count);
     }
 
     return dest;
 }
-#pragma optimize( "", on )
 
 int ccmp(const void* s1, const void* s2, size_t count)
 {
@@ -71,43 +72,33 @@ int ccmp(const void* s1, const void* s2, size_t count)
     return 0;
 }
 
-#pragma optimize( "", off )
 void* ccfset(void* dest, int value, size_t count) {
     unsigned char* ptr = (unsigned char*)dest;
     unsigned char val = (unsigned char)value;
 
-    while (count > 0 && ((uintptr)ptr % sizeof(uint64)) != 0) {
-        *ptr = val;
-        ptr++;
-        count--;
+    size_t align_offset = sizeof(uint64) - (uintptr)ptr % sizeof(uint64);
+    if (align_offset == sizeof(uint64)) align_offset = 0;
+    if (align_offset > count) align_offset = count;
+    if (align_offset) {
+        __stosb(ptr, val, align_offset);
+        ptr += align_offset;
+        count -= align_offset;
     }
 
     if (count >= sizeof(uint64)) {
-        uint64 word_val = 0;
-        for (uint64 i = 0; i < sizeof(uint64); ++i) {
-            word_val = (word_val << 8) | val;
-        }
-
-        uint64* word_ptr = (uint64*)ptr;
-        uint64 num_words = count / sizeof(uint64);
-        for (uint64 i = 0; i < num_words; ++i) {
-            *word_ptr = word_val;
-            word_ptr++;
-        }
-
-        ptr = (unsigned char*)word_ptr;
+        uint64 word_val = 0x0101010101010101ULL * val;
+        size_t num_words = count / sizeof(uint64);
+        __stosq((unsigned long long*)ptr, word_val, num_words);
+        ptr += num_words * sizeof(uint64);
         count -= num_words * sizeof(uint64);
     }
 
-    while (count > 0) {
-        *ptr = val;
-        ptr++;
-        count--;
+    if (count) {
+        __stosb(ptr, val, count);
     }
 
     return dest;
 }
-#pragma optimize( "", on )
 
 void* ccmov(void* dest, const void* src, size_t n) {
     if (n == 0 || dest == src) return dest;
@@ -115,40 +106,41 @@ void* ccmov(void* dest, const void* src, size_t n) {
     unsigned char* d = (unsigned char*)dest;
     const unsigned char* s = (const unsigned char*)src;
 
-    if (d < s) {
-        while (n >= 32) {
-            *(uint64*)(d + 0) = *(uint64*)(s + 0);
-            *(uint64*)(d + 8) = *(uint64*)(s + 8);
-            *(uint64*)(d + 16) = *(uint64*)(s + 16);
-            *(uint64*)(d + 24) = *(uint64*)(s + 24);
-            d += 32; s += 32; n -= 32;
+    // Forward copy is safe for d < s and for non-overlapping regions. For an
+    // overlapping move with d > s the copy has to run from the end backwards,
+    // one word at a time: a single rep movsq would overwrite source bytes that
+    // have not been read yet.
+    if (d < s || (size_t)(d - s) >= n) {
+        size_t num_words = n / sizeof(uint64);
+        if (num_words) {
+            __movsq((unsigned long long*)d, (const unsigned long long*)s, num_words);
+            d += num_words * sizeof(uint64);
+            s += num_words * sizeof(uint64);
+            n -= num_words * sizeof(uint64);
         }
-        while (n >= 8) {
-            *(uint64*)d = *(uint64*)s;
-            d += 8; s += 8; n -= 8;
-        }
-        while (n > 0) {
-            *d++ = *s++;
-            n--;
+        if (n) {
+            __movsb(d, s, n);
         }
     }
     else {
+        size_t tail = n % sizeof(uint64);
         d += n;
         s += n;
-        while (n >= 32) {
-            d -= 32; s -= 32; n -= 32;
-            *(uint64*)(d + 24) = *(uint64*)(s + 24);
-            *(uint64*)(d + 16) = *(uint64*)(s + 16);
-            *(uint64*)(d + 8) = *(uint64*)(s + 8);
-            *(uint64*)(d + 0) = *(uint64*)(s + 0);
+        if (tail) {
+            d -= tail; s -= tail;
+            // Highest bytes first: straight-line stores, deliberately not a loop.
+            if (tail >= 7) d[6] = s[6];
+            if (tail >= 6) d[5] = s[5];
+            if (tail >= 5) d[4] = s[4];
+            if (tail >= 4) d[3] = s[3];
+            if (tail >= 3) d[2] = s[2];
+            if (tail >= 2) d[1] = s[1];
+            if (tail >= 1) d[0] = s[0];
         }
-        while (n >= 8) {
-            d -= 8; s -= 8; n -= 8;
-            *(uint64*)d = *(uint64*)s;
-        }
-        while (n > 0) {
-            d--; s--; n--;
-            *d = *s;
+        n -= tail;
+        while (n) {
+            d -= sizeof(uint64); s -= sizeof(uint64); n -= sizeof(uint64);
+            __movsq((unsigned long long*)d, (const unsigned long long*)s, 1);
         }
     }
 
@@ -199,8 +191,15 @@ unsigned __int64 ccrc64(const void* data, unsigned int size) {
     return ~crc;
 }
 
+// Zeroing allocator: every byte handed out is zeroed by the heap manager.
 void* memalloc(int size) {
     return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size);
+}
+// Fast allocator: contents are garbage. Callers that need zeroed memory must
+// zero it themselves - the win is that they only do it once (the heap manager
+// would have zeroed it anyway, and then the caller zeroed it again).
+void* memallocf(int size) {
+    return HeapAlloc(GetProcessHeap(), 0, size);
 }
 void* operator new(size_t size) { return memalloc((int)size); }
 void* operator new[](size_t size) { return memalloc((int)size); }

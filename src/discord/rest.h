@@ -134,11 +134,6 @@ namespace api
 
     // Edits our own profile. Any argument may be null to leave it alone.
     void update_self_profile(const char* global_name, const char* bio);
-
-    // Replaces the avatar or the banner with the contents of a file. Discord
-    // takes these as data URIs on the account itself, not on the profile, and
-    // works out the format from the prefix. Passing an empty path clears it.
-    void update_self_image(bool banner, const wchar_t* path);
     void trigger_typing(snowflake channel_id);
     // Rewrites one of our own. Discord takes only the text; an empty one is
     // refused rather than treated as a delete.
@@ -285,11 +280,23 @@ namespace api
     void email_apply(const char* new_email, const char* password);
     bool take_email_apply_result(bool* ok, char* error, int error_cap);
 
+    // ---- phone ----
+    // Step 1: the number itself; Discord sends an SMS. Repeating this call is
+    // the resend - there is no separate endpoint on the client side. Step 2
+    // exchanges the code for a phone token. Step 3 attaches the number with
+    // that token and the current password.
+    void phone_send_code(const char* phone);
+    bool take_phone_code_result(bool* ok, char* error, int error_cap);
+    void phone_verify_code(const char* phone, const char* code);
+    bool take_phone_verify_result(bool* ok, char* error, int error_cap);
+    void phone_apply(const char* password);
+    bool take_phone_apply_result(bool* ok, char* error, int error_cap);
+
     // ---- profile ----
     struct avatar_item
     {
         char id[32];      // history id: PATCH {"avatar_id": id} restores it
-        char hash[64];    // storage_hash: shown as cdn avatars/<self>/<hash>
+        char hash[64];    // storage_hash: cdn avatars/<self>/archived/<id>/<hash>
         char desc[128];
     };
     // Last avatar uploads, newest first. Empty until fetched.
@@ -307,8 +314,10 @@ namespace api
         char error[128];
     };
     bool take_username_check(username_check* out);
-    // Bio and pronouns in one PATCH to users/%40me/profile. Null skips.
-    void update_profile(const char* bio, const char* pronouns);
+    // Bio, pronouns and banner in one PATCH to users/%40me/profile. Null bio
+    // and pronouns skip; banner_datauri uploads and remove_banner clears.
+    void update_profile(const char* bio, const char* pronouns,
+                        const char* banner_datauri, bool remove_banner);
     bool take_profile_result(bool* ok, char* error, int error_cap);
     // Display name and/or avatar in one PATCH to users/@me. avatar_datauri
     // is a data:image/...;base64 upload, avatar_id restores a history id;
@@ -685,6 +694,8 @@ namespace api
     void delete_channel(snowflake channel_id);
     // Categories are channels too, so this renames one of those as well.
     void rename_channel(snowflake channel_id, const char* name);
+
+    void set_channel_slowmode(snowflake channel_id, int seconds);
 
     // The channels of one server in the order they should appear. Sent whole
     // rather than as one moved entry: a position only means anything next to

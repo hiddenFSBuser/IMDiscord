@@ -38,11 +38,17 @@ namespace
     int g_av_mode = 0;
     char g_av_hist_id[32];
 
+    // Banner staging: 0 unchanged, 1 cropped file, 2 remove.
+    int g_bn_mode = 0;
+    unsigned char* g_bn_final = 0;
+    ID3D11ShaderResourceView* g_bn_preview = 0;
+    char* g_bn_datauri = 0;
+
     unsigned char* g_av_src = 0;
     int g_av_w = 0, g_av_h = 0;
     ID3D11ShaderResourceView* g_av_tex = 0;
 
-    unsigned char* g_av_final = 0;   // 128x128 RGBA, cropped result
+    unsigned char* g_av_final = 0;   // cropped result
     ID3D11ShaderResourceView* g_av_preview = 0;
     char* g_av_datauri = 0;
 
@@ -62,15 +68,20 @@ namespace
     char g_err_account[256];
 
     // ---- crop overlay ----
+    enum { CROP_AVATAR = 0, CROP_BANNER = 1 };
+    const float BANNER_ASPECT = 2.5f;   // 600x240
+
     bool g_cropping = false;
     bool g_crop_want_open = false;
+    int g_crop_kind = CROP_AVATAR;
     // The editor popup is deliberately closed while the crop runs: it is
     // the popup below, and anything closing it takes popups above it down
     // as well. It reopens when the crop ends, state intact.
     bool g_ed_suspended = false;
     bool g_crop_init = false;
     ImVec2 g_crop_pos;
-    float g_crop_size = 0.0f;
+    float g_crop_w = 0.0f;
+    float g_crop_h = 0.0f;
     int g_crop_handle = -1;          // 0..3 corners, 4 move
     ImVec2 g_img_pos;
     ImVec2 g_img_size;
@@ -142,7 +153,15 @@ namespace
         g_av_hist_id[0] = 0;
     }
 
-    bool pick_avatar_file()
+    void free_banner_staged()
+    {
+        if (g_bn_final) { memfree(g_bn_final); g_bn_final = 0; }
+        drop_texture(&g_bn_preview);
+        if (g_bn_datauri) { memfree(g_bn_datauri); g_bn_datauri = 0; }
+        g_bn_mode = 0;
+    }
+
+    bool pick_crop_file(int kind)
     {
         wchar_t path[MAX_PATH];
         path[0] = 0;
@@ -168,7 +187,6 @@ namespace
         }
 
         free_avatar_source();
-        free_avatar_staged();
 
         g_av_src = px;
         g_av_w = w;
@@ -182,6 +200,7 @@ namespace
         }
 
         log_line("profile: файл взят %dx%d, кроп открыт", w, h);
+        g_crop_kind = kind;
         g_cropping = true;
         g_crop_init = false;
         g_crop_handle = -1;
@@ -195,40 +214,70 @@ namespace
         return true;
     }
 
-    // Square 1:1 crop at (sx, sy, size) in source pixels. The square goes
-    // out at its own size, capped at 1024: a small picture stays as it is
-    // instead of being stretched, a huge one does not ship megabytes to
-    // the CDN. Box-downscaled, PNG in memory.
-    bool apply_crop(int sx, int sy, int size)
+    bool pick_avatar_file()
     {
-        if (!g_av_src || size <= 0) return false;
+        bool picked = pick_crop_file(CROP_AVATAR);
+        if (picked) free_avatar_staged();
+        return picked;
+    }
+
+    bool pick_banner_file()
+    {
+        bool picked = pick_crop_file(CROP_BANNER);
+        if (picked) free_banner_staged();
+        return picked;
+    }
+
+    bool apply_crop(int sx, int sy, int sw, int sh)
+    {
+        if (!g_av_src || sw <= 0 || sh <= 0) return false;
         if (sx < 0) sx = 0;
         if (sy < 0) sy = 0;
-        if (sx + size > g_av_w) size = g_av_w - sx;
-        if (sy + size > g_av_h) size = g_av_h - sy;
-        if (size <= 0) return false;
+        if (sx >= g_av_w || sy >= g_av_h) return false;
+        if (sx + sw > g_av_w) sw = g_av_w - sx;
+        if (sy + sh > g_av_h) sh = g_av_h - sy;
+        if (sw <= 0 || sh <= 0) return false;
 
-        int target = size > 1024 ? 1024 : size;
-        if (target < 1) target = 1;
-        unsigned char* out = (unsigned char*)memalloc(target * target * 4);
+        int target_w, target_h;
+        if (g_crop_kind == CROP_BANNER)
+        {
+            target_w = sw > 1200 ? 1200 : sw;
+            target_h = target_w * 2 / 5;
+            if (target_h < 1) target_h = 1;
+            if (target_h > sh)
+            {
+                target_h = sh;
+                target_w = target_h * 5 / 2;
+            }
+            if (target_w < 1) target_w = 1;
+        }
+        else
+        {
+            target_w = target_h = sw < sh ? sw : sh;
+            if (target_w > 1024) target_w = target_h = 1024;
+            if (target_w < 1) target_w = 1;
+        }
+
+        unsigned char* out = (unsigned char*)memalloc(target_w * target_h * 4);
         if (!out) return false;
 
-        float scale = (float)size / (float)target;
-        for (int ty = 0; ty < target; ty++)
+        float scale_x = (float)sw / (float)target_w;
+        float scale_y = (float)sh / (float)target_h;
+        for (int ty = 0; ty < target_h; ty++)
         {
-            for (int tx = 0; tx < target; tx++)
+            for (int tx = 0; tx < target_w; tx++)
             {
-                int sy0 = (int)(ty * scale);
-                int sy1 = (int)((ty + 1) * scale);
-                int sx0 = (int)(tx * scale);
-                int sx1 = (int)((tx + 1) * scale);
+                int sy0 = (int)(ty * scale_y);
+                int sy1 = (int)((ty + 1) * scale_y);
+                int sx0 = (int)(tx * scale_x);
+                int sx1 = (int)((tx + 1) * scale_x);
 
                 float r = 0, g = 0, b = 0, a = 0, n = 0;
                 for (int y = sy0; y <= sy1; y++)
                 {
                     for (int x = sx0; x <= sx1; x++)
                     {
-                        if (x < 0 || y < 0 || x >= size || y >= size) continue;
+                        if (x < 0 || y < 0 || x >= sw || y >= sh) continue;
                         int idx = (((sy + y) * g_av_w) + (sx + x)) * 4;
                         r += g_av_src[idx];
                         g += g_av_src[idx + 1];
@@ -239,7 +288,7 @@ namespace
                 }
                 if (n <= 0.0f) n = 1.0f;
 
-                int o = (ty * target + tx) * 4;
+                int o = (ty * target_w + tx) * 4;
                 out[o] = (unsigned char)(r / n);
                 out[o + 1] = (unsigned char)(g / n);
                 out[o + 2] = (unsigned char)(b / n);
@@ -247,10 +296,9 @@ namespace
             }
         }
 
-    // Square output, as-is: Discord rounds it on display itself.
-    int png_len = 0;
-    unsigned char* png = stbi_write_png_to_mem(out, target * 4, target, target,
-                                               4, &png_len);
+        int png_len = 0;
+        unsigned char* png = stbi_write_png_to_mem(out, target_w * 4, target_w, target_h,
+                                                   4, &png_len);
         if (!png || png_len <= 0)
         {
             if (png) memfree(png);
@@ -275,10 +323,8 @@ namespace
         ccpy(uri, prefix, ccslenf(prefix) + 1);
         ccpy(uri + ccslenf(prefix), b64.data, b64.size + 1);
 
-        free_avatar_staged();
-        g_av_final = out;
-        g_av_preview = make_rgba_texture(target, target, out);
-        if (!g_av_preview)
+        ID3D11ShaderResourceView* preview = make_rgba_texture(target_w, target_h, out);
+        if (!preview)
         {
             memfree(uri);
             memfree(png);
@@ -287,11 +333,25 @@ namespace
             return false;
         }
 
+        if (g_crop_kind == CROP_BANNER)
+        {
+            free_banner_staged();
+            g_bn_final = out;
+            g_bn_preview = preview;
+            g_bn_datauri = uri;
+            g_bn_mode = 1;
+        }
+        else
+        {
+            free_avatar_staged();
+            g_av_final = out;
+            g_av_preview = preview;
+            g_av_datauri = uri;
+            g_av_mode = 1;
+        }
+
         memfree(png);
         b64.free_buffer();
-
-        g_av_datauri = uri;
-        g_av_mode = 1;
         return true;
     }
 
@@ -304,6 +364,7 @@ namespace
         ccfset(g_ed_pass, 0, sizeof(g_ed_pass));
         free_avatar_source();
         free_avatar_staged();
+        free_banner_staged();
     }
 
     const char* nonempty_or_null(const char* s)
@@ -339,6 +400,8 @@ void ui_open_profile_editor()
 
     free_avatar_source();
     free_avatar_staged();
+    free_banner_staged();
+    g_crop_kind = CROP_AVATAR;
     g_hist_n = 0;
     g_hist_requested = false;
     g_ed_suspended = false;
@@ -465,18 +528,27 @@ void ui_view_avatar_crop()
 
     if (!g_crop_init)
     {
-        g_crop_size = g_img_size.x < g_img_size.y ? g_img_size.x : g_img_size.y;
-        g_crop_pos = ImVec2(g_img_pos.x + (g_img_size.x - g_crop_size) * 0.5f,
-                            g_img_pos.y + (g_img_size.y - g_crop_size) * 0.5f);
+        float aspect = g_crop_kind == CROP_BANNER ? BANNER_ASPECT : 1.0f;
+        float cw = g_img_size.x;
+        float ch = cw / aspect;
+        if (ch > g_img_size.y)
+        {
+            ch = g_img_size.y;
+            cw = ch * aspect;
+        }
+        g_crop_w = cw;
+        g_crop_h = ch;
+        g_crop_pos = ImVec2(g_img_pos.x + (g_img_size.x - cw) * 0.5f,
+                            g_img_pos.y + (g_img_size.y - ch) * 0.5f);
         g_crop_init = true;
     }
 
     ImVec2 p[4] =
     {
         g_crop_pos,
-        ImVec2(g_crop_pos.x + g_crop_size, g_crop_pos.y),
-        ImVec2(g_crop_pos.x, g_crop_pos.y + g_crop_size),
-        ImVec2(g_crop_pos.x + g_crop_size, g_crop_pos.y + g_crop_size),
+        ImVec2(g_crop_pos.x + g_crop_w, g_crop_pos.y),
+        ImVec2(g_crop_pos.x, g_crop_pos.y + g_crop_h),
+        ImVec2(g_crop_pos.x + g_crop_w, g_crop_pos.y + g_crop_h),
     };
 
     ImVec2 mouse = ImGui::GetMousePos();
@@ -504,62 +576,58 @@ void ui_view_avatar_crop()
         if (g_crop_handle == 4)
         {
             g_crop_pos.x = clampf(g_crop_pos.x + delta.x, g_img_pos.x,
-                                  img_end.x - g_crop_size);
+                                  img_end.x - g_crop_w);
             g_crop_pos.y = clampf(g_crop_pos.y + delta.y, g_img_pos.y,
-                                  img_end.y - g_crop_size);
+                                  img_end.y - g_crop_h);
         }
         else
         {
-            float old = g_crop_size;
-            float ds = (g_crop_handle == 0 || g_crop_handle == 2) ? -delta.x : delta.x;
-            float want = old + ds;
+            float aspect = g_crop_w / g_crop_h;
+            bool left = (g_crop_handle == 0 || g_crop_handle == 2);
+            bool top = (g_crop_handle == 0 || g_crop_handle == 1);
+            ImVec2 anchor(left ? g_crop_pos.x + g_crop_w : g_crop_pos.x,
+                          top ? g_crop_pos.y + g_crop_h : g_crop_pos.y);
 
-            float room;
-            if (g_crop_handle == 3)
-                room = img_end.x - g_crop_pos.x < img_end.y - g_crop_pos.y
-                       ? img_end.x - g_crop_pos.x : img_end.y - g_crop_pos.y;
-            else if (g_crop_handle == 0)
-                room = g_crop_pos.x + old - g_img_pos.x < g_crop_pos.y + old - g_img_pos.y
-                       ? g_crop_pos.x + old - g_img_pos.x : g_crop_pos.y + old - g_img_pos.y;
-            else if (g_crop_handle == 1)
-                room = img_end.x - g_crop_pos.x < g_crop_pos.y + old - g_img_pos.y
-                       ? img_end.x - g_crop_pos.x : g_crop_pos.y + old - g_img_pos.y;
-            else
-                room = g_crop_pos.x + old - g_img_pos.x < img_end.y - g_crop_pos.y
-                       ? g_crop_pos.x + old - g_img_pos.x : img_end.y - g_crop_pos.y;
+            float want_w = left ? (anchor.x - mouse.x) : (mouse.x - anchor.x);
+            float want_h = top ? (anchor.y - mouse.y) : (mouse.y - anchor.y);
+            if (want_h * aspect > want_w) want_w = want_h * aspect;
 
-            float size = clampf(want, 40.0f, room);
-            float diff = size - old;
+            float room_x = left ? anchor.x - g_img_pos.x : img_end.x - anchor.x;
+            float room_y = (top ? anchor.y - g_img_pos.y : img_end.y - anchor.y) * aspect;
+            float room = room_x < room_y ? room_x : room_y;
 
-            if (g_crop_handle == 0) { g_crop_pos.x -= diff; g_crop_pos.y -= diff; }
-            else if (g_crop_handle == 1) { g_crop_pos.y -= diff; }
-            else if (g_crop_handle == 2) { g_crop_pos.x -= diff; }
-            g_crop_size = size;
+            float min_w = 40.0f < room ? 40.0f : room;
+            want_w = clampf(want_w, min_w, room);
+
+            g_crop_w = want_w;
+            g_crop_h = want_w / aspect;
+            g_crop_pos.x = left ? anchor.x - g_crop_w : anchor.x;
+            g_crop_pos.y = top ? anchor.y - g_crop_h : anchor.y;
         }
     }
 
     // Crosshair, dimmed outside, white frame, corner dots.
-    dl->AddLine(ImVec2(g_crop_pos.x + g_crop_size * 0.5f, g_crop_pos.y),
-                ImVec2(g_crop_pos.x + g_crop_size * 0.5f, g_crop_pos.y + g_crop_size),
+    dl->AddLine(ImVec2(g_crop_pos.x + g_crop_w * 0.5f, g_crop_pos.y),
+                ImVec2(g_crop_pos.x + g_crop_w * 0.5f, g_crop_pos.y + g_crop_h),
                 IM_COL32(255, 255, 255, 30));
-    dl->AddLine(ImVec2(g_crop_pos.x, g_crop_pos.y + g_crop_size * 0.5f),
-                ImVec2(g_crop_pos.x + g_crop_size, g_crop_pos.y + g_crop_size * 0.5f),
+    dl->AddLine(ImVec2(g_crop_pos.x, g_crop_pos.y + g_crop_h * 0.5f),
+                ImVec2(g_crop_pos.x + g_crop_w, g_crop_pos.y + g_crop_h * 0.5f),
                 IM_COL32(255, 255, 255, 30));
 
     dl->AddRectFilled(g_img_pos, ImVec2(g_img_pos.x + g_img_size.x, g_crop_pos.y),
                       IM_COL32(0, 0, 0, 160));
-    dl->AddRectFilled(ImVec2(g_img_pos.x, g_crop_pos.y + g_crop_size),
+    dl->AddRectFilled(ImVec2(g_img_pos.x, g_crop_pos.y + g_crop_h),
                       ImVec2(g_img_pos.x + g_img_size.x, g_img_pos.y + g_img_size.y),
                       IM_COL32(0, 0, 0, 160));
     dl->AddRectFilled(ImVec2(g_img_pos.x, g_crop_pos.y),
-                      ImVec2(g_crop_pos.x, g_crop_pos.y + g_crop_size),
+                      ImVec2(g_crop_pos.x, g_crop_pos.y + g_crop_h),
                       IM_COL32(0, 0, 0, 160));
-    dl->AddRectFilled(ImVec2(g_crop_pos.x + g_crop_size, g_crop_pos.y),
-                      ImVec2(g_img_pos.x + g_img_size.x, g_crop_pos.y + g_crop_size),
+    dl->AddRectFilled(ImVec2(g_crop_pos.x + g_crop_w, g_crop_pos.y),
+                      ImVec2(g_img_pos.x + g_img_size.x, g_crop_pos.y + g_crop_h),
                       IM_COL32(0, 0, 0, 160));
 
-    dl->AddRect(g_crop_pos, ImVec2(g_crop_pos.x + g_crop_size,
-                                   g_crop_pos.y + g_crop_size),
+    dl->AddRect(g_crop_pos, ImVec2(g_crop_pos.x + g_crop_w,
+                                   g_crop_pos.y + g_crop_h),
                 IM_COL32_WHITE, 0.0f, 0, 2.0f);
     for (int i = 0; i < 4; i++)
         dl->AddCircleFilled(p[i], 5.0f, (g_crop_handle == i) ? IM_COL32(100, 255, 100, 255)
@@ -570,10 +638,11 @@ void ui_view_avatar_crop()
     {
         int sx = (int)((g_crop_pos.x - g_img_pos.x) / g_img_scale);
         int sy = (int)((g_crop_pos.y - g_img_pos.y) / g_img_scale);
-        int ss = (int)(g_crop_size / g_img_scale);
-        if (apply_crop(sx, sy, ss))
+        int sw = (int)(g_crop_w / g_img_scale);
+        int sh = (int)(g_crop_h / g_img_scale);
+        if (apply_crop(sx, sy, sw, sh))
         {
-            log_line("profile: кроп принят (%d, %d, %d)", sx, sy, ss);
+            log_line("profile: кроп принят (%d, %d, %d, %d)", sx, sy, sw, sh);
             free_avatar_source();
             g_cropping = false;
             ImGui::CloseCurrentPopup();
@@ -584,7 +653,7 @@ void ui_view_avatar_crop()
         }
         else
         {
-            log_line("profile: кроп не вышел (%d, %d, %d)", sx, sy, ss);
+            log_line("profile: кроп не вышел (%d, %d, %d, %d)", sx, sy, sw, sh);
         }
     }
     ImGui::SameLine();
@@ -694,6 +763,7 @@ void ui_view_profile_editor()
 
     // ---- avatar ----
     {
+        ImGui::PushID("avatar");
         ImVec2 at = ImGui::GetCursorScreenPos();
         if (g_av_mode == 1 && g_av_preview)
         {
@@ -731,6 +801,80 @@ void ui_view_profile_editor()
         if (g_av_mode != 0 && ImGui::SmallButton(tr("Убрать выбор")))
             free_avatar_staged();
         ImGui::EndGroup();
+        ImGui::PopID();
+    }
+
+    // ---- banner ----
+    {
+        ImGui::PushID("banner");
+        ui_text_muted(tr("Баннер профиля"));
+        float bw = 280.0f;
+        float bh = bw / BANNER_ASPECT;
+        ImVec2 bp = ImGui::GetCursorScreenPos();
+        ImDrawList* bdl = ImGui::GetWindowDrawList();
+        bool drew = false;
+
+        if (g_bn_mode == 1 && g_bn_preview)
+        {
+            bdl->AddImageRounded((ImTextureID)g_bn_preview, bp,
+                                 ImVec2(bp.x + bw, bp.y + bh),
+                                 ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 8.0f);
+            drew = true;
+        }
+        else if (g_bn_mode != 2 && me && me->banner && me->banner[0])
+        {
+            char url[320];
+            cdn::user_banner(me, 512, url, sizeof(url));
+            const texture* bt = url[0] ? tex::get(url) : 0;
+            if (bt && bt->ready())
+            {
+                ImVec2 uv0(0, 0), uv1(1, 1);
+                float src_aspect = bt->height > 0
+                                 ? (float)bt->width / (float)bt->height : 1.0f;
+                if (src_aspect > BANNER_ASPECT)
+                {
+                    float visible = BANNER_ASPECT / src_aspect;
+                    uv0.x = (1.0f - visible) * 0.5f;
+                    uv1.x = 1.0f - uv0.x;
+                }
+                else if (src_aspect < BANNER_ASPECT)
+                {
+                    float visible = src_aspect / BANNER_ASPECT;
+                    uv0.y = (1.0f - visible) * 0.5f;
+                    uv1.y = 1.0f - uv0.y;
+                }
+                bdl->AddImageRounded(bt->id(), bp, ImVec2(bp.x + bw, bp.y + bh),
+                                     uv0, uv1, IM_COL32_WHITE, 8.0f);
+                drew = true;
+            }
+        }
+
+        if (!drew)
+            bdl->AddRectFilled(bp, ImVec2(bp.x + bw, bp.y + bh), col::bg_hover, 8.0f);
+        ImGui::Dummy(ImVec2(bw, bh));
+
+        ImGui::SameLine(0, 12.0f);
+        ImGui::BeginGroup();
+        if (ImGui::Button(tr("Выбрать файл"), ImVec2(220, 30)))
+            pick_banner_file();
+
+        if (g_bn_mode == 1) ui_text_muted(tr("новый: из файла"));
+        else if (g_bn_mode == 2) ui_text_muted(tr("будет убран"));
+        else if (me && me->banner && me->banner[0]) ui_text_muted(tr("текущий"));
+        else ui_text_muted(tr("нет баннера"));
+
+        if (g_bn_mode == 1 && ImGui::SmallButton(tr("Убрать выбор")))
+            free_banner_staged();
+        else if (g_bn_mode == 0 && me && me->banner && me->banner[0] &&
+                 ImGui::SmallButton(tr("Убрать баннер")))
+        {
+            free_banner_staged();
+            g_bn_mode = 2;
+        }
+        else if (g_bn_mode == 2 && ImGui::SmallButton(tr("Оставить")))
+            g_bn_mode = 0;
+        ImGui::EndGroup();
+        ImGui::PopID();
     }
 
     ImGui::Dummy(ImVec2(0, 4));
@@ -752,28 +896,52 @@ void ui_view_profile_editor()
             for (int i = 0; i < g_hist_n; i++)
             {
                 ImGui::PushID(i);
-                duser shim;
-                ccfset(&shim, 0, sizeof(shim));
-                shim.id = self_id;
-                shim.avatar = g_hist[i].hash;
 
                 char thumb_url[320];
-                cdn::user_avatar(&shim, 64, thumb_url, sizeof(thumb_url));
+                cdn::archived_avatar(self_id, g_hist[i].id, g_hist[i].hash, 64,
+                                     thumb_url, sizeof(thumb_url));
                 const texture* th = thumb_url[0] ? tex::get(thumb_url) : 0;
                 bool thumb_failed = th && th->state == TEX_FAILED;
 
                 ImVec2 av_at = ImGui::GetCursorScreenPos();
-                ui_avatar(&shim, 32.0f, false);
+                ImDrawList* tdl = ImGui::GetWindowDrawList();
+                float av_round = 32.0f * theme::avatar_rounding();
+                if (th && th->ready())
+                    tdl->AddImageRounded(th->id(), av_at,
+                                         ImVec2(av_at.x + 32.0f, av_at.y + 32.0f),
+                                         ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, av_round);
+                else
+                    tdl->AddRectFilled(av_at, ImVec2(av_at.x + 32.0f, av_at.y + 32.0f),
+                                       col::bg_hover, av_round);
+
+                ImGui::SetCursorScreenPos(av_at);
+                if (ImGui::InvisibleButton("##thumbview", ImVec2(32.0f, 32.0f)))
+                {
+                    if (thumb_failed)
+                    {
+                        // Dead link stays dead after the automatic attempts:
+                        // tapping the square asks for one more go.
+                        tex::retry(thumb_url);
+                    }
+                    else
+                    {
+                        char full[320];
+                        cdn::archived_avatar(self_id, g_hist[i].id, g_hist[i].hash, 4096,
+                                             full, sizeof(full));
+
+                        char name[160];
+                        cnprint(name, sizeof(name), "avatar-%s.png", g_hist[i].id);
+                        ui_open_image_viewer(full, name);
+                    }
+                }
+                if (ImGui::IsItemHovered())
+                {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                    ImGui::SetTooltip(thumb_failed ? tr("Не загрузилась, нажать чтобы повторить")
+                                                   : tr("Открыть аватарку"));
+                }
                 if (thumb_failed)
                 {
-                    // Dead link stays dead after the automatic attempts:
-                    // tapping the square asks for one more go.
-                    ImGui::SetCursorScreenPos(av_at);
-                    if (ImGui::InvisibleButton("##thumbretry", ImVec2(32.0f, 32.0f)))
-                        tex::retry(thumb_url);
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip(tr("Не загрузилась, нажать чтобы повторить"));
-                    ImDrawList* tdl = ImGui::GetWindowDrawList();
                     tdl->AddLine(av_at, ImVec2(av_at.x + 32.0f, av_at.y + 32.0f),
                                  col::red, 2.0f);
                     tdl->AddLine(ImVec2(av_at.x + 32.0f, av_at.y), ImVec2(av_at.x, av_at.y + 32.0f),
@@ -921,6 +1089,7 @@ void ui_view_profile_editor()
         bool av_ch = (g_av_mode == 1 && g_av_datauri) ||
                      (g_av_mode == 2 && g_av_hist_id[0]) ||
                      (g_av_mode == 3 && g_ed_manual_id[0]);
+        bool bn_ch = (g_bn_mode == 1 && g_bn_datauri) || g_bn_mode == 2;
 
         if (!me)
         {
@@ -932,7 +1101,7 @@ void ui_view_profile_editor()
             ccstrncpy(g_err_account, tr("Для смены юзернейма введи пароль"),
                       sizeof(g_err_account) - 1);
         }
-        else if (!name_ch && !user_ch && !bio_ch && !pro_ch && !av_ch)
+        else if (!name_ch && !user_ch && !bio_ch && !pro_ch && !av_ch && !bn_ch)
         {
             ImGui::CloseCurrentPopup();
             close_editor();
@@ -945,10 +1114,12 @@ void ui_view_profile_editor()
             g_err_profile[0] = 0;
             g_err_account[0] = 0;
 
-            if (bio_ch || pro_ch)
+            if (bio_ch || pro_ch || bn_ch)
             {
                 api::update_profile(bio_ch ? nonempty_or_null(g_ed_bio) : 0,
-                                    pro_ch ? nonempty_or_null(g_ed_pronouns) : 0);
+                                    pro_ch ? nonempty_or_null(g_ed_pronouns) : 0,
+                                    (g_bn_mode == 1) ? g_bn_datauri : 0,
+                                    g_bn_mode == 2);
                 g_busy_profile = true;
             }
             const char* av_data = (g_av_mode == 1) ? g_av_datauri : 0;

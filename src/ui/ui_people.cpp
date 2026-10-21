@@ -1476,8 +1476,27 @@ void ui_view_profile_popup()
         const texture* t = tex::get(banner_url);
         if (t->ready())
         {
+            // Cover the strip without squashing: crop the longer side.
+            ImVec2 uv0(0, 0), uv1(1, 1);
+            if (t->width > 0 && t->height > 0)
+            {
+                float img_ar = (float)t->width / (float)t->height;
+                float box_ar = banner_w / banner_h;
+                if (img_ar > box_ar)
+                {
+                    float frac = box_ar / img_ar;
+                    uv0.x = (1.0f - frac) * 0.5f;
+                    uv1.x = 1.0f - uv0.x;
+                }
+                else if (img_ar < box_ar)
+                {
+                    float frac = img_ar / box_ar;
+                    uv0.y = (1.0f - frac) * 0.5f;
+                    uv1.y = 1.0f - uv0.y;
+                }
+            }
             dl->AddImageRounded(t->id(), p, ImVec2(p.x + banner_w, p.y + banner_h),
-                                ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 8.0f);
+                                uv0, uv1, IM_COL32_WHITE, 8.0f);
             drew_banner = true;
 
             // Clicking it opens the real thing rather than this strip. The
@@ -1742,18 +1761,6 @@ void ui_view_profile_popup()
 
         if (offline::active())
             ui_text_muted(tr("Пока нет связи, изменения не уйдут"));
-
-        ImGui::Dummy(ImVec2(0, 6));
-        ui_text_muted(tr("Баннер заменяется сразу, отдельно от профиля"));
-
-        if (ImGui::Button(tr("Баннер..."), ImVec2(160, 26)))
-        {
-            wchar_t chosen[MAX_PATH];
-            if (ufile::open_dialog(chosen, MAX_PATH))
-                api::update_self_image(true, chosen);
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton(tr("убрать баннер"))) api::update_self_image(true, 0);
 
         ImGui::Dummy(ImVec2(0, 6));
     }
@@ -2186,6 +2193,11 @@ void ui_view_channel_info_popup()
 
         if (c->user_limit) cnprint(line, sizeof(line), "%d", c->user_limit);
         info_line(tr("Лимит участников"), c->user_limit ? line : tr("без лимита"));
+
+        static ulist<snowflake> in_voice;
+        store::users_in_voice(c->id, &in_voice);
+        cnprint(line, sizeof(line), "%d", (int)in_voice.count);
+        info_line(tr("Сейчас в канале"), line);
     }
     else
     {
@@ -2265,6 +2277,17 @@ void ui_view_channel_info_popup()
         ImGui::TextUnformatted(hidden ? tr("Этот аккаунт читать канал не может")
                                       : tr("Этот аккаунт канал читать может"));
         ImGui::PopStyleColor();
+
+        // A voice channel holds a second question the first one says nothing
+        // about: seeing the room and being let into it are separate bits.
+        if (c->is_voice())
+        {
+            bool connect = store::can_connect_channel(g, store::self_id(), c);
+            ImGui::PushStyleColor(ImGuiCol_Text, connect ? col::green : col::red);
+            ImGui::TextUnformatted(connect ? tr("Этот аккаунт может подключиться")
+                                           : tr("Этот аккаунт подключиться не может"));
+            ImGui::PopStyleColor();
+        }
     }
 
     ImGui::Dummy(ImVec2(0, 10));

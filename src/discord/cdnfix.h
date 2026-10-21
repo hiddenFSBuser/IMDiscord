@@ -23,11 +23,13 @@ namespace cdnfix
 
     // The link to actually use for this attachment.
     //
-    // Returns the original when it carries no expiry or has not reached it, a
-    // refreshed one when that has arrived, and null while a refresh is still
-    // in flight - which the caller should draw as "loading" rather than as a
-    // failure, because that is what it is.
-    const char* usable(const char* url);
+    // Returns the original when it carries no expiry or has not reached it,
+    // and otherwise copies the refreshed one into out and returns that: the
+    // entry it comes from is rewritten by a worker the moment another refresh
+    // answers, so an address into the table outlives nothing. Null while a
+    // refresh is still in flight - which the caller should draw as "loading"
+    // rather than as a failure, because that is what it is.
+    const char* usable(const char* url, char* out, int out_cap);
 
     // Sends whatever has been gathered. Called from the frame loop; does
     // nothing until there is something to ask about.

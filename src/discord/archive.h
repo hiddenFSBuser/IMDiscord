@@ -43,6 +43,12 @@ namespace archive
     // anything already there. Returns how many messages it added.
     int load_channel(snowflake channel_id);
 
+    // The same load on a worker thread, for the chat view: a big channel is
+    // millions of bytes of json and reading it inline freezes the frame. The
+    // restored count lands on the channel when the job finishes, and it is
+    // dropped if the account changed while it ran.
+    void load_channel_async(snowflake channel_id);
+
     // How many messages are on disk for a channel, and for everything.
     unsigned int channel_count(snowflake channel_id);
     unsigned int total_messages();

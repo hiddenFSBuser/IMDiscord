@@ -52,6 +52,13 @@ namespace
         const char* text;
     };
     ulist<intern_entry> g_interned;
+
+    // A bulk load (the archive, mostly) would otherwise rebuild the dm
+    // sidebar order once per message. Inside a batch the rebuild is deferred
+    // and done once when the outermost batch ends. Two loads can overlap on
+    // worker threads, so the depth is counted atomically.
+    volatile long g_batch_depth = 0;
+    volatile long g_batch_dm_dirty = 0;
 }
 
 void store::init()
@@ -838,6 +845,21 @@ bool store::can_view_channel(const dguild* g, snowflake user_id, const dchannel*
     return (member_permissions(g, user_id, c) & PERM_VIEW_CHANNEL) != 0;
 }
 
+bool store::can_connect_channel(const dguild* g, snowflake user_id, const dchannel* c)
+{
+    // The same three answers as can_view_channel, for the same reasons: an
+    // unknown member or an empty table is not evidence of a closed door.
+    if (!g || !c) return true;
+    if (!c->overwrites.count && !g->roles.count) return true;
+
+    bool known = false;
+    for (unsigned int i = 0; i < g->members.count && !known; i++)
+        if (g->members[i].user_id == user_id) known = true;
+    if (!known) return true;
+
+    return (member_permissions(g, user_id, c) & PERM_CONNECT) != 0;
+}
+
 void store::sort_guild_channels(dguild* g)
 {
     if (!g) return;
@@ -919,9 +941,15 @@ void store::remove_guild(snowflake id)
 dmessage* store::find_message(dchannel* ch, snowflake id)
 {
     if (!ch) return 0;
+
+    // Messages are kept sorted by id, so the walk can stop the moment it
+    // drops below the target. Without that stop every warm-up insert scans
+    // the whole list, and a large archive costs a full pass per message.
     for (unsigned int i = ch->messages.count; i > 0; i--)
     {
-        if (ch->messages[i - 1].id == id) return &ch->messages[i - 1];
+        snowflake at = ch->messages[i - 1].id;
+        if (at == id) return &ch->messages[i - 1];
+        if (at < id) break;
     }
     return 0;
 }
@@ -1376,7 +1404,11 @@ dmessage* store::upsert_message(const jval* v)
         if (who && who->bot) msg->application_id = msg->author_id;
     }
 
-    if (ch->is_dm()) touch_dm_order();
+    if (ch->is_dm())
+    {
+        if (g_batch_depth > 0) InterlockedExchange(&g_batch_dm_dirty, 1);
+        else touch_dm_order();
+    }
 
     return msg;
 }
@@ -1958,6 +1990,25 @@ void store::set_sessions(const jval* arr)
 }
 
 const ulist<dsession>& store::sessions() { return g_sessions; }
+
+void store::batch_begin()
+{
+    InterlockedIncrement(&g_batch_depth);
+}
+
+void store::batch_end()
+{
+    long left = InterlockedDecrement(&g_batch_depth);
+    if (left > 0) return;
+
+    // The dm order is store state the ui thread reads under the lock, and the
+    // caller of a batch (a load worker) does not hold it.
+    if (InterlockedExchange(&g_batch_dm_dirty, 0) != 0)
+    {
+        store::guard guard;
+        touch_dm_order();
+    }
+}
 
 void store::touch_dm_order()
 {

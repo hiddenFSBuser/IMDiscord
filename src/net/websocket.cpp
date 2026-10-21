@@ -45,16 +45,24 @@ namespace
 
 void websocket::init()
 {
+    // Initialized once for the life of the object. A reconnect re-inits a
+    // websocket other threads may still be sending on, and re-initializing a
+    // lock somebody holds resets it under them.
+    if (!lock_ready)
+    {
+        InitializeCriticalSection(&send_lock);
+        lock_ready = true;
+    }
+
+    EnterCriticalSection(&send_lock);
     ccfset(&stream, 0, sizeof(stream));
     stream.plain = INVALID_SOCKET;
 
-    open = 0;
+    InterlockedExchange(&open, 0);
     close_status = 0;
     inbox.init(1 << 16);
     inbox_at = 0;
-
-    InitializeCriticalSection(&send_lock);
-    lock_ready = true;
+    LeaveCriticalSection(&send_lock);
 }
 
 bool websocket::connect(const char* url, const char* extra_headers, const proxy_config* proxy)
@@ -275,8 +283,17 @@ namespace
         }
 
         EnterCriticalSection(&ws->send_lock);
-        bool ok = httpstream::write_all(&ws->stream, head, n);
-        if (ok && len) ok = httpstream::write_all(&ws->stream, body.data, (int)len);
+
+        // The open flag is read again under the lock: a close that is already
+        // in flight holds it, so a frame that loses that race must not touch
+        // the stream the close is about to tear down.
+        bool ok = false;
+        if (ws->open)
+        {
+            ok = httpstream::write_all(&ws->stream, head, n);
+            if (ok && len) ok = httpstream::write_all(&ws->stream, body.data, (int)len);
+        }
+
         LeaveCriticalSection(&ws->send_lock);
 
         body.free_buffer();
@@ -505,8 +522,17 @@ void websocket::close()
 
 void websocket::close_handles()
 {
-    httpstream::close(&stream);
+    // The flag goes down first, so a sender that has not yet passed its check
+    // gives up. The lock then waits out one that is already inside: closing
+    // the stream under a writer frees the tls state it is still writing into,
+    // and that is a heap corruption with no witness - it surfaces later in
+    // whatever unlucky thread allocates next.
     InterlockedExchange(&open, 0);
+
+    if (lock_ready) EnterCriticalSection(&send_lock);
+    httpstream::close(&stream);
+    if (lock_ready) LeaveCriticalSection(&send_lock);
+
     inbox.clear();
     inbox_at = 0;
 }
@@ -514,13 +540,16 @@ void websocket::close_handles()
 void websocket::destroy()
 {
     close_handles();
-    inbox.free_buffer();
 
-    if (lock_ready)
-    {
-        DeleteCriticalSection(&send_lock);
-        lock_ready = false;
-    }
+    // The lock itself is never handed back. This object can be destroyed
+    // while the heartbeat or the ui is still inside send - a reconnect is
+    // exactly that - and a deleted critical section is a trap for whichever
+    // thread loses that race. There are a handful of these in the process,
+    // so the leak is nothing next to the crash.
+    if (lock_ready) EnterCriticalSection(&send_lock);
+    inbox.free_buffer();
+    inbox_at = 0;
+    if (lock_ready) LeaveCriticalSection(&send_lock);
 }
 
 bool ws::self_test()

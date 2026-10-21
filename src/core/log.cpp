@@ -8,6 +8,58 @@ static bool g_log_ready = false;
 
 namespace
 {
+    // Lines are batched in memory and the writer thread drains them every
+    // LOG_FLUSH_INTERVAL_MS. Flushing the file after every single line (what
+    // this used to do) turns each log_line into a disk sync - with voice and
+    // stream logs that is a freeze source and needless wear.
+    //
+    // For hunting a crash that happens during a specific test, set this to 0:
+    // then every line is written and flushed on the calling thread, exactly
+    // like the old behaviour, and nothing is lost if the process dies mid-run.
+    constexpr DWORD LOG_FLUSH_INTERVAL_MS = 3000;
+
+    ubuffer g_pending;
+    HANDLE g_log_thread = 0;
+    HANDLE g_log_wake = 0;
+    volatile LONG g_log_running = 0;
+
+    void drain_pending()
+    {
+        unsigned char* data = 0;
+        unsigned int size = 0;
+
+        EnterCriticalSection(&g_log_lock);
+        data = g_pending.data;
+        size = g_pending.size;
+        g_pending.data = 0;
+        g_pending.size = 0;
+        g_pending.cap = 0;
+        HANDLE f = g_log_file;
+        LeaveCriticalSection(&g_log_lock);
+
+        if (!data) return;
+
+        if (f != INVALID_HANDLE_VALUE && size)
+        {
+            DWORD written = 0;
+            WriteFile(f, data, size, &written, 0);
+            FlushFileBuffers(f);
+        }
+        memfree(data);
+    }
+
+    DWORD WINAPI log_writer_thread(LPVOID)
+    {
+        for (;;)
+        {
+            DWORD w = WaitForSingleObject(g_log_wake, LOG_FLUSH_INTERVAL_MS);
+            if (w == WAIT_OBJECT_0 || !g_log_running) break;
+            drain_pending();
+        }
+        drain_pending();
+        return 0;
+    }
+
     // Whether this run is one of the "--*test" modes rather than the client.
     //
     // Those write somewhere else and leave the ordinary log alone. A test run
@@ -130,14 +182,49 @@ void log_init()
         wcstochar(chosen, where, (int)sizeof(where));
         log_line("log: пишу в %s", where);
     }
+
+    if (LOG_FLUSH_INTERVAL_MS != 0 && g_log_file != INVALID_HANDLE_VALUE)
+    {
+        g_log_wake = CreateEventW(0, FALSE, FALSE, 0);
+        if (g_log_wake)
+        {
+            g_log_running = 1;
+            g_log_thread = CreateThread(0, 0, log_writer_thread, 0, 0, 0);
+            if (!g_log_thread)
+            {
+                // Without the thread nothing would ever reach the file, so
+                // fall back to draining from log_raw itself.
+                g_log_running = 0;
+                CloseHandle(g_log_wake);
+                g_log_wake = 0;
+            }
+        }
+    }
 }
 
 void log_shutdown()
 {
     if (!g_log_ready) return;
+
+    if (g_log_thread)
+    {
+        InterlockedExchange(&g_log_running, 0);
+        if (g_log_wake) SetEvent(g_log_wake);
+        WaitForSingleObject(g_log_thread, 5000);
+        CloseHandle(g_log_thread);
+        g_log_thread = 0;
+        if (g_log_wake)
+        {
+            CloseHandle(g_log_wake);
+            g_log_wake = 0;
+        }
+    }
+    drain_pending();
+
     EnterCriticalSection(&g_log_lock);
     if (g_log_file != INVALID_HANDLE_VALUE)
     {
+        FlushFileBuffers(g_log_file);
         CloseHandle(g_log_file);
         g_log_file = INVALID_HANDLE_VALUE;
     }
@@ -148,12 +235,23 @@ static void log_raw(const char* text, int len)
 {
     OutputDebugStringA(text);
 
-    if (!g_log_ready || g_log_file == INVALID_HANDLE_VALUE) return;
+    if (!g_log_ready) return;
+
+    // Debug mode (interval 0): straight to disk, every line, like before the
+    // writer thread existed. Anything else batches in memory.
+    if (LOG_FLUSH_INTERVAL_MS == 0 || !g_log_thread)
+    {
+        if (g_log_file == INVALID_HANDLE_VALUE) return;
+        EnterCriticalSection(&g_log_lock);
+        DWORD written = 0;
+        WriteFile(g_log_file, text, (DWORD)len, &written, 0);
+        FlushFileBuffers(g_log_file);
+        LeaveCriticalSection(&g_log_lock);
+        return;
+    }
 
     EnterCriticalSection(&g_log_lock);
-    DWORD written = 0;
-    WriteFile(g_log_file, text, (DWORD)len, &written, 0);
-    FlushFileBuffers(g_log_file);
+    g_pending.append(text, (unsigned int)len);
     LeaveCriticalSection(&g_log_lock);
 }
 

@@ -49,6 +49,49 @@ namespace
     unsigned long long g_allow = 0;
     unsigned long long g_deny = 0;
 
+    bool g_paint_active = false;
+    int g_paint_state = -1;
+
+    void apply_perm(const perm_row* p, int state)
+    {
+        if (state == 0)
+        {
+            g_deny |= p->bit;
+            g_allow &= ~p->bit;
+        }
+        else if (state == 1)
+        {
+            g_allow &= ~p->bit;
+            g_deny &= ~p->bit;
+        }
+        else
+        {
+            g_allow |= p->bit;
+            g_deny &= ~p->bit;
+        }
+    }
+
+    void paint_button(const perm_row* p, int state, const char* glyph,
+                      bool on, ImU32 color)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button, on ? color : col::bg_panel);
+        ImGui::Button(glyph, ImVec2(26, 22));
+        bool hovered = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+        ImGui::PopStyleColor();
+
+        if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        {
+            g_paint_active = true;
+            g_paint_state = state;
+            apply_perm(p, state);
+        }
+        else if (g_paint_active && g_paint_state == state && hovered &&
+                 ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        {
+            apply_perm(p, state);
+        }
+    }
+
     const doverwrite* find_overwrite(const dchannel* c, snowflake target)
     {
         for (unsigned int i = 0; i < c->overwrites.count; i++)
@@ -61,6 +104,8 @@ namespace
         g_ui.chanperm_target = target;
         g_allow = 0;
         g_deny = 0;
+        g_paint_active = false;
+        g_paint_state = -1;
 
         const doverwrite* o = find_overwrite(c, target);
         if (o) { g_allow = o->allow; g_deny = o->deny; }
@@ -75,33 +120,13 @@ namespace
 
         ImGui::PushID((const void*)(size_t)p->bit);
 
-        ImU32 off = col::bg_panel;
-
-        ImGui::PushStyleColor(ImGuiCol_Button, denied ? col::red : off);
-        if (ImGui::Button("✕", ImVec2(26, 22)))
-        {
-            g_deny = denied ? (g_deny & ~p->bit) : (g_deny | p->bit);
-            if (!denied) g_allow &= ~p->bit;
-        }
-        ImGui::PopStyleColor();
+        paint_button(p, 0, "✕", denied, col::red);
 
         ImGui::SameLine(0, 3);
-        ImGui::PushStyleColor(ImGuiCol_Button, (!allowed && !denied) ? col::accent : off);
-        if (ImGui::Button("/", ImVec2(26, 22)))
-        {
-            g_allow &= ~p->bit;
-            g_deny &= ~p->bit;
-        }
-        ImGui::PopStyleColor();
+        paint_button(p, 1, "/", !allowed && !denied, col::accent);
 
         ImGui::SameLine(0, 3);
-        ImGui::PushStyleColor(ImGuiCol_Button, allowed ? col::green : off);
-        if (ImGui::Button("✓", ImVec2(26, 22)))
-        {
-            g_allow = allowed ? (g_allow & ~p->bit) : (g_allow | p->bit);
-            if (!allowed) g_deny &= ~p->bit;
-        }
-        ImGui::PopStyleColor();
+        paint_button(p, 2, "✓", allowed, col::green);
 
         ImGui::SameLine();
         ImGui::TextUnformatted(tr(p->label));
@@ -115,6 +140,8 @@ void ui_open_channel_perms(snowflake channel_id)
     g_ui.chanperm_target = 0;
     g_allow = 0;
     g_deny = 0;
+    g_paint_active = false;
+    g_paint_state = -1;
     g_ui.open_chanperm_popup = true;
     api::clear_last_error();
 }
@@ -200,6 +227,12 @@ void ui_view_channel_perms_popup()
     {
         ui_text_muted(tr("✕ запретить   /  наследовать   ✓ разрешить"));
         ImGui::Separator();
+
+        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+        {
+            g_paint_active = false;
+            g_paint_state = -1;
+        }
 
         for (int i = 0; i < PERM_COUNT; i++) tri_state(&PERMS[i]);
     }

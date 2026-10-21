@@ -230,7 +230,7 @@ void cdnfix::reset()
     LeaveCriticalSection(&g_lock);
 }
 
-const char* cdnfix::usable(const char* url)
+const char* cdnfix::usable(const char* url, char* out, int out_cap)
 {
     if (!g_ready || !url || !url[0]) return url;
 
@@ -249,9 +249,18 @@ const char* cdnfix::usable(const char* url)
 
     if (f && f->url[0] && f->expires > now + 60)
     {
-        const char* fresh = f->url;
+        // Copied out rather than handed over: the refresh job answers while
+        // the caller is still drawing, and writes the new link straight into
+        // the entry a pointer would have been aiming at.
+        if (out && out_cap > 0)
+        {
+            ccstrncpy(out, f->url, out_cap - 1);
+            LeaveCriticalSection(&g_lock);
+            return out;
+        }
+
         LeaveCriticalSection(&g_lock);
-        return fresh;
+        return 0;
     }
 
     if (!f) f = make(key);
@@ -328,7 +337,9 @@ bool cdnfix::self_test()
         return false;
     }
 
-    if (cdnfix::usable(plain) != plain)
+    char out[512];
+
+    if (cdnfix::usable(plain, out, sizeof(out)) != plain)
     {
         log_line("cdnfix: самопроверка: обычная ссылка не вернулась как есть");
         return false;
@@ -357,18 +368,37 @@ bool cdnfix::self_test()
 
     // An expired one is not handed back, and it is queued exactly once
     // however often it is asked for.
-    if (cdnfix::usable(signed_url) != 0)
+    if (cdnfix::usable(signed_url, out, sizeof(out)) != 0)
     {
         log_line("cdnfix: самопроверка: просроченная ссылка выдана как годная");
         return false;
     }
 
-    cdnfix::usable(signed_url);
-    cdnfix::usable(signed_url);
+    cdnfix::usable(signed_url, out, sizeof(out));
+    cdnfix::usable(signed_url, out, sizeof(out));
 
     if (g_queued != 1)
     {
         log_line("cdnfix: самопроверка: в очереди %d, ждали 1", g_queued);
+        return false;
+    }
+
+    // A refreshed link comes out as a copy: the table entry behind it is
+    // rewritten by the worker the moment the next answer arrives, so what is
+    // handed to the caller cannot be an address into the table.
+    cdnfix::reset();
+
+    fixed* fresh = make(path_key(signed_url));
+    ccstrncpy(fresh->url, "https://cdn.discordapp.com/attachments/1/2/a.png?ex=7fffffff&hm=ff",
+              sizeof(fresh->url) - 1);
+    fresh->expires = 0x7fffffffull;
+
+    char copied[512];
+    const char* got = cdnfix::usable(signed_url, copied, sizeof(copied));
+
+    if (got != copied || !copied[0])
+    {
+        log_line("cdnfix: самопроверка: свежая ссылка не скопирована в буфер");
         return false;
     }
 

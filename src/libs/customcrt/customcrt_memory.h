@@ -46,6 +46,7 @@ __forceinline unsigned __int64 ccrc64(void* buffer, unsigned int size) { return 
 __forceinline unsigned __int64 ccrc64(unsigned long long buffer, unsigned int size) { return ccrc64((const void*)buffer, size); }
 
 void* memalloc(int size);
+void* memallocf(int size);
 void* memrealloc(void* ptr, int size);
 void memfree(void* ptr);
 inline void memfree(const void* ptr) { memfree((void*)ptr); }

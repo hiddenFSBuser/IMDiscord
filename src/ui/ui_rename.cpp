@@ -16,6 +16,29 @@ namespace
 {
     char g_typed[128];
     snowflake g_loaded = 0;
+
+    snowflake g_slow_channel = 0;
+    snowflake g_slow_loaded = 0;
+    bool g_slow_open = false;
+    int g_slow_seconds = 0;
+
+    const int SLOW_SECONDS[] = { 0, 5, 10, 15, 30, 60, 120, 300, 600, 900,
+                                 1800, 3600, 7200, 21600 };
+    const int SLOW_COUNT = (int)(sizeof(SLOW_SECONDS) / sizeof(SLOW_SECONDS[0]));
+
+    void slow_label(int seconds, char* out, int cap)
+    {
+        if (seconds <= 0)
+            ccstrncpy(out, tr("Выключено"), cap - 1);
+        else if (seconds < 60)
+            cnprint(out, cap, tr("%d с"), seconds);
+        else if (seconds % 3600 == 0)
+            cnprint(out, cap, tr("%d ч"), seconds / 3600);
+        else if (seconds % 60 == 0)
+            cnprint(out, cap, tr("%d мин"), seconds / 60);
+        else
+            cnprint(out, cap, tr("%d с"), seconds);
+    }
 }
 
 void ui_open_rename_channel(snowflake channel_id)
@@ -101,6 +124,103 @@ void ui_view_rename_popup()
     if (go)
     {
         api::rename_channel(c->id, g_typed);
+        ImGui::CloseCurrentPopup();
+    }
+
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Отмена"), ImVec2(120, 30)) ||
+        ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+    {
+        api::clear_last_error();
+        ImGui::CloseCurrentPopup();
+    }
+
+    if (api::last_error()[0])
+    {
+        ImGui::Dummy(ImVec2(0, 6));
+        ImGui::PushStyleColor(ImGuiCol_Text, col::yellow);
+        ImGui::TextWrapped("%s", api::last_error());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::EndPopup();
+    ImGui::PopStyleColor();
+}
+
+void ui_open_slowmode(snowflake channel_id)
+{
+    g_slow_channel = channel_id;
+    g_slow_loaded = 0;
+    g_slow_open = true;
+    api::clear_last_error();
+}
+
+void ui_view_slowmode_popup()
+{
+    if (g_slow_open)
+    {
+        ImGui::OpenPopup("##slowmode");
+        g_slow_open = false;
+    }
+
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f,
+                                   vp->WorkPos.y + vp->WorkSize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(400, 0));
+
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImGui::ColorConvertU32ToFloat4(col::bg_panel));
+    if (!ImGui::BeginPopupModal("##slowmode", 0,
+                                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    store::guard guard;
+
+    dchannel* c = store::find_channel(g_slow_channel);
+    if (!c)
+    {
+        ui_text_muted(tr("Канал недоступен"));
+        if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30))) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+        ImGui::PopStyleColor();
+        return;
+    }
+
+    if (g_slow_loaded != c->id)
+    {
+        g_slow_loaded = c->id;
+        g_slow_seconds = c->rate_limit_per_user;
+    }
+
+    ImGui::TextUnformatted(tr("Медленный режим"));
+    ImGui::Separator();
+    ImGui::Dummy(ImVec2(0, 4));
+
+    char current[32];
+    slow_label(g_slow_seconds, current, sizeof(current));
+
+    ImGui::SetNextItemWidth(220);
+    if (ImGui::BeginCombo(tr("Медленный режим"), current))
+    {
+        for (int i = 0; i < SLOW_COUNT; i++)
+        {
+            char label[32];
+            slow_label(SLOW_SECONDS[i], label, sizeof(label));
+            if (ImGui::Selectable(label, g_slow_seconds == SLOW_SECONDS[i]))
+                g_slow_seconds = SLOW_SECONDS[i];
+        }
+
+        ImGui::EndCombo();
+    }
+
+    ImGui::Dummy(ImVec2(0, 10));
+
+    if (ImGui::Button(tr("Сохранить"), ImVec2(130, 30)))
+    {
+        api::set_channel_slowmode(c->id, g_slow_seconds);
         ImGui::CloseCurrentPopup();
     }
 

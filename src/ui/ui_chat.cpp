@@ -131,10 +131,11 @@ namespace
             // cdnfix queued on the ask above, so wait for it rather than
             // failing at once.
             blob->clear();
+            char live_buf[512];
             for (int i = 0; i < 20 && !ok; i++)
             {
                 Sleep(500);
-                const char* live = cdnfix::usable(url);
+                const char* live = cdnfix::usable(url, live_buf, sizeof(live_buf));
                 if (!live) continue;
                 if (live == url) break;   // not expirable: tried already
                 blob->clear();
@@ -202,7 +203,8 @@ namespace
             // The address likely expired: queue a refresh and try the living
             // one if it is already known. Copying cannot wait for the round
             // trip, so a queued refresh reads as "try again".
-            const char* live = cdnfix::usable(url);
+            char live_buf[512];
+            const char* live = cdnfix::usable(url, live_buf, sizeof(live_buf));
             if (live && live != url && tex::fetch_blob(live, &blob) && blob.size)
             {
                 // Falls through to decoding below.
@@ -774,7 +776,8 @@ namespace
     void copy_link_url(const char* url)
     {
         if (!url || !url[0]) return;
-        const char* live = cdnfix::usable(url);
+        char live_buf[512];
+        const char* live = cdnfix::usable(url, live_buf, sizeof(live_buf));
         ImGui::SetClipboardText(live && live[0] ? live : url);
     }
 
@@ -1083,7 +1086,8 @@ namespace
         // attachment link stops working on a date written into it. So the one
         // actually used may be a refreshed one, and while that is being
         // fetched there is no link at all.
-        const char* live = cdnfix::usable(url);
+        char live_buf[512];
+        const char* live = cdnfix::usable(url, live_buf, sizeof(live_buf));
         bool refreshing = (live == 0);
 
         const texture* t = live ? tex::get(live) : 0;
@@ -4782,9 +4786,9 @@ void ui_view_chat(float width, float height)
     {
         ch->archive_loaded = true;
 
-        int restored = archive::load_channel(ch->id);
-        ch->archive_messages = restored;
-        if (restored) store::bump_revision();
+        // On a worker: a big channel would otherwise stall this frame for
+        // the whole parse. The count and the redraw arrive with the job.
+        archive::load_channel_async(ch->id);
     }
 
     if (!ch->history_loaded && !ch->history_loading && !ch->history_failed)

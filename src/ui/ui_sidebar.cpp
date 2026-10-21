@@ -22,6 +22,7 @@
 #include "audio/sounds.h"
 #include "audio/music.h"
 #include "discord/science.h"
+#include "discord/captcha.h"
 #include "video/screenshare.h"
 #include "video/streamview.h"
 #include "video/streampreview.h"
@@ -626,7 +627,32 @@ namespace
         ImGui::Dummy(ImVec2(0, 2));
     }
 
-    bool channel_row(dchannel* c, bool active, float width, bool hidden)
+    bool has_slowmode(dchannel* c)
+    {
+        if (!c || c->is_dm() || c->is_voice()) return false;
+        return c->type == CH_GUILD_TEXT || c->type == CH_ANNOUNCEMENT ||
+               c->type == CH_FORUM || c->type == CH_PUBLIC_THREAD ||
+               c->type == CH_PRIVATE_THREAD || c->type == CH_ANNOUNCEMENT_THREAD;
+    }
+
+    // Whether walking into this voice channel would actually be an option.
+    // Discord hands out "see it" and "walk in" as two separate bits, and a
+    // room already at its limit turns everyone away except those who can move
+    // people - which is how the real client reads it too.
+    bool voice_joinable(dguild* g, dchannel* c)
+    {
+        if (!store::can_connect_channel(g, store::self_id(), c)) return false;
+        if (voice::current_channel() == c->id) return true;
+        if (c->user_limit <= 0) return true;
+
+        static ulist<snowflake> in_voice;
+        store::users_in_voice(c->id, &in_voice);
+        if ((int)in_voice.count < c->user_limit) return true;
+
+        return (store::member_permissions(g, store::self_id(), c) & PERM_MOVE_MEMBERS) != 0;
+    }
+
+    bool channel_row(dchannel* c, dguild* g, bool active, float width, bool hidden)
     {
         char label[256];
         ui_channel_display_name(c, label, sizeof(label));
@@ -634,6 +660,18 @@ namespace
         bool is_voice = (c->type == CH_GUILD_VOICE || c->type == CH_STAGE);
         float row_w = width - 16.0f;
         float row_h = 26.0f;
+
+        // Two facts discord keeps apart but the eye wants together: how full
+        // the room is, and whether this account could step in at all.
+        int occupants = 0;
+        bool connect_ok = true;
+        if (is_voice)
+        {
+            static ulist<snowflake> in_voice;
+            store::users_in_voice(c->id, &in_voice);
+            occupants = (int)in_voice.count;
+            connect_ok = store::can_connect_channel(g, store::self_id(), c);
+        }
 
         ImVec2 start = ImGui::GetCursorScreenPos();
         bool clicked = ImGui::InvisibleButton("##ch", ImVec2(row_w, row_h));
@@ -649,12 +687,40 @@ namespace
         ImU32 tint = active ? col::text_normal : col::text_muted;
         if (hidden && !active) tint = IM_COL32(110, 114, 124, 255);
 
-        ui_draw_icon(dl, is_voice ? ICON_SPEAKER : (c->type == CH_FORUM ? ICON_FORUM : ICON_HASH),
-                     ImVec2(start.x + 13.0f, start.y + row_h * 0.5f), 15.0f, tint);
+        // A speaker where stepping in is allowed, a lock where it is not -
+        // the same thing the real client shows when the connect bit is
+        // missing, and the first reason a click can do nothing.
+        if (is_voice && !hidden && !connect_ok)
+            draw_lock(dl, ImVec2(start.x + 13.0f, start.y + row_h * 0.5f), 14.0f, tint);
+        else
+            ui_draw_icon(dl, is_voice ? ICON_SPEAKER : (c->type == CH_FORUM ? ICON_FORUM : ICON_HASH),
+                         ImVec2(start.x + 13.0f, start.y + row_h * 0.5f), 15.0f, tint);
 
         ImVec2 text_size = ImGui::CalcTextSize(label);
         ui_draw_text_emoji(dl, ImVec2(start.x + 28.0f, start.y + (row_h - text_size.y) * 0.5f),
                            tint, label);
+
+        // A limited room wears its count the way discord's own client does -
+        // "02 | 02" - and turns red the moment the room is full. Half of the
+        // answer to "why did nothing happen when I clicked"; the other half
+        // is the lock above.
+        if (is_voice && !hidden && c->user_limit > 0)
+        {
+            char slots[32];
+            cnprint(slots, sizeof(slots), "%02d | %02d", occupants, c->user_limit);
+
+            ImVec2 size = ImGui::CalcTextSize(slots);
+            bool full = occupants >= c->user_limit;
+
+            float right = start.x + row_w - 10.0f;
+            float w = size.x + 12.0f;
+
+            dl->AddRectFilled(ImVec2(right - w, start.y + 4.0f),
+                              ImVec2(right, start.y + row_h - 4.0f),
+                              col::bg_active, (row_h - 8.0f) * 0.5f);
+            dl->AddText(ImVec2(right - w + 6.0f, start.y + (row_h - size.y) * 0.5f),
+                        full ? col::red : col::text_muted, slots);
+        }
 
         // Access lost but something saved: the disk copy is still readable,
         // and the box says so next to the lock.
@@ -1175,7 +1241,7 @@ void ui_view_channel_list(float width, float height)
                     bool hidden = !store::can_view_channel(g, store::self_id(), c);
                     if (hidden && !g_ui.show_hidden_channels) { ImGui::PopID(); continue; }
 
-                    bool clicked = channel_row(c, active, width, hidden);
+                    bool clicked = channel_row(c, g, active, width, hidden);
 
                     // Dragging one channel onto another puts it where that one
                     // is. The payload is the id rather than the index, because
@@ -1254,6 +1320,7 @@ void ui_view_channel_list(float width, float height)
                             }
                         }
                         if (ImGui::MenuItem(tr("Переименовать"))) ui_open_rename_channel(c->id);
+                        if (has_slowmode(c) && ImGui::MenuItem(tr("Медленный режим"))) ui_open_slowmode(c->id);
                         if (ImGui::MenuItem(tr("Права канала"))) ui_open_channel_perms(c->id);
                         if (ImGui::MenuItem(tr("Удалить канал"))) api::delete_channel(c->id);
                         ImGui::Separator();
@@ -1271,7 +1338,7 @@ void ui_view_channel_list(float width, float height)
                             if (ImGui::MenuItem(tr("Выйти из канала")))
                                 { g_ui.pending_voice_leave = true; g_ui.pending_voice_join = false; }
                         }
-                        else if (ImGui::MenuItem(tr("Зайти в канал")))
+                        else if (voice_joinable(g, c) && ImGui::MenuItem(tr("Зайти в канал")))
                         {
                             {
                                 g_ui.pending_voice_guild = g->id;
@@ -1293,11 +1360,22 @@ void ui_view_channel_list(float width, float height)
                     if (clicked && c->is_voice() && !hidden)
                     {
                         // Joining and opening its chat are one action, the
-                        // way every other client does it.
+                        // way every other client does it - where joining is
+                        // an option at all. A room at its limit, or a channel
+                        // the connect bit was never handed out for, answers
+                        // the click the way a channel out of sight does: with
+                        // the properties box, which spells out what is in the
+                        // way.
+                        if (voice_joinable(g, c))
                         {
                             g_ui.pending_voice_guild = g->id;
                             g_ui.pending_voice_channel = c->id;
                             g_ui.pending_voice_join = true;
+                        }
+                        else
+                        {
+                            g_ui.channel_info_id = c->id;
+                            g_ui.open_channel_info_popup = true;
                         }
                     }
 
@@ -1702,7 +1780,10 @@ void ui_view_voice_panel(float width)
 
         char first[96];
         char second[96];
-        cnprint(first, sizeof(first), tr("голос закрыт, код %u"), voice::last_close_code());
+        if (voice::last_close_code())
+            cnprint(first, sizeof(first), tr("голос закрыт, код %u"), voice::last_close_code());
+        else
+            cnprint(first, sizeof(first), "%s", tr("голос закрыт"));
         // Translated here rather than where it is set: the reason is kept as a
         // pointer to a literal, and one set before the language changed would
         // otherwise stay in the language it was set in.
@@ -2129,6 +2210,271 @@ namespace
 
         ImGui::EndPopup();
     }
+
+    // ---- phone verification wizard ----
+    // Send a code, exchange it for a phone token, then attach the number with
+    // the current password. Discord has no separate resend endpoint here:
+    // repeating the first request is the resend.
+    int g_ph_step = 0;          // 0 number, 1 code, 2 password, 3 done
+    bool g_ph_want_open = false;
+    bool g_ph_busy = false;
+    char g_ph_error[256];
+    char g_ph_phone[40];
+    char g_ph_code[16];
+    char g_ph_pass[256];
+
+    // Keeps the leading plus and the digits, drops the spaces, dashes and
+    // brackets people copy along with a number.
+    void phone_normalize(const char* in, char* out, int cap)
+    {
+        int n = 0;
+        for (const char* p = in; p && *p && n < cap - 1; p++)
+        {
+            if (*p == '+' && n == 0) out[n++] = '+';
+            else if (*p >= '0' && *p <= '9') out[n++] = *p;
+        }
+        out[n] = 0;
+    }
+
+    int phone_digits(const char* phone)
+    {
+        int n = 0;
+        for (const char* p = phone; *p; p++)
+            if (*p >= '0' && *p <= '9') n++;
+        return n;
+    }
+
+    void ui_open_phone_link(const char* phone)
+    {
+        bool drop_ok = false;
+        char drop[256];
+        drop[0] = 0;
+        api::take_phone_code_result(&drop_ok, drop, sizeof(drop));
+        api::take_phone_verify_result(&drop_ok, drop, sizeof(drop));
+        api::take_phone_apply_result(&drop_ok, drop, sizeof(drop));
+
+        g_ph_step = 0;
+        g_ph_want_open = true;
+        g_ph_busy = false;
+        g_ph_error[0] = 0;
+        ccstrncpy(g_ph_phone, phone ? phone : "", sizeof(g_ph_phone) - 1);
+        g_ph_code[0] = 0;
+        g_ph_pass[0] = 0;
+    }
+
+    void ui_view_phone_popup()
+    {
+        if (g_ph_want_open || g_ph_busy)
+        {
+            if (!ImGui::IsPopupOpen("##phonelink"))
+                ImGui::OpenPopup("##phonelink");
+            g_ph_want_open = false;
+        }
+
+        ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_Appearing);
+        if (!ImGui::BeginPopup("##phonelink", ImGuiWindowFlags_NoResize))
+            return;
+
+        bool ok = false;
+        char err[256];
+        err[0] = 0;
+
+        if (api::take_phone_code_result(&ok, err, sizeof(err)))
+        {
+            g_ph_busy = false;
+            if (ok) { g_ph_step = 1; g_ph_error[0] = 0; }
+            else ccstrncpy(g_ph_error, err[0] ? err : "?", sizeof(g_ph_error) - 1);
+        }
+        if (api::take_phone_verify_result(&ok, err, sizeof(err)))
+        {
+            g_ph_busy = false;
+            if (ok) { g_ph_step = 2; g_ph_error[0] = 0; }
+            else ccstrncpy(g_ph_error, err[0] ? err : "?", sizeof(g_ph_error) - 1);
+        }
+        if (api::take_phone_apply_result(&ok, err, sizeof(err)))
+        {
+            g_ph_busy = false;
+            if (ok) { g_ph_step = 3; g_ph_error[0] = 0; }
+            else ccstrncpy(g_ph_error, err[0] ? err : "?", sizeof(g_ph_error) - 1);
+        }
+
+        if (g_ph_busy && captcha::waiting())
+        {
+            ImGui::TextUnformatted(tr("Discord требует капчу"));
+            ImGui::SameLine(0, 8);
+            ui_text_muted(captcha::action_text());
+
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(tr("Открой страницу в браузере и реши её — токен подхватится сам."));
+            ImGui::PopTextWrapPos();
+
+            ImGui::Dummy(ImVec2(0, 4));
+            if (ImGui::Button(tr("Открыть в браузере"), ImVec2(200, 30)))
+                captcha::reopen_browser();
+            ImGui::SameLine();
+            if (ImGui::Button(tr("Отмена"), ImVec2(120, 30)))
+                captcha::cancel();
+
+            ImGui::EndPopup();
+            return;
+        }
+
+        if (g_ph_step == 0)
+        {
+            ImGui::TextUnformatted(tr("Подтверждение телефона"));
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(tr("Введи номер с кодом страны, например +380..."));
+            ImGui::PopTextWrapPos();
+
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##phphone", "+380...", g_ph_phone, sizeof(g_ph_phone));
+
+            if (g_ph_error[0])
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+                ImGui::TextWrapped("%s", g_ph_error);
+                ImGui::PopStyleColor();
+            }
+
+            ImGui::Dummy(ImVec2(0, 4));
+            if (g_ph_busy)
+            {
+                ui_text_muted(tr("Отправляем..."));
+            }
+            else
+            {
+                if (ImGui::Button(tr("Отправить код"), ImVec2(200, 30)))
+                {
+                    char number[40];
+                    phone_normalize(g_ph_phone, number, sizeof(number));
+                    int digits = phone_digits(number);
+
+                    if (number[0] != '+' || digits < 8 || digits > 15)
+                    {
+                        g_ph_error[0] = 0;
+                        ccstrncpy(g_ph_error,
+                                  tr("Номер должен начинаться с + и содержать код страны"),
+                                  sizeof(g_ph_error) - 1);
+                    }
+                    else
+                    {
+                        ccstrncpy(g_ph_phone, number, sizeof(g_ph_phone) - 1);
+                        g_ph_busy = true;
+                        g_ph_error[0] = 0;
+                        api::phone_send_code(g_ph_phone);
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Отмена"), ImVec2(140, 30)))
+                    ImGui::CloseCurrentPopup();
+            }
+        }
+        else if (g_ph_step == 1)
+        {
+            ImGui::TextUnformatted(tr("Код из SMS"));
+            ImGui::Separator();
+            ui_text_muted(tr("Шесть цифр из сообщения"));
+
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##phcode", tr("код"), g_ph_code, sizeof(g_ph_code),
+                                     ImGuiInputTextFlags_CharsDecimal);
+
+            if (g_ph_error[0])
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+                ImGui::TextWrapped("%s", g_ph_error);
+                ImGui::PopStyleColor();
+            }
+
+            ImGui::Dummy(ImVec2(0, 4));
+            if (g_ph_busy)
+            {
+                ui_text_muted(tr("Проверяем..."));
+            }
+            else
+            {
+                if (ImGui::Button(tr("Подтвердить"), ImVec2(160, 30)) && g_ph_code[0])
+                {
+                    g_ph_busy = true;
+                    g_ph_error[0] = 0;
+                    api::phone_verify_code(g_ph_phone, g_ph_code);
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton(tr("Отправить код заново")))
+                {
+                    // The same request that sent the first code: that is what
+                    // the resend button does.
+                    g_ph_busy = true;
+                    g_ph_error[0] = 0;
+                    api::phone_send_code(g_ph_phone);
+                }
+                if (ImGui::SmallButton(tr("Изменить номер")))
+                {
+                    g_ph_step = 0;
+                    g_ph_error[0] = 0;
+                }
+            }
+        }
+        else if (g_ph_step == 2)
+        {
+            ImGui::TextUnformatted(tr("Пароль"));
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(tr("Для привязки номера нужен текущий пароль."));
+            ImGui::PopTextWrapPos();
+
+            ImGui::SetNextItemWidth(-1.0f);
+            ImGui::InputTextWithHint("##phpass", tr("текущий пароль"),
+                                     g_ph_pass, sizeof(g_ph_pass),
+                                     ImGuiInputTextFlags_Password);
+
+            if (g_ph_error[0])
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, col::red);
+                ImGui::TextWrapped("%s", g_ph_error);
+                ImGui::PopStyleColor();
+            }
+
+            ImGui::Dummy(ImVec2(0, 4));
+            if (g_ph_busy)
+            {
+                ui_text_muted(tr("Подтверждаем..."));
+            }
+            else
+            {
+                if (ImGui::Button(tr("Привязать"), ImVec2(160, 30)) && g_ph_pass[0])
+                {
+                    g_ph_busy = true;
+                    g_ph_error[0] = 0;
+                    api::phone_apply(g_ph_pass);
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Отмена"), ImVec2(140, 30)))
+                    ImGui::CloseCurrentPopup();
+            }
+        }
+        else
+        {
+            ImGui::TextUnformatted(tr("Телефон подтверждён"));
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(tr("Номер привязан к аккаунту."));
+            ImGui::PopTextWrapPos();
+            ImGui::Dummy(ImVec2(0, 8));
+
+            if (ImGui::Button(tr("Закрыть"), ImVec2(160, 30)))
+                ImGui::CloseCurrentPopup();
+        }
+
+        ImGui::EndPopup();
+    }
+}
+
+bool ui_phone_captcha_inline()
+{
+    return g_ph_busy && captcha::waiting();
 }
 
 // Wipes the delete-account confirmation after the account is gone. Defined at
@@ -2921,6 +3267,16 @@ void ui_view_settings_popup()
                 ui_open_email_change();
 
             ImGui::Dummy(ImVec2(0, 10));
+            ImGui::TextUnformatted(tr("Телефон"));
+            ImGui::Separator();
+
+            if (ImGui::Button((self->phone && self->phone[0]) ? tr("Сменить телефон")
+                                                              : tr("Привязать телефон"),
+                              ImVec2(-1, 0)))
+                ui_open_phone_link(self->phone);
+            ui_text_muted(tr("Подтверждение номера по коду из SMS"));
+
+            ImGui::Dummy(ImVec2(0, 10));
             ImGui::TextUnformatted(tr("Удаление аккаунта"));
             ImGui::Separator();
 
@@ -3101,6 +3457,7 @@ void ui_view_settings_popup()
     if (ImGui::Button(tr("Закрыть"), ImVec2(120, 30))) ImGui::CloseCurrentPopup();
 
     ui_view_email_popup();
+    ui_view_phone_popup();
 
     ImGui::EndPopup();
 }

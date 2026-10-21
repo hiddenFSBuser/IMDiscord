@@ -48,6 +48,12 @@ namespace voice
     void join(snowflake guild_id, snowflake channel_id);
     void leave();
 
+    // Called once per ui frame. A session that failed after it was already
+    // announced is torn down here: the worker threads can only be joined from
+    // a thread that is not one of them, and leaving the half-dead session up
+    // hid the panel while keeping a silent member in the channel.
+    void on_ui_frame();
+
     voice_state_kind state();
     const char* status_text();
     snowflake current_channel();

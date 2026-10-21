@@ -155,6 +155,11 @@ namespace store
     // being looked at - not everyone in the server.
     bool can_view_channel(const dguild* g, snowflake user_id, const dchannel* c);
 
+    // Whether that member could walk into the channel if they tried. Seeing a
+    // channel and being allowed in are two different bits in discord's table,
+    // and a server that hands out one is not always handing out the other.
+    bool can_connect_channel(const dguild* g, snowflake user_id, const dchannel* c);
+
     dmember* find_member(dguild* g, snowflake user_id);
 
     // The role that decides what colour a name is drawn in: the highest one
@@ -220,6 +225,12 @@ namespace store
     // The one-to-one conversation with somebody, or 0 if none is open.
     snowflake dm_with(snowflake user_id);
     void touch_dm_order();
+
+    // Defers the dm order rebuild while a bulk load runs: begin before the
+    // run, end after it, and any dm touched in between reorders once. The end
+    // takes the store lock itself, so it must be called without it held.
+    void batch_begin();
+    void batch_end();
 
     // ---- auth sessions ----
     // The account's sign-ins from /auth/sessions, fetched on demand for the

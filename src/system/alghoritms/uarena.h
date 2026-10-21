@@ -27,6 +27,9 @@ public:
     // Duplicates a string into the arena. len < 0 means "measure it".
     const char* dup(const char* str, int len = -1);
     void reset();
+    // Drops everything allocated but keeps the chunks: a parser called once
+    // per line reuses one arena instead of allocating a fresh one each time.
+    void rewind();
 
     template <typename T>
     T* make()

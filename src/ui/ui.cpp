@@ -2494,7 +2494,10 @@ void ui_init()
     noise::set_mode(storage::settings_get_int("noise_mode", NOISE_OFF));
     noise::set_gate_threshold((float)storage::settings_get_int("gate_threshold", 20) / 1000.0f);
 
-    g_ui.show_hidden_channels = storage::settings_get_int("show_hidden_channels", 1) != 0;
+    // Locked channels start hidden the way discord's own sidebar has them:
+    // a wall of padlocks tells nobody anything. The toggle in the settings
+    // still brings them back for anyone who wants the reminders.
+    g_ui.show_hidden_channels = storage::settings_get_int("show_hidden_channels", 0) != 0;
 
     vad::init();
     vad::set_enabled(storage::settings_get_int("vad_enabled", 1) != 0);
@@ -2730,7 +2733,7 @@ void ui_frame()
     if (!g_ui.logged_in)
     {
         ui_view_login();
-        ui_view_captcha_popup();
+        if (!ui_phone_captcha_inline()) ui_view_captcha_popup();
         return;
     }
 
@@ -2784,6 +2787,8 @@ void ui_frame()
         g_ui.pending_voice_join = false;
         voice::join(g_ui.pending_voice_guild, g_ui.pending_voice_channel);
     }
+
+    voice::on_ui_frame();
 
     store::guard guard;
 
@@ -2857,6 +2862,7 @@ void ui_frame()
     ui_view_ownership_popup();
     ui_view_delete_guild_popup();
     ui_view_rename_popup();
+    ui_view_slowmode_popup();
     ui_view_onboarding_popup();
     ui_view_token_popup();
     ui_view_modal_popup();
@@ -2901,7 +2907,7 @@ void ui_frame()
     ui_view_pins_popup();
     ui_view_search_popup();
     ui_view_media_popup();
-    ui_view_captcha_popup();
+    if (!ui_phone_captcha_inline()) ui_view_captcha_popup();
     ui_view_profile_editor();
     ui_view_avatar_crop();
     ui_view_wallpaper_crop();

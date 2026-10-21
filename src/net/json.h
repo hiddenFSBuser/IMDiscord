@@ -79,6 +79,10 @@ struct jdoc
 
     void init();
     bool parse(const char* text, int len = -1);
+    // Same, but keeps the arena's memory between calls: a file walked line by
+    // line reuses one document instead of allocating an arena per line.
+    bool parse_reuse(const char* text, int len = -1);
+    bool parse_impl(const char* text, int len, bool keep_arena);
     void free_doc();
 
     const jval* r() const { return root ? root : null_value(); }

@@ -340,6 +340,10 @@ namespace
                 const char* errs = doc.root->obj("errors")->str("message", 0);
                 if (errs) detail = errs;
             }
+
+            if (detail && (ccscmp(detail, "Die Ressourcenrate wird begrenzt.") == 0 ||
+                           ccscmp(detail, "You are being rate limited.") == 0))
+                detail = tr("Слишком много запросов, попробуй позже");
         }
 
         // Discord answers some refusals with a body that carries no message at
@@ -5007,12 +5011,6 @@ namespace
 
 namespace
 {
-    struct job_image
-    {
-        bool banner;
-        wchar_t path[MAX_PATH];
-    };
-
     struct job_guild_image
     {
         snowflake guild_id;
@@ -5102,6 +5100,36 @@ namespace
         memfree(j);
     }
 
+    struct job_slowmode
+    {
+        snowflake channel_id;
+        int seconds;
+    };
+
+    void job_channel_slowmode(void* user)
+    {
+        job_slowmode* j = (job_slowmode*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_i64("rate_limit_per_user", j->seconds);
+        w.end_obj();
+
+        char path[64];
+        cnprint(path, sizeof(path), "/channels/%llu", j->channel_id);
+
+        http_response res;
+        res.init();
+
+        if (!api::call("PATCH", path, w.buf.c_str(), &res) || !res.ok())
+            record_api_error(tr("Медленный режим"), &res);
+
+        res.free_response();
+        w.free_writer();
+        memfree(j);
+    }
+
     void job_guild_icon(void* user)
     {
         job_guild_image* j = (job_guild_image*)user;
@@ -5170,115 +5198,6 @@ namespace
         memfree(j);
     }
 
-    void job_update_image(void* user)
-    {
-        job_image* j = (job_image*)user;
-
-        ubuffer file;
-        file.init();
-
-        if (!j->path[0])
-        {
-            // An empty path means take it off.
-            jwriter w;
-            w.init();
-            w.begin_obj();
-            w.kv_null(j->banner ? "banner" : "avatar");
-            w.end_obj();
-
-            http_response res;
-            res.init();
-            if (api::call("PATCH", "/users/@me", w.buf.c_str(), &res) && res.ok())
-                api::set_last_error(j->banner ? tr("Баннер убран") : tr("Аватарка убрана"));
-            else
-                record_api_error(tr("Не удалось убрать картинку"), &res);
-
-            res.free_response();
-            w.free_writer();
-            file.free_buffer();
-            memfree(j);
-            return;
-        }
-
-        if (!ufile::read_all(j->path, &file) || !file.size)
-        {
-            api::set_last_error(tr("Файл не читается"));
-            file.free_buffer();
-            memfree(j);
-            return;
-        }
-
-        // Discord's own limit. Sending more just wastes the upload and comes
-        // back rejected.
-        if (file.size > 10u * 1024u * 1024u)
-        {
-            api::set_last_error(tr("Файл больше 10 МБ"));
-            file.free_buffer();
-            memfree(j);
-            return;
-        }
-
-        ubuffer base64;
-        base64.init(file.size * 4 / 3 + 64);
-        crypto::base64_encode(file.data, file.size, &base64);
-
-        ubuffer uri;
-        uri.init(base64.size + 64);
-        uri.append("data:", 5);
-        {
-            const char* mime = mime_for(j->path);
-            uri.append(mime, (unsigned int)ccslenf(mime));
-        }
-        uri.append(";base64,", 8);
-        uri.append(base64.data, base64.size);
-        uri.append("\0", 1);   // the url is handed on as a C string
-
-        jwriter w;
-        w.init();
-        w.begin_obj();
-        w.kv_str(j->banner ? "banner" : "avatar", (const char*)uri.data);
-        w.end_obj();
-
-        http_response res;
-        res.init();
-        if (api::call("PATCH", "/users/@me", w.buf.c_str(), &res) && res.ok())
-        {
-            jdoc doc;
-            doc.init();
-            if (doc.parse(res.text(), (int)res.body.size))
-            {
-                store::guard g;
-                store::upsert_user(doc.r());
-                store::bump_revision();
-            }
-            doc.free_doc();
-            api::set_last_error(j->banner ? tr("Баннер обновлён") : tr("Аватарка обновлена"));
-        }
-        else
-        {
-            record_api_error(tr("Не удалось загрузить картинку"), &res);
-        }
-
-        res.free_response();
-        w.free_writer();
-        uri.free_buffer();
-        base64.free_buffer();
-        file.free_buffer();
-        memfree(j);
-    }
-}
-
-void api::update_self_image(bool banner, const wchar_t* path)
-{
-    job_image* j = (job_image*)memalloc(sizeof(job_image));
-    if (!j) return;
-    ccfset(j, 0, sizeof(job_image));
-    j->banner = banner;
-
-    if (path)
-        for (int i = 0; path[i] && i < MAX_PATH - 1; i++) j->path[i] = path[i];
-
-    jobs::post(job_update_image, j);
 }
 
 static void do_fetch_counts(void* user)
@@ -6344,13 +6263,43 @@ namespace
     void op_fail_detail(op_slot* slot, const jval* root, const char* fallback)
     {
         const char* detail = (root && root->type == JTYPE_OBJ) ? root->str("message", 0) : 0;
+
+        // Discord localises the body by the client's locale, so the same
+        // refusal arrives in German for one person and English for another.
+        // The rate limit in particular is worth a sentence that can be acted
+        // on rather than "Die Ressourcenrate wird begrenzt.".
+        if (detail && (ccscmp(detail, "Die Ressourcenrate wird begrenzt.") == 0 ||
+                       ccscmp(detail, "You are being rate limited.") == 0))
+            detail = tr("Слишком много запросов, попробуй позже");
+        else if (detail && ccscmp(detail, "Verifizierungscode ist ungültig.") == 0)
+            detail = tr("Неверный код, попробуй ещё");
+
         if (detail && detail[0]) op_fail(slot, detail);
         else op_fail(slot, fallback);
+    }
+
+    // A 429 carries how long to wait, and saying it saves the person from
+    // hammering the button to find out.
+    void op_fail_rate_limit(op_slot* slot, const http_response* res)
+    {
+        int secs = res ? (res->retry_after_ms + 999) / 1000 : 0;
+        if (secs <= 0)
+        {
+            op_fail(slot, tr("Слишком много запросов, попробуй позже"));
+            return;
+        }
+
+        char text[128];
+        cnprint(text, sizeof(text), tr("Слишком много запросов, подожди %d с"), secs);
+        op_fail(slot, text);
     }
 
     op_slot g_email_code;
     op_slot g_email_verify;
     op_slot g_email_apply;
+    op_slot g_phone_code;
+    op_slot g_phone_verify;
+    op_slot g_phone_apply;
     op_slot g_profile_outcome;
     op_slot g_account_outcome;
     op_slot g_delete_outcome;
@@ -6365,6 +6314,7 @@ namespace
 
     // The token step 2 returns: step 3 carries it, nothing else does.
     char g_email_token[2048];
+    char g_phone_token[2048];
 
     struct avatar_entry
     {
@@ -6388,12 +6338,30 @@ namespace
         char password[256];
     };
 
+    struct job_phone_send_args
+    {
+        char phone[32];
+    };
+
+    struct job_phone_verify_args
+    {
+        char phone[32];
+        char code[16];
+    };
+
+    struct job_phone_apply_args
+    {
+        char password[256];
+    };
+
     struct job_profile_text
     {
         char bio[512];
         bool has_bio;
         char pronouns[64];
         bool has_pronouns;
+        char* banner;
+        bool remove_banner;
     };
 
     struct job_account_display
@@ -6428,6 +6396,25 @@ namespace
         store::guard g;
         store::upsert_user(root);
         store::bump_revision();
+    }
+
+    // Phone attachment answers 204, so the number itself has to be read back
+    // from the account rather than taken from the request.
+    void refresh_self_live()
+    {
+        http_response res;
+        res.init();
+
+        if (api::call("GET", "/users/@me", 0, &res) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                refresh_self(doc.root);
+            doc.free_doc();
+        }
+
+        res.free_response();
     }
 
     void job_email_send_code(void* user)
@@ -6563,6 +6550,144 @@ namespace
         memfree(j);
     }
 
+    void job_phone_send_code(void* user)
+    {
+        job_phone_send_args* j = (job_phone_send_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("phone", j->phone);
+        w.kv_str("change_phone_reason", "user_settings_update");
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/users/@me/phone", w.c_str(), &res,
+                               0, tr("Телефон"), 0) && res.ok())
+        {
+            op_done(&g_phone_code);
+            log_line("phone: код запрошен");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root;
+
+            if (res.status == 429) op_fail_rate_limit(&g_phone_code, &res);
+            else op_fail_detail(&g_phone_code, parsed ? doc.root : 0,
+                                tr("Не удалось отправить код"));
+
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_phone_verify_code(void* user)
+    {
+        job_phone_verify_args* j = (job_phone_verify_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("phone", j->phone);
+        w.kv_str("code", j->code);
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/phone-verifications/verify", w.c_str(),
+                               &res, 0, tr("Телефон"), 0) && res.ok())
+        {
+            jdoc doc;
+            doc.init();
+            const char* token = 0;
+            if (doc.parse(res.text(), (int)res.body.size) && doc.root)
+                token = doc.root->str("token", 0);
+
+            if (token && token[0])
+            {
+                ccstrncpy(g_phone_token, token, sizeof(g_phone_token) - 1);
+                op_done(&g_phone_verify);
+                log_line("phone: код принят");
+            }
+            else
+            {
+                op_fail(&g_phone_verify, tr("Неожиданный ответ сервера"));
+            }
+
+            doc.free_doc();
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root;
+            int code = parsed ? doc.root->i32("code", 0) : 0;
+
+            if (res.status == 429) op_fail_rate_limit(&g_phone_verify, &res);
+            else if (code == 50037) op_fail(&g_phone_verify, tr("Неверный код, попробуй ещё"));
+            else op_fail_detail(&g_phone_verify, parsed ? doc.root : 0,
+                                tr("Не удалось подтвердить номер"));
+
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
+    void job_phone_apply_number(void* user)
+    {
+        job_phone_apply_args* j = (job_phone_apply_args*)user;
+
+        jwriter w;
+        w.init();
+        w.begin_obj();
+        w.kv_str("phone_token", g_phone_token);
+        w.kv_str("password", j->password);
+        w.kv_str("change_phone_reason", "user_settings_update");
+        w.end_obj();
+
+        http_response res;
+        res.init();
+
+        if (call_captcha_aware("POST", "/users/@me/phone", w.c_str(), &res,
+                               0, tr("Телефон"), 0) && res.ok())
+        {
+            ccfset(g_phone_token, 0, sizeof(g_phone_token));
+            refresh_self_live();
+            op_done(&g_phone_apply);
+            log_line("phone: номер привязан");
+        }
+        else
+        {
+            jdoc doc;
+            doc.init();
+            bool parsed = doc.parse(res.text(), (int)res.body.size) && doc.root;
+
+            if (res.status == 429) op_fail_rate_limit(&g_phone_apply, &res);
+            else op_fail_detail(&g_phone_apply, parsed ? doc.root : 0,
+                                tr("Номер не привязан"));
+
+            doc.free_doc();
+        }
+
+        res.free_response();
+        w.free_writer();
+        ccfset(j, 0, sizeof(*j));
+        memfree(j);
+    }
+
     void job_profile_patch(void* user)
     {
         job_profile_text* j = (job_profile_text*)user;
@@ -6572,6 +6697,8 @@ namespace
         w.begin_obj();
         if (j->has_bio) w.kv_str("bio", j->bio);
         if (j->has_pronouns) w.kv_str("pronouns", j->pronouns);
+        if (j->banner) w.kv_str("banner", j->banner);
+        else if (j->remove_banner) w.kv_null("banner");
         w.end_obj();
 
         http_response res;
@@ -6586,24 +6713,30 @@ namespace
             {
                 // The answer is shaped like the profile, not like a user:
                 // fold what it says into the owner's object by hand.
-                const char* bio = doc.root->str("bio", 0);
-                const char* pronouns = doc.root->str("pronouns", 0);
-                if (bio || pronouns)
+                store::guard g;
+                duser* me = store::self();
+                if (me)
                 {
-                    store::guard g;
-                    duser* me = store::self();
-                    if (me)
+                    if (doc.root->has("bio"))
+                        me->bio = store::intern(doc.root->str("bio", ""));
+                    if (doc.root->has("pronouns"))
+                        me->pronouns = store::intern(doc.root->str("pronouns", ""));
+                    if (doc.root->has("banner"))
                     {
-                        if (bio) me->bio = store::intern(bio);
-                        if (pronouns) me->pronouns = store::intern(pronouns);
+                        const char* banner = doc.root->str("banner", 0);
+                        me->banner = banner ? store::intern(banner) : 0;
                     }
-                    store::bump_revision();
+                    else if (j->remove_banner)
+                    {
+                        me->banner = 0;
+                    }
                 }
+                store::bump_revision();
             }
             doc.free_doc();
 
             op_done(&g_profile_outcome);
-            log_line("profile: описание/местоимения сохранены");
+            log_line("profile: описание/местоимения/баннер сохранены");
         }
         else
         {
@@ -6620,6 +6753,7 @@ namespace
 
         res.free_response();
         w.free_writer();
+        if (j->banner) memfree(j->banner);
         ccfset(j, 0, sizeof(*j));
         memfree(j);
     }
@@ -6939,6 +7073,85 @@ bool api::take_email_apply_result(bool* ok, char* error, int error_cap)
     return op_take(&g_email_apply, ok, error, error_cap);
 }
 
+void api::phone_send_code(const char* phone)
+{
+    if (offline::active())
+    {
+        op_fail(&g_phone_code, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!phone || !phone[0]) return;
+
+    job_phone_send_args* j = (job_phone_send_args*)memalloc(sizeof(job_phone_send_args));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->phone, phone, sizeof(j->phone) - 1);
+
+    // A fresh code belongs to the number in this request, so a token from an
+    // earlier verification must not survive it.
+    ccfset(g_phone_token, 0, sizeof(g_phone_token));
+
+    g_phone_code.have = false;
+    jobs::post(job_phone_send_code, j);
+}
+
+bool api::take_phone_code_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_phone_code, ok, error, error_cap);
+}
+
+void api::phone_verify_code(const char* phone, const char* code)
+{
+    if (offline::active())
+    {
+        op_fail(&g_phone_verify, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!phone || !phone[0] || !code || !code[0]) return;
+
+    job_phone_verify_args* j = (job_phone_verify_args*)memalloc(sizeof(job_phone_verify_args));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->phone, phone, sizeof(j->phone) - 1);
+    ccstrncpy(j->code, code, sizeof(j->code) - 1);
+
+    g_phone_verify.have = false;
+    jobs::post(job_phone_verify_code, j);
+}
+
+bool api::take_phone_verify_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_phone_verify, ok, error, error_cap);
+}
+
+void api::phone_apply(const char* password)
+{
+    if (offline::active())
+    {
+        op_fail(&g_phone_apply, tr("Нет соединения с discord.com"));
+        return;
+    }
+    if (!password || !password[0]) return;
+    if (!g_phone_token[0])
+    {
+        op_fail(&g_phone_apply, tr("Сначала подтверди код"));
+        return;
+    }
+
+    job_phone_apply_args* j = (job_phone_apply_args*)memalloc(sizeof(job_phone_apply_args));
+    if (!j) return;
+    ccfset(j, 0, sizeof(*j));
+    ccstrncpy(j->password, password, sizeof(j->password) - 1);
+
+    g_phone_apply.have = false;
+    jobs::post(job_phone_apply_number, j);
+}
+
+bool api::take_phone_apply_result(bool* ok, char* error, int error_cap)
+{
+    return op_take(&g_phone_apply, ok, error, error_cap);
+}
+
 void api::fetch_avatars()
 {
     if (offline::active()) return;
@@ -6994,14 +7207,16 @@ bool api::take_username_check(username_check* out)
     return true;
 }
 
-void api::update_profile(const char* bio, const char* pronouns)
+void api::update_profile(const char* bio, const char* pronouns,
+                         const char* banner_datauri, bool remove_banner)
 {
     if (offline::active())
     {
         op_fail(&g_profile_outcome, tr("Нет соединения с discord.com"));
         return;
     }
-    if (!bio && !pronouns) return;
+    if (!bio && !pronouns && (!banner_datauri || !banner_datauri[0]) && !remove_banner)
+        return;
 
     job_profile_text* j = (job_profile_text*)memalloc(sizeof(job_profile_text));
     if (!j) return;
@@ -7015,6 +7230,22 @@ void api::update_profile(const char* bio, const char* pronouns)
     {
         ccstrncpy(j->pronouns, pronouns, sizeof(j->pronouns) - 1);
         j->has_pronouns = true;
+    }
+    if (banner_datauri && banner_datauri[0])
+    {
+        unsigned int len = (unsigned int)ccslenf(banner_datauri);
+        j->banner = (char*)memalloc((int)len + 1);
+        if (!j->banner)
+        {
+            op_fail(&g_profile_outcome, tr("Не хватило памяти"));
+            memfree(j);
+            return;
+        }
+        ccpy(j->banner, banner_datauri, len + 1);
+    }
+    else if (remove_banner)
+    {
+        j->remove_banner = true;
     }
 
     g_profile_outcome.have = false;
@@ -7841,6 +8072,20 @@ void api::rename_channel(snowflake channel_id, const char* name)
     ccstrncpy(j->text, name, sizeof(j->text) - 1);
 
     jobs::post(job_channel_name, j);
+}
+
+void api::set_channel_slowmode(snowflake channel_id, int seconds)
+{
+    if (seconds < 0) seconds = 0;
+
+    job_slowmode* j = (job_slowmode*)memalloc(sizeof(job_slowmode));
+    if (!j) return;
+
+    ccfset(j, 0, sizeof(*j));
+    j->channel_id = channel_id;
+    j->seconds = seconds;
+
+    jobs::post(job_channel_slowmode, j);
 }
 
 void api::update_guild_icon(snowflake guild_id, const wchar_t* path)

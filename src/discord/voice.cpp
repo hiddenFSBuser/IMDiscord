@@ -243,6 +243,11 @@ namespace
     };
 
     char g_status[192];
+
+    // Set when a running session reaches VOICE_FAILED. The ui frame drains it:
+    // stopping the session means joining every worker thread, and only the ui
+    // thread is allowed to wait for all of them.
+    volatile long g_fail_pending = 0;
     char g_endpoint[256];
     char g_voice_token[256];
     char g_voice_session[128];
@@ -312,6 +317,9 @@ namespace
     // client, the far end, or discord - and guessing between them from the
     // outside has cost several rounds already.
     const char* g_stop_reason = "";
+    // Backing store for a reason that is not a literal (the failure text comes
+    // from the translated status line). The panel reads this after teardown.
+    char g_stop_reason_text[192];
     unsigned short g_last_close = 0;
 
     // Until when the notification sounds stay off. Set when a 4014 schedules
@@ -355,6 +363,17 @@ namespace
         InterlockedExchange(&g_state, (long)s);
         ccfset(g_status, 0, sizeof(g_status));
         if (text) ccstrncpy(g_status, text, sizeof(g_status) - 1);
+
+        // A failure with a session still running used to set a status nobody
+        // could see and leave the call half up: the panel vanished, discord
+        // still listed us in the channel, and no sound ever came. The reason
+        // is kept for the panel and the ui frame tears the session down.
+        if (s == VOICE_FAILED && g_running)
+        {
+            ccstrncpy(g_stop_reason_text, g_status, sizeof(g_stop_reason_text) - 1);
+            g_stop_reason = g_stop_reason_text;
+            InterlockedExchange(&g_fail_pending, 1);
+        }
     }
 
     // ---- per person volume ---------------------------------------------
@@ -754,6 +773,35 @@ namespace
 
     mls::group_state g_group;
 
+    // The websocket thread writes the group when a welcome or a commit
+    // arrives; the audio thread reads it on every frame. The lock is where
+    // they meet, and the audio thread never touches g_group itself - it works
+    // from its own copy, taken below the lock at the top of a tick.
+    CRITICAL_SECTION g_group_lock;
+    bool g_group_lock_ready = false;
+
+    // Stable address on purpose: the ratchets in dave_frames are keyed by the
+    // group pointer they were made under.
+    mls::group_state g_media_group;
+
+    // One guard, so the paths that send key packages, apply commits and stop
+    // the session never leave the lock behind.
+    struct group_guard
+    {
+        group_guard()
+        {
+            held = g_group_lock_ready;
+            if (held) EnterCriticalSection(&g_group_lock);
+        }
+
+        ~group_guard()
+        {
+            if (held) LeaveCriticalSection(&g_group_lock);
+        }
+
+        bool held;
+    };
+
     // Proposals kept from op 27, so the commit that references them can be
     // applied when it arrives.
     mls::cached_proposal g_known[mls::MAX_MEMBERS];
@@ -782,7 +830,13 @@ namespace
 
     // When the session was last rebuilt, so a rebuild cannot provoke itself.
     unsigned long long g_last_reinit_tick = 0;
+
+    // Owned by the audio thread alone. Epoch resets happen on the websocket
+    // side now, which is a different thread, so they arrive as a bump of this
+    // counter that the audio thread notices before its next frame.
     unsigned int g_dave_nonce = 0;
+    long g_nonce_seen = 0;
+    volatile long g_nonce_epoch = 0;
 
     // A commit that has been handed to us but must not take effect yet.
     //
@@ -825,6 +879,19 @@ namespace
         return ok;
     }
 
+    // Refreshes the audio thread's copy of the group, and says whether there
+    // is anything to encrypt to or unwrap with. The copy is the point: the
+    // websocket thread can move the group to a new epoch at any moment, and a
+    // frame has to be wrapped with one epoch's keys or the other, never a mix
+    // of the two.
+    bool take_media_group()
+    {
+        group_guard g;
+        bool ready = g_media_ready;
+        if (ready) g_media_group = g_group;
+        return ready;
+    }
+
     void send_key_package()
     {
         if (!g_sig_ready)
@@ -862,10 +929,15 @@ namespace
         for (int i = 0; i < 8; i++)
             group_id[i] = (unsigned char)(g_channel_id >> (56 - i * 8));
 
-        g_group_ready = mls::create_group(&g_group, group_id, 8, &g_key_package.leaf,
-                                          g_sig_private, g_key_package_private.encryption_private);
+        bool created;
+        {
+            group_guard g;
+            created = mls::create_group(&g_group, group_id, 8, &g_key_package.leaf,
+                                        g_sig_private, g_key_package_private.encryption_private);
+            g_group_ready = created;
+        }
 
-        log_line("dave: local group %s", g_group_ready ? "created" : "FAILED");
+        log_line("dave: local group %s", created ? "created" : "FAILED");
     }
 
     void send_invalid_commit(unsigned int transition_id);
@@ -878,15 +950,19 @@ namespace
     {
         log_line("dave: сессия пересобирается заново (%s)", why);
 
-        g_last_reinit_tick = g_tick;
-        g_have_pending_commit = false;
-        g_own_commit_ready = false;
-        g_own_commit_won = false;
-        g_known_count = 0;
-        g_group_ready = false;
-        g_media_ready = false;
+        {
+            group_guard g;
+            g_last_reinit_tick = g_tick;
+            g_have_pending_commit = false;
+            g_own_commit_ready = false;
+            g_own_commit_won = false;
+            g_known_count = 0;
+            g_group_ready = false;
+            g_media_ready = false;
+        }
+
         dave::reset_ratchets();
-        g_dave_nonce = 0;
+        InterlockedIncrement(&g_nonce_epoch);
 
         send_key_package();
     }
@@ -896,30 +972,45 @@ namespace
     // turns up.
     void execute_pending_transition(unsigned int transition_id)
     {
-        bool ours = g_own_commit_won ||
-                    (g_own_commit_ready && !g_have_pending_commit &&
-                     transition_id == g_pending_transition);
+        bool ours;
+        bool have_pending;
+        unsigned int pending;
+        bool won;
 
-        if (ours && transition_id == g_pending_transition)
         {
-            // Our own commit was the one taken. The state it leads to was
-            // built when it was written, so moving to it is a swap.
-            g_group = g_group_next;
+            group_guard g;
 
-            g_own_commit_ready = false;
-            g_own_commit_won = false;
-            g_have_pending_commit = false;
-            g_known_count = 0;
-            g_last_transition_done = transition_id;
+            ours = g_own_commit_won ||
+                   (g_own_commit_ready && !g_have_pending_commit &&
+                    transition_id == g_pending_transition);
+            have_pending = g_have_pending_commit;
+            pending = g_pending_transition;
+            won = ours && transition_id == pending;
 
+            if (won)
+            {
+                // Our own commit was the one taken. The state it leads to was
+                // built when it was written, so moving to it is a swap.
+                g_group = g_group_next;
+
+                g_own_commit_ready = false;
+                g_own_commit_won = false;
+                g_have_pending_commit = false;
+                g_known_count = 0;
+                g_last_transition_done = transition_id;
+            }
+        }
+
+        if (won)
+        {
             dave::reset_ratchets();
-            g_dave_nonce = 0;
+            InterlockedIncrement(&g_nonce_epoch);
 
             log_line("dave: переход %u выполнен своим коммитом", transition_id);
             return;
         }
 
-        if (!g_have_pending_commit || transition_id != g_pending_transition)
+        if (!have_pending || transition_id != pending)
         {
             // The channel is moving to an epoch this client has nothing for.
             // Sitting still leaves it holding keys the group has abandoned,
@@ -931,10 +1022,17 @@ namespace
             // provokes the very traffic that can ask for another one - so this
             // gets one attempt every few seconds and no more. Rebuilding on
             // everything that reached here killed the call outright.
-            bool worth_it = transition_id != 0 && g_dave_active &&
-                            !g_dave_downgraded && g_key_package_ready;
+            bool worth_it;
+            bool long_enough;
 
-            if (worth_it && g_tick - g_last_reinit_tick > 250)
+            {
+                group_guard g;
+                worth_it = transition_id != 0 && g_dave_active &&
+                           !g_dave_downgraded && g_key_package_ready;
+                long_enough = g_tick - g_last_reinit_tick > 250;
+            }
+
+            if (worth_it && long_enough)
             {
                 // Answer first, rebuild second: op 31 is the protocol's way
                 // to say "I cannot run this transition", and the server's
@@ -948,12 +1046,23 @@ namespace
             return;
         }
 
-        g_have_pending_commit = false;
-
         const char* why = "";
-        bool applied = mls::process_commit(&g_group, g_pending_commit.data,
-                                           g_pending_commit.size,
-                                           g_known, g_known_count, &why);
+        bool applied;
+
+        {
+            group_guard g;
+            g_have_pending_commit = false;
+
+            applied = mls::process_commit(&g_group, g_pending_commit.data,
+                                          g_pending_commit.size,
+                                          g_known, g_known_count, &why);
+
+            if (applied)
+            {
+                g_known_count = 0;
+                g_last_transition_done = transition_id;
+            }
+        }
 
         log_line("dave: переход %u %s%s%s", transition_id,
                  applied ? "выполнен" : "ПРОВАЛЕН",
@@ -961,10 +1070,8 @@ namespace
 
         if (applied)
         {
-            g_known_count = 0;
-            g_last_transition_done = transition_id;
             dave::reset_ratchets();
-            g_dave_nonce = 0;
+            InterlockedIncrement(&g_nonce_epoch);
             return;
         }
 
@@ -979,7 +1086,10 @@ namespace
         // waiting that no amount of rejoining fixed. So introduce ourselves
         // again, now, rather than fifteen seconds later when the watchdog
         // notices.
-        g_media_ready = false;
+        {
+            group_guard g;
+            g_media_ready = false;
+        }
         send_invalid_commit(transition_id);
         dave_reinit(tr("коммит не применился"));
     }
@@ -997,13 +1107,16 @@ namespace
 
             if (g_dave_version == 0)
             {
-                g_dave_active = false;
-                g_dave_downgraded = true;
-                g_media_ready = true;      // plain opus needs no group
+                {
+                    group_guard g;
+                    g_dave_active = false;
+                    g_dave_downgraded = true;
+                    g_media_ready = true;      // plain opus needs no group
 
-                g_have_pending_commit = false;
-                g_own_commit_ready = false;
-                g_own_commit_won = false;
+                    g_have_pending_commit = false;
+                    g_own_commit_ready = false;
+                    g_own_commit_won = false;
+                }
 
                 log_line("dave: канал понижен с v%d до v0 - шифрование выключено", was);
                 set_status(VOICE_CONNECTED, tr("В голосовом канале (без E2EE)"));
@@ -1012,8 +1125,11 @@ namespace
 
             // Back up again, or on for the first time. Either way this client
             // has no standing in the group at the new version.
-            g_dave_active = true;
-            g_dave_downgraded = false;
+            {
+                group_guard g;
+                g_dave_active = true;
+                g_dave_downgraded = false;
+            }
             log_line("dave: канал переходит с v%d на v%d", was, g_dave_version);
             dave_reinit(tr("смена версии протокола"));
             return;
@@ -1070,12 +1186,15 @@ namespace
 
         // Kept so the commit that follows, which names them by reference rather
         // than repeating them, can be applied when it arrives as op 29.
-        if (is_revoke) g_known_count = 0;
-        for (unsigned int i = 0; i < count && !is_revoke && g_known_count < mls::MAX_MEMBERS; i++)
         {
-            messages[i].compute_ref(g_known[g_known_count].ref);
-            g_known[g_known_count].prop = messages[i].prop;
-            g_known_count++;
+            group_guard g;
+            if (is_revoke) g_known_count = 0;
+            for (unsigned int i = 0; i < count && !is_revoke && g_known_count < mls::MAX_MEMBERS; i++)
+            {
+                messages[i].compute_ref(g_known[g_known_count].ref);
+                g_known[g_known_count].prop = messages[i].prop;
+                g_known_count++;
+            }
         }
 
         for (unsigned int i = 0; i < count; i++)
@@ -1094,24 +1213,41 @@ namespace
             }
         }
 
-        if (is_revoke || !g_group_ready) return;
+        bool ready;
+        {
+            group_guard g;
+            ready = g_group_ready;
+        }
+
+        if (is_revoke || !ready) return;
 
         ubuffer commit, welcome;
         commit.init();
         welcome.init();
 
-        // A copy, so the live group is untouched whether or not this commit
-        // is the one the server picks.
-        g_group_next = g_group;
-        g_own_commit_ready = false;
-        g_own_commit_won = false;
+        bool built = false;
 
-        if (mls::build_commit(&g_group_next, messages, count, &commit, &welcome))
         {
-            g_own_commit.clear();
-            g_own_commit.append(commit.data, commit.size);
-            g_own_commit_ready = true;
+            group_guard g;
 
+            // A copy, so the live group is untouched whether or not this
+            // commit is the one the server picks.
+            g_group_next = g_group;
+            g_own_commit_ready = false;
+            g_own_commit_won = false;
+
+            built = mls::build_commit(&g_group_next, messages, count, &commit, &welcome);
+
+            if (built)
+            {
+                g_own_commit.clear();
+                g_own_commit.append(commit.data, commit.size);
+                g_own_commit_ready = true;
+            }
+        }
+
+        if (built)
+        {
             // op 28 carries the commit and the welcome back to back.
             ubuffer payload_out;
             payload_out.init(commit.size + welcome.size + 16);
@@ -1204,7 +1340,13 @@ namespace
 
         case VOP_MLS_WELCOME:
         {
-            if (payload_len < 3 || !g_key_package_ready)
+            bool had_package;
+            {
+                group_guard g;
+                had_package = g_key_package_ready;
+            }
+
+            if (payload_len < 3 || !had_package)
             {
                 log_line("dave: welcome arrived before we had a key package");
                 break;
@@ -1213,15 +1355,33 @@ namespace
             // [uint16 transition_id][Welcome]
             unsigned int transition_id = ((unsigned int)payload[0] << 8) | payload[1];
 
-            g_group_ready = mls::process_welcome(&g_group, payload + 2, payload_len - 2,
-                                                 &g_key_package, &g_key_package_private,
-                                                 g_sig_private);
-            g_media_ready = g_group_ready;
+            bool opened;
+            {
+                group_guard g;
+                opened = mls::process_welcome(&g_group, payload + 2, payload_len - 2,
+                                              &g_key_package, &g_key_package_private,
+                                              g_sig_private);
+                g_group_ready = opened;
+                g_media_ready = opened;
+
+                // The welcome already puts us on the epoch its transition points
+                // at, so when the server follows up with "execute transition N"
+                // for the very same N, there is nothing left to execute. Without
+                // this mark that follow-up looked like a transition we had no
+                // commit for, the session was torn down and rebuilt, and the
+                // server - which had just been told "ready" - never sent a second
+                // welcome: both directions of the call went silent on rejoin.
+                if (opened)
+                {
+                    g_known_count = 0;
+                    g_last_transition_done = transition_id;
+                }
+            }
 
             // A welcome that does not open is the same dead end as a commit
             // that does not apply, and the key package it was addressed to is
             // spent either way.
-            if (!g_group_ready)
+            if (!opened)
             {
                 log_line("dave: welcome не открылся, представляюсь заново");
                 send_transition_response(transition_id, false);
@@ -1231,23 +1391,12 @@ namespace
 
             // A new epoch means new media keys for everyone.
             dave::reset_ratchets();
-            g_dave_nonce = 0;
-            g_known_count = 0;
+            InterlockedIncrement(&g_nonce_epoch);
 
-            // The welcome already puts us on the epoch its transition points
-            // at, so when the server follows up with "execute transition N"
-            // for the very same N, there is nothing left to execute. Without
-            // this mark that follow-up looked like a transition we had no
-            // commit for, the session was torn down and rebuilt, and the
-            // server - which had just been told "ready" - never sent a second
-            // welcome: both directions of the call went silent on rejoin.
-            g_last_transition_done = transition_id;
+            log_line("dave: welcome accepted (transition %u)", transition_id);
 
-            log_line("dave: welcome %s (transition %u)",
-                     g_group_ready ? "accepted" : "REJECTED", transition_id);
-
-            if (g_media_ready) set_status(VOICE_CONNECTED, tr("В голосовом канале (E2EE)"));
-            send_transition_response(transition_id, g_group_ready);
+            set_status(VOICE_CONNECTED, tr("В голосовом канале (E2EE)"));
+            send_transition_response(transition_id, true);
             break;
         }
 
@@ -1268,8 +1417,14 @@ namespace
             if (transition_id == 0)
             {
                 const char* why = "";
-                bool applied = mls::process_commit(&g_group, payload + 2, payload_len - 2,
-                                                   g_known, g_known_count, &why);
+                bool applied;
+
+                {
+                    group_guard g;
+                    applied = mls::process_commit(&g_group, payload + 2, payload_len - 2,
+                                                  g_known, g_known_count, &why);
+                    if (applied) g_known_count = 0;
+                }
 
                 log_line("dave: коммит %s немедленно%s%s",
                          applied ? "применён" : "НЕ применён",
@@ -1277,9 +1432,8 @@ namespace
 
                 if (applied)
                 {
-                    g_known_count = 0;
                     dave::reset_ratchets();
-                    g_dave_nonce = 0;
+                    InterlockedIncrement(&g_nonce_epoch);
                 }
 
                 send_transition_response(0, applied);
@@ -1289,28 +1443,34 @@ namespace
             unsigned int commit_len = payload_len - 2;
             const unsigned char* commit_bytes = payload + 2;
 
-            // The server broadcasts the winning commit to everybody, author
-            // included. Ours cannot be applied like somebody else's - a
-            // commit does not encrypt its path to the leaf that wrote it - so
-            // recognising it matters: the state it produces is already built.
-            bool mine = g_own_commit_ready &&
-                        g_own_commit.size == commit_len &&
-                        ccmp(g_own_commit.data, commit_bytes, commit_len) == 0;
+            bool mine;
 
-            if (mine)
             {
-                g_own_commit_won = true;
-                g_have_pending_commit = false;
-            }
-            else
-            {
-                g_pending_commit.clear();
-                g_pending_commit.append(commit_bytes, commit_len);
-                g_have_pending_commit = true;
-                g_own_commit_won = false;
-            }
+                group_guard g;
 
-            g_pending_transition = transition_id;
+                // The server broadcasts the winning commit to everybody, author
+                // included. Ours cannot be applied like somebody else's - a
+                // commit does not encrypt its path to the leaf that wrote it - so
+                // recognising it matters: the state it produces is already built.
+                mine = g_own_commit_ready &&
+                       g_own_commit.size == commit_len &&
+                       ccmp(g_own_commit.data, commit_bytes, commit_len) == 0;
+
+                if (mine)
+                {
+                    g_own_commit_won = true;
+                    g_have_pending_commit = false;
+                }
+                else
+                {
+                    g_pending_commit.clear();
+                    g_pending_commit.append(commit_bytes, commit_len);
+                    g_have_pending_commit = true;
+                    g_own_commit_won = false;
+                }
+
+                g_pending_transition = transition_id;
+            }
 
             log_line("dave: %s коммит ждёт перехода %u (%u байт)",
                      mine ? "свой" : "чужой", transition_id, commit_len);
@@ -1573,6 +1733,8 @@ namespace
             return proxy::udp_send(&g_udp_route, wrapped, n);
         }
 
+        g_stat_tried++;
+
         unsigned int counter = ++g_nonce_counter;
         unsigned char counter_bytes[4] = {
             (unsigned char)(counter >> 24), (unsigned char)(counter >> 16),
@@ -1600,7 +1762,7 @@ namespace
             ok = crypto::aes256gcm_encrypt(g_secret_key, nonce, packet, 12,
                                            opus_data, (unsigned int)opus_len, cipher, tag);
         }
-        if (!ok) return 0;
+        if (!ok) { g_stat_failed++; return 0; }
 
         int len = 12 + opus_len;
         ccpy(packet + len, tag, 16);
@@ -1611,7 +1773,10 @@ namespace
         g_sequence++;
         g_timestamp += AUDIO_FRAME_SAMPLES;
 
-        return proxy::udp_send(&g_udp_route, packet, len);
+        int sent = proxy::udp_send(&g_udp_route, packet, len);
+        if (sent > 0) g_stat_sent++;
+
+        return sent;
     }
 
     // Returns the length of the decrypted opus payload, or 0.
@@ -2495,6 +2660,11 @@ namespace
         media_stats_tick();
         control_tick();
 
+        // One copy of the group for this whole pass, taken under the lock the
+        // websocket thread moves it with. A frame is unwrapped with the epoch
+        // it arrived in, never with a half of one the group has just moved to.
+        bool media_ready = take_media_group();
+
         // Sixty-four packets per 20 ms tick: a video keyframe burst is tens
         // of packets at once, and draining it in ones would leave the tail
         // sitting through several frames. The per-packet work is decrypt and
@@ -2577,7 +2747,7 @@ namespace
                     LeaveCriticalSection(&g_speakers_lock);
                 }
 
-                if (!sender || !g_media_ready)
+                if (!sender || !media_ready)
                 {
                     // The ssrc has not been mapped to a user yet; op 5 will
                     // arrive shortly and later frames will decode. Counted:
@@ -2587,7 +2757,7 @@ namespace
                 }
 
                 unsigned int plain_len = 0;
-                if (!dave::decrypt_frame(&g_group, sender, payload, prot_len,
+                if (!dave::decrypt_frame(&g_media_group, sender, payload, prot_len,
                                          plain, &plain_len))
                 {
                     g_stats.unwrap++;
@@ -2651,10 +2821,21 @@ namespace
     {
         unsigned char wrapped[1400];
 
-        if (g_dave_active && g_media_ready)
+        // The nonce belongs to this thread. Epoch resets happen on the
+        // websocket side now, and are noticed here before the next frame -
+        // which is the same moment the old code reset it, only without the
+        // websocket thread reaching into a counter this one is stepping.
+        long nonce_epoch = g_nonce_epoch;
+        if (nonce_epoch != g_nonce_seen)
+        {
+            g_nonce_seen = nonce_epoch;
+            g_dave_nonce = 0;
+        }
+
+        if (g_dave_active && take_media_group())
         {
             unsigned int wrapped_len = 0;
-            if (!dave::encrypt_frame(&g_group, g_self_id, &g_dave_nonce,
+            if (!dave::encrypt_frame(&g_media_group, g_self_id, &g_dave_nonce,
                                      opus_data, (unsigned int)opus_len, wrapped, &wrapped_len))
                 return;
 
@@ -2708,7 +2889,13 @@ namespace
 
         // Without a group there is nothing to encrypt to, and plain opus on a
         // DAVE channel gets the session dropped.
-        if (g_dave_active && !g_media_ready)
+        bool dave_unagreed;
+        {
+            group_guard g;
+            dave_unagreed = g_dave_active && !g_media_ready;
+        }
+
+        if (dave_unagreed)
         {
             if (g_speaking_sent) { send_speaking(false); g_speaking_sent = false; }
             vad::reset();
@@ -2892,7 +3079,13 @@ namespace
             // and nothing on screen says why. Rejoining does not always help,
             // because whatever the server is waiting for it is not a new
             // connection - it is a key package. So say so, and send one.
-            if (g_dave_active && !g_media_ready)
+            bool dave_unagreed;
+            {
+                group_guard g;
+                dave_unagreed = g_dave_active && !g_media_ready;
+            }
+
+            if (dave_unagreed)
             {
                 if (!g_silent_since) g_silent_since = g_tick;
                 else if (g_tick - g_silent_since > 750)      // 15 s
@@ -3180,12 +3373,15 @@ namespace
         // keys came out of the handshake, and every packet from here on is
         // wrapped with them instead of with discord's own scheme.
         int dave_version = d->i32("dave_protocol_version", 0);
-        g_dave_active = dave_version > 0;
-        g_dave_version = dave_version;
-        g_dave_version_next = dave_version;
-        g_dave_downgraded = false;
+        {
+            group_guard g;
+            g_dave_active = dave_version > 0;
+            g_dave_version = dave_version;
+            g_dave_version_next = dave_version;
+            g_dave_downgraded = false;
+        }
 
-        if (g_dave_active)
+        if (dave_version > 0)
             log_line("voice: webrtc, сервер включил DAVE v%d", dave_version);
 
         start_media();
@@ -3216,11 +3412,15 @@ namespace
         // encryption still works either way, so the session is kept alive; what
         // cannot be done is unwrapping individual E2E frames.
         int dave_version = d->i32("dave_protocol_version", 0);
-        g_dave_active = dave_version > 0;
-        g_dave_version = dave_version;
-        g_dave_version_next = dave_version;
-        g_dave_downgraded = false;
-        if (g_dave_active)
+        {
+            group_guard g;
+            g_dave_active = dave_version > 0;
+            g_dave_version = dave_version;
+            g_dave_version_next = dave_version;
+            g_dave_downgraded = false;
+        }
+
+        if (dave_version > 0)
             log_line("voice: server enabled DAVE v%d - E2EE frames cannot be decoded", dave_version);
         else
             log_line("voice: transport encryption %s, DAVE off", mode);
@@ -3328,10 +3528,13 @@ namespace
 
             if (epoch == 1)
             {
-                g_dave_version = version;
-                g_dave_version_next = version;
-                g_dave_active = version > 0;
-                g_dave_downgraded = false;
+                {
+                    group_guard g;
+                    g_dave_version = version;
+                    g_dave_version_next = version;
+                    g_dave_active = version > 0;
+                    g_dave_downgraded = false;
+                }
                 dave_reinit(tr("эпоха 1"));
             }
             break;
@@ -3484,7 +3687,18 @@ namespace
         char url[512];
         cnprint(url, sizeof(url), "wss://%s/?v=8", g_endpoint);
 
-        const proxy_config* via = g_proxy.in_use() ? &g_proxy : 0;
+        // "Always direct" is about the whole call, not just its media. Leaving
+        // the signalling in the proxy while the udp goes out from here gives
+        // the voice server two different addresses for one session, and its
+        // udp discovery then answers neither half. A proxy that cannot carry
+        // udp gets the same treatment under the automatic route: both halves
+        // direct keeps the session consistent.
+        bool voice_via_proxy = g_proxy.in_use() && g_proxy.voice != VOICE_DIRECT &&
+                               !(g_proxy.voice == VOICE_AUTO && !g_proxy.carries_udp());
+        const proxy_config* via = voice_via_proxy ? &g_proxy : 0;
+
+        if (g_proxy.in_use() && !voice_via_proxy)
+            log_line("voice: сигнализация идёт напрямую, как и медиа");
 
         ubuffer message;
         message.init(1 << 14);
@@ -3751,17 +3965,20 @@ namespace
             ccfset(g_voice_token, 0, sizeof(g_voice_token));
         }
         g_have_state = false;
-        g_dave_active = false;
-        g_group_ready = false;
-        g_media_ready = false;
-        g_key_package_ready = false;
-        g_dave_nonce = 0;
-        g_dave_version = 0;
-        g_dave_version_next = 0;
-        g_dave_downgraded = false;
-        g_last_transition_done = 0xFFFFFFFF;
-        g_last_reinit_tick = 0;
+        {
+            group_guard g;
+            g_dave_active = false;
+            g_group_ready = false;
+            g_media_ready = false;
+            g_key_package_ready = false;
+            g_dave_version = 0;
+            g_dave_version_next = 0;
+            g_dave_downgraded = false;
+            g_last_transition_done = 0xFFFFFFFF;
+            g_last_reinit_tick = 0;
+        }
         dave::reset_ratchets();
+        InterlockedIncrement(&g_nonce_epoch);
         g_mode = MODE_NONE;
         ccfset(g_secret_key, 0, sizeof(g_secret_key));
     }
@@ -3776,21 +3993,24 @@ namespace
         // (who talks, how loud, what was half-decoded) stays - it is still
         // true, and keeping the speaker mapping is what lets audio resume on
         // the first frames instead of waiting for everyone to speak again.
-        g_dave_active = false;
-        g_group_ready = false;
-        g_media_ready = false;
-        g_key_package_ready = false;
-        g_dave_nonce = 0;
-        g_dave_version = 0;
-        g_dave_version_next = 0;
-        g_dave_downgraded = false;
-        g_last_transition_done = 0xFFFFFFFF;
-        g_last_reinit_tick = 0;
-        g_have_pending_commit = false;
-        g_pending_transition = 0;
-        g_own_commit_ready = false;
-        g_own_commit_won = false;
+        {
+            group_guard g;
+            g_dave_active = false;
+            g_group_ready = false;
+            g_media_ready = false;
+            g_key_package_ready = false;
+            g_dave_version = 0;
+            g_dave_version_next = 0;
+            g_dave_downgraded = false;
+            g_last_transition_done = 0xFFFFFFFF;
+            g_last_reinit_tick = 0;
+            g_have_pending_commit = false;
+            g_pending_transition = 0;
+            g_own_commit_ready = false;
+            g_own_commit_won = false;
+        }
         dave::reset_ratchets();
+        InterlockedIncrement(&g_nonce_epoch);
         g_mode = MODE_NONE;
         ccfset(g_secret_key, 0, sizeof(g_secret_key));
 
@@ -3983,6 +4203,8 @@ void voice::init()
     if (g_locks_ready) return;
     InitializeCriticalSection(&g_speakers_lock);
     InitializeCriticalSection(&g_life_lock);
+    InitializeCriticalSection(&g_group_lock);
+    g_group_lock_ready = true;
     g_life_ready = true;
     g_speakers = ulist<speaker>();
     g_pending_commit.init(2048);
@@ -4013,6 +4235,11 @@ void voice::shutdown()
     // After the last stop, which takes it.
     g_life_ready = false;
     DeleteCriticalSection(&g_life_lock);
+
+    // The group lock goes last of the three: every thread that could still
+    // touch the group is joined by the stop above.
+    g_group_lock_ready = false;
+    DeleteCriticalSection(&g_group_lock);
 
     DeleteCriticalSection(&g_speakers_lock);
     if (g_stop_event) { CloseHandle(g_stop_event); g_stop_event = 0; }
@@ -4088,6 +4315,43 @@ void voice::leave()
 
     gateway::update_voice_state(guild, 0, false, false);
     set_status(VOICE_IDLE, "");
+}
+
+void voice::on_ui_frame()
+{
+    if (InterlockedCompareExchange(&g_fail_pending, 0, 0) == 0) return;
+    InterlockedExchange(&g_fail_pending, 0);
+
+    // Somebody already hung up while the failure was on its way here. That
+    // teardown is the one to keep; a failure must not resurrect the panel.
+    if (!g_running) return;
+
+    char keep[192];
+    ccstrncpy(keep, g_status, sizeof(keep) - 1);
+
+    snowflake guild = g_guild_id;
+    snowflake channel = g_channel_id;
+
+    // g_stop_reason already names the failure, set where it happened.
+    stop_voice_connection();
+    gateway::release_hold();
+    science::clear_voice_identity();
+
+    g_guild_id = 0;
+    g_channel_id = 0;
+    g_pending_guild = 0;
+    g_pending_channel = 0;
+    ccfset(g_voice_session, 0, sizeof(g_voice_session));
+    g_media_direct = false;
+
+    // Discord still has us in the channel: the socket never got as far as
+    // telling it otherwise. Saying we left turns the next join into a real
+    // transition instead of a no-op while it believes we are already there.
+    if (channel) gateway::update_voice_state(guild, 0, false, false);
+
+    // The panel now shows the stop band with the reason, so the failure does
+    // not disappear along with the connecting row.
+    set_status(VOICE_FAILED, keep);
 }
 
 voice_state_kind voice::state() { return (voice_state_kind)g_state; }
@@ -4173,7 +4437,11 @@ bool voice::last_rx_report(voice::rx_report* out)
     return true;
 }
 
-bool voice::e2ee_active() { return g_dave_active && g_media_ready; }
+bool voice::e2ee_active()
+{
+    group_guard g;
+    return g_dave_active && g_media_ready;
+}
 
 // ---- cameras --------------------------------------------------------------
 

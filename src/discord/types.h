@@ -525,6 +525,10 @@ namespace cdn
 {
     // All of these write a NUL terminated url into out.
     void user_avatar(const duser* u, int size, char* out, int cap);
+    // An avatar from the account's upload history. Those live under
+    // /avatars/<user>/archived/<avatar_id>/<storage_hash>.webp.
+    void archived_avatar(snowflake user_id, const char* avatar_id, const char* hash,
+                         int size, char* out, int cap);
     void user_banner(const duser* u, int size, char* out, int cap);
     void guild_icon(const dguild* g, int size, char* out, int cap);
     void channel_icon(const dchannel* c, int size, char* out, int cap);

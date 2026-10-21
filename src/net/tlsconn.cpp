@@ -182,6 +182,11 @@ void tlsnet::close(tls_stream* s)
 {
     if (!s) return;
 
+    // Told before the context goes. A reader already inside waits no longer
+    // than one slice: it checks this flag between socket waits, and would
+    // otherwise sit there until its own deadline, holding the stream.
+    s->closed = true;
+
     if (s->ctx)
     {
         tls_destroy_context((TLSContext*)s->ctx);

@@ -488,7 +488,18 @@ void jdoc::init()
 
 bool jdoc::parse(const char* text, int len)
 {
-    arena.reset();
+    return parse_impl(text, len, false);
+}
+
+bool jdoc::parse_reuse(const char* text, int len)
+{
+    return parse_impl(text, len, true);
+}
+
+bool jdoc::parse_impl(const char* text, int len, bool keep_arena)
+{
+    if (keep_arena) arena.rewind();
+    else arena.reset();
     root = 0;
     if (!text) return false;
     if (len < 0) len = (int)ccslenf(text);
@@ -512,7 +523,8 @@ bool jdoc::parse(const char* text, int len)
 
     if (!ok)
     {
-        arena.reset();
+        if (keep_arena) arena.rewind();
+        else arena.reset();
         return false;
     }
 

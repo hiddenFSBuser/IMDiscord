@@ -25,7 +25,7 @@ void* uarena::alloc(unsigned int size, unsigned int align)
     unsigned int cap = DEFAULT_CHUNK;
     while (cap < want) cap *= 2;
 
-    chunk* c = (chunk*)memalloc((int)(cap + sizeof(chunk)));
+    chunk* c = (chunk*)memallocf((int)(cap + sizeof(chunk)));
     if (!c) return 0;
 
     c->next = head;
@@ -56,6 +56,11 @@ const char* uarena::dup(const char* str, int len)
     if (len > 0) ccpy(out, str, (size_t)len);
     out[len] = 0;
     return out;
+}
+
+void uarena::rewind()
+{
+    for (chunk* c = head; c; c = c->next) c->used = 0;
 }
 
 void uarena::reset()

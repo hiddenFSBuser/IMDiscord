@@ -338,6 +338,24 @@ void* __imp_exit                    = (void*)&cc_exit;
 
 } // extern "C"
 
+// ---- zstd (src/libs/zstd) -----------------------------------------------
+// The amalgamation carries zstd's dictionary trainer, its thread pool and its
+// debug prints. Nothing this client builds reaches any of those, but the
+// linker resolves the whole object before it drops what is unused, so the
+// symbols their corners ask for have to exist. The fallbacks answer them
+// without pulling any CRT in.
+extern "C" {
+
+int cc_fprintf(void*, const char*, ...) { return 0; }
+
+int cc_qsort_s(void*, size_t, size_t, int(__cdecl*)(void*, const void*, const void*), void*) { return 0; }
+
+unsigned long long cc_beginthreadex(void*, unsigned, unsigned(__stdcall*)(void*), void*, unsigned, unsigned*) { return 0; }
+
+int* cc_errno() { static int value = 0; return &value; }
+
+} // extern "C"
+
 // The short vector math library lives in the CRT, and the prebuilt rnnoise.lib
 // calls into it. Its entry points pass __m128d in XMM registers and return in
 // XMM0, which is the __vectorcall convention - a plain __cdecl definition would
@@ -422,3 +440,7 @@ extern "C" __m128d __vectorcall imd_vdecl_pow2(__m128d x, __m128d y)
 #pragma comment(linker, "/alternatename:_time64=cc_time")
 #pragma comment(linker, "/alternatename:toupper=cc_toupper")
 #pragma comment(linker, "/alternatename:raise=cc_raise")
+#pragma comment(linker, "/alternatename:fprintf=cc_fprintf")
+#pragma comment(linker, "/alternatename:qsort_s=cc_qsort_s")
+#pragma comment(linker, "/alternatename:_beginthreadex=cc_beginthreadex")
+#pragma comment(linker, "/alternatename:_errno=cc_errno")

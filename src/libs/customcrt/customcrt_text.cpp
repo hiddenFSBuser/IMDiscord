@@ -601,8 +601,7 @@ long ccstrtol(const char* nptr, char** endptr, int base) {
         acc = neg ? 2147483648UL : 2147483647UL;
     }
     else if (neg) {
-        acc = acc + 0x7FFFFFFF;
-        //acc = -acc;
+        acc = (unsigned long)(-(long)acc);
     }
 
     if (endptr != 0) {
@@ -676,8 +675,7 @@ long long ccstrtoll(const char* nptr, char** endptr, int base) {
         acc = neg ? 9223372036854775808ULL : 9223372036854775807ULL;
     }
     else if (neg) {
-        acc = acc + 0x7FFFFFFFFFFFFFFF;
-        //acc = -acc;
+        acc = (unsigned long long)(-(long long)acc);
     }
 
     if (endptr != 0) *endptr = (char*)(any ? s : nptr);

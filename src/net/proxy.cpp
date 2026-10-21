@@ -153,7 +153,9 @@ namespace
     // positioned after it. Fills `bound` when the caller wants it.
     bool socks5_read_address(SOCKET s, unsigned char atyp, sockaddr_in* bound)
     {
-        unsigned char addr[256];
+        // A domain address is one length byte plus up to 255 name bytes plus
+        // the two port bytes, so the scratch buffer has to hold 258.
+        unsigned char addr[258];
 
         if (atyp == 0x01)
         {
@@ -173,6 +175,7 @@ namespace
         {
             unsigned char len = 0;
             if (!recv_exact(s, &len, 1)) return false;
+            if ((int)len + 2 > (int)sizeof(addr)) return false;
             return recv_exact(s, addr, (int)len + 2);
         }
 
